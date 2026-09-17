@@ -10,7 +10,11 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 # When this file is executed via `curl .../install.sh | sh`, there is no
 # checkout beside it. Delegate to the public bootstrap, which downloads the
 # pinned source bundle and release binary before re-entering this installer.
-if [ ! -f "$SCRIPT_DIR/skill/SKILL.md" ] && [ -z "${PROJECT_PARITY_SOURCE:-}" ]; then
+case "$0" in
+  */install.sh|./install.sh) local_script=1 ;;
+  *) local_script=0 ;;
+esac
+if { [ "$local_script" -eq 0 ] || [ ! -f "$SCRIPT_DIR/skill/SKILL.md" ]; } && [ -z "${PROJECT_PARITY_SOURCE:-}" ]; then
   command -v curl >/dev/null 2>&1 || { echo 'project-parity: curl is required for remote install' >&2; exit 1; }
   exec sh -s -- "$@" <<EOF
 $(curl -fsSL "https://raw.githubusercontent.com/beautyfree/project-parity/master/bootstrap.sh")
