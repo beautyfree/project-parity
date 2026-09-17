@@ -4,7 +4,7 @@
 set -eu
 
 REPO=${PROJECT_PARITY_REPO:-beautyfree/project-parity}
-VERSION=${PROJECT_PARITY_VERSION:-v0.1.1}
+VERSION=${PROJECT_PARITY_VERSION:-v0.1.2}
 BASE="https://github.com/$REPO"
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/project-parity-install.XXXXXX")
 trap 'find "$TMP_DIR" -type f -delete 2>/dev/null || true; find "$TMP_DIR" -type d -depth -empty -delete 2>/dev/null || true' EXIT INT TERM
