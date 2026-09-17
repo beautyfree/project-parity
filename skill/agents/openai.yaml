@@ -1,0 +1,4 @@
+interface:
+  display_name: Project parity loop
+  short_description: Drive evidence-first upstream/local parity repairs
+  default_prompt: Compare the authoritative upstream tree with the local tree using project-parity, inspect the highest-priority work item, patch only local sources, validate, and resync the queue.

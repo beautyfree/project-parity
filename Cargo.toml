@@ -1,0 +1,30 @@
+[package]
+name = "project-parity"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+publish = false
+
+[dependencies]
+anyhow = "1"
+jsonc-parser = { version = "0.33.2", features = ["serde"] }
+oxc_allocator = "=0.126.0"
+oxc_ast = "=0.126.0"
+oxc_ast_visit = "=0.126.0"
+oxc_codegen = "=0.126.0"
+oxc_parser = "=0.126.0"
+oxc_semantic = "=0.126.0"
+oxc_span = "=0.126.0"
+oxc_str = "=0.126.0"
+oxc_syntax = "=0.126.0"
+rayon = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sourcemap = "9.3.2"
+walkdir = "2"
+zstd = "0.13"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,31 @@
+{
+  "topK": 5,
+  "expected": [
+    {
+      "left": { "file": "source.ts", "name": "renamedOwner" },
+      "right": { "file": "bundle.js", "name": "a" }
+    },
+    {
+      "left": { "file": "source.ts", "name": "wrappedOwner" },
+      "right": { "file": "bundle.js", "name": "b" }
+    },
+    {
+      "left": { "file": "source.ts", "name": "changedApiOwner" },
+      "right": { "file": "bundle.js", "name": "d" }
+    },
+    {
+      "left": { "file": "source.ts", "name": "changedLiteralOwner" },
+      "right": { "file": "bundle.js", "name": "e" }
+    },
+    {
+      "left": { "file": "source.ts", "name": "createMenuManager" },
+      "right": { "file": "bundle.js", "name": "w7" }
+    }
+  ],
+  "forbidden": [
+    {
+      "left": { "file": "source.ts", "name": "subtractOwner" },
+      "right": { "file": "bundle.js", "name": "c" }
+    }
+  ]
+}
