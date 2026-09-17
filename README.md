@@ -11,14 +11,27 @@ either tree and never edits either input.
 
 ## Quick start
 
+From a clean machine, install the CLI and skill in one command:
+
 ```bash
-./install.sh --target=codex --yes
+curl -fsSL https://raw.githubusercontent.com/beautyfree/project-parity/master/bootstrap.sh \
+  | sh -s -- --target=codex --yes
+```
+
+Then, in the project where parity work will happen:
+
+```bash
 project-parity init /path/to/local /path/to/upstream
 ```
 
 `init` creates `/path/to/local/.parity/`, runs the first authoritative
 comparison, and stores the LLM queue in `.parity/state.sqlite`. After that,
 open the local project in your agent and ask it to continue the parity loop.
+
+The bootstrap downloads a versioned prebuilt binary and the bundled skill; it
+does not require a Rust toolchain. Use `PROJECT_PARITY_VERSION=vX.Y.Z` to pin a
+release. The repository installer remains available for source builds and
+development.
 
 ## Advanced operation
 
