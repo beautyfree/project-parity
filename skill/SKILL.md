@@ -18,7 +18,8 @@ project-parity init LOCAL_DIR UPSTREAM_DIR
 ```
 
 Do not make the user learn report paths, SQLite commands, or graph file names.
-`init` creates the report, state database, and LLM work queue for you.
+`init` creates the report, state database, and LLM work queue for you. Run it
+once per project.
 
 ## Repair loop
 
@@ -31,8 +32,9 @@ Repeat until the queue is empty:
    dependencies, and package provenance. A name or score is only a locator.
 4. Patch only the local project. Never edit the upstream tree or copy a
    low-confidence candidate without understanding its contract.
-5. Run the relevant tests/runtime checks, then run `project-parity init` again.
-   The state queue is updated automatically and resolved items disappear.
+5. Run the relevant tests/runtime checks, then run:
+   `project-parity sync LOCAL_DIR UPSTREAM_DIR`. The state queue is updated
+   automatically and resolved items disappear.
 
 For a long session, an agent may run the optional service:
 

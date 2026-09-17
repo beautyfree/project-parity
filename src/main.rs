@@ -6137,6 +6137,7 @@ fn usage() -> &'static str {
     concat!(
         "Usage:\n",
         "  project-parity init LOCAL_DIR UPSTREAM_DIR\n",
+        "  project-parity sync LOCAL_DIR UPSTREAM_DIR\n",
         "  project-parity LEFT_DIR RIGHT_DIR --out DIRECTORY [--oracle FILE] [--bundle-certificates FILE]\n",
         "  project-parity watch LEFT_DIR RIGHT_DIR --out DIRECTORY [--state STATE_DB] [--interval MS] [--debounce MS]\n",
         "  project-parity serve LEFT_DIR RIGHT_DIR --out DIRECTORY [--state STATE_DB] [--interval MS] [--debounce MS] [--mcp]\n",
@@ -6416,6 +6417,30 @@ fn print_mcp(value: &impl Serialize) -> Result<()> {
     print_stdout(serde_json::to_string(value)?)
 }
 
+fn sync_project(local: &Path, upstream: &Path, command: &'static str) -> Result<serde_json::Value> {
+    let parity = local.join(".parity");
+    let report = parity.join("report");
+    let state_db = parity.join("state.sqlite");
+    if command == "sync" && !parity.is_dir() {
+        bail!(
+            "{} is not initialized; run `project-parity init LOCAL_DIR UPSTREAM_DIR` first",
+            local.display()
+        );
+    }
+    fs::create_dir_all(&parity)?;
+    let summary = run(local, upstream, &report)?;
+    let sync = state::sync(&state_db, &report)?;
+    Ok(serde_json::json!({
+        "schema": format!("project-parity/{command}-v1"),
+        "local": local,
+        "upstream": upstream,
+        "report": report,
+        "state": state_db,
+        "summary": summary,
+        "stateSync": sync,
+    }))
+}
+
 fn main() -> Result<()> {
     // Keep matcher parallelism bounded on large upstream bundles.  Two
     // workers retain throughput while avoiding the multi-gigabyte peaks from
@@ -6432,23 +6457,22 @@ fn main() -> Result<()> {
         if args.len() != 3 {
             bail!(usage());
         }
-        let local = Path::new(&args[1]);
-        let upstream = Path::new(&args[2]);
-        let parity = local.join(".parity");
-        let report = parity.join("report");
-        let state_db = parity.join("state.sqlite");
-        fs::create_dir_all(&parity)?;
-        let summary = run(local, upstream, &report)?;
-        let sync = state::sync(&state_db, &report)?;
-        print_json(&serde_json::json!({
-            "schema": "project-parity/init-v1",
-            "local": local,
-            "upstream": upstream,
-            "report": report,
-            "state": state_db,
-            "summary": summary,
-            "stateSync": sync,
-        }))?;
+        print_json(&sync_project(
+            Path::new(&args[1]),
+            Path::new(&args[2]),
+            "init",
+        )?)?;
+        return Ok(());
+    }
+    if args.first().is_some_and(|arg| arg == "sync") {
+        if args.len() != 3 {
+            bail!(usage());
+        }
+        print_json(&sync_project(
+            Path::new(&args[1]),
+            Path::new(&args[2]),
+            "sync",
+        )?)?;
         return Ok(());
     }
     if args

@@ -198,4 +198,4 @@ for target in codex claude cursor; do
   if contains_target "$target"; then install_skill "$target"; fi
 done
 
-echo 'Done. Run project-parity --help, then initialize a report with two project roots.'
+echo 'Done. Run project-parity init LOCAL_DIR UPSTREAM_DIR once, then project-parity sync after patches.'

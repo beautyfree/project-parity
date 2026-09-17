@@ -25,8 +25,9 @@ project-parity init /path/to/local /path/to/upstream
 ```
 
 `init` creates `/path/to/local/.parity/`, runs the first authoritative
-comparison, and stores the LLM queue in `.parity/state.sqlite`. After that,
-open the local project in your agent and ask it to continue the parity loop.
+comparison, and stores the LLM queue in `.parity/state.sqlite`. Run it once per
+project. After a local patch, use `project-parity sync LOCAL UPSTREAM`, or let
+the optional `serve` watcher resync automatically.
 
 The public installer downloads a versioned prebuilt binary and the bundled
 skill; it does not require a Rust toolchain. Use
@@ -64,8 +65,8 @@ matching, including their non-executable graph context. Auditing a project
 against itself therefore produces an empty repair queue instead of false work
 items from repeated or context-only nodes.
 
-`state-sync` pins both input hashes in SQLite. After a local patch, rerun the
-CLI against the same two roots and sync again. An item is resolved only when
+`state-sync` pins both input hashes in SQLite. After a local patch, run `sync`
+against the same two roots. An item is resolved only when
 its stable id disappears or its disposition is explicitly covered by fresh
 evidence.
 
@@ -96,7 +97,7 @@ claim of runtime, native, asset, or pixel equivalence.
 
 The [`skill/`](skill/) directory is a portable Codex/LLM skill. Copy it into a
 skill registry or load `skill/SKILL.md` directly. Its default path is only
-`init → next task → inspect → patch local → tests → init`; detailed artifact
+`init once → next task → inspect → patch local → tests → sync`; detailed artifact
 contracts live in `skill/references/` and do not clutter the normal workflow.
 
 ### Agent installation
@@ -119,7 +120,7 @@ with concrete local/upstream roots and a report directory for each project.
 Use `serve ... --mcp` as the configured MCP command. `--skip-build` reuses an
 existing `target/release/project-parity` binary. The upstream input remains
 read-only; the skill tells the agent to patch only the local input and re-run
-`state-sync`.
+`sync`.
 
 ## Development
 
