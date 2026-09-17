@@ -1,101 +1,59 @@
 ---
 name: project-parity-loop
-description: Use the project-parity CLI to compare an authoritative upstream JavaScript or TypeScript project with a local implementation and drive a hash-pinned LLM repair loop.
+description: Bring a local JavaScript or TypeScript project into parity with an authoritative upstream project.
 ---
 
 # Project parity loop
 
-Use this skill when an upstream implementation is the behavioral/source target
-and the local project must be brought into correspondence. The CLI is an
-evidence generator and queue manager; it is not an automatic patcher.
+Use this skill when the user asks to reproduce or synchronize a local project
+with an upstream implementation. The upstream tree is the reference; the
+local tree is the only tree you may edit.
 
-## Invariants
+## Start automatically
 
-- The report's `right` side is authoritative. Never edit it.
-- The `left` side is the local implementation and is the only code you patch.
-- A score is locator evidence, not proof. Read the complete owners, scopes,
-  callers, dependency edges, imports/exports, and package provenance.
-- `proven-structure` means alpha-equivalent AST/binding structure only. It does
-  not prove runtime, native, asset, timing, or pixel parity.
-- CodeGraph, when imported, is supplementary navigation evidence. It cannot
-  promote a relation to proven parity.
-- Never close a task because a name or file path looks similar.
-
-## Start a run
+If `LOCAL_DIR/.parity/` does not exist, initialize the analysis:
 
 ```bash
 project-parity init LOCAL_DIR UPSTREAM_DIR
 ```
 
-This creates `LOCAL_DIR/.parity/report` and `LOCAL_DIR/.parity/state.sqlite`,
-performs the first comparison, and syncs the LLM queue. Use the advanced
-commands below only when a long-running service or direct evidence paging is
-needed.
+Do not make the user learn report paths, SQLite commands, or graph file names.
+`init` creates the report, state database, and LLM work queue for you.
 
-For a long-running repair session, use the safe watcher:
+## Repair loop
 
-```bash
-project-parity watch LOCAL_DIR UPSTREAM_DIR --out REPORT_DIR \
-  --state STATE_DB --interval 1000 --debounce 750
-```
+Repeat until the queue is empty:
 
-For an agent-supervised lifecycle, use the equivalent `serve` entry point:
+1. Read the next task from `LOCAL_DIR/.parity/state.sqlite`.
+2. Load its complete evidence with `show-work`, then inspect the listed units
+   and graph edges when the task is ambiguous or crosses file boundaries.
+3. Compare the full upstream owner chain: imports, exports, scopes, callers,
+   dependencies, and package provenance. A name or score is only a locator.
+4. Patch only the local project. Never edit the upstream tree or copy a
+   low-confidence candidate without understanding its contract.
+5. Run the relevant tests/runtime checks, then run `project-parity init` again.
+   The state queue is updated automatically and resolved items disappear.
 
-```bash
-project-parity serve LOCAL_DIR UPSTREAM_DIR --out REPORT_DIR \
-  --state STATE_DB --interval 1000 --debounce 750
-```
-
-`serve` is a foreground service wrapper. It writes `serve-status.json` and
-can be supervised by an agent or shell service manager. For agent hosts with
-MCP support, add `--mcp`; this exposes only read/evidence tools plus an explicit
-`resync` operation, while keeping upstream read-only.
-
-It snapshots content hashes, coalesces editor save bursts, skips no-op cycles,
-records `change-set.json`, reuses the per-file AST cache for unchanged files,
-records `resync-plan.json` with the reverse dependency impact closure, reuses
-the per-file AST cache for unchanged files, and syncs the SQLite queue after
-each completed analysis. Correspondence remains global so a partial merge
-cannot silently lose cross-file relations.
-
-Read `REPORT_DIR/llm-manifest.json` first. It contains input hashes, artifact
-names, lossless-ledger guarantees, and the current work-item contract. Treat a
-changed input hash as a new audit boundary; do not reuse conclusions from an
-older report.
-
-## Process one work item
-
-1. Take the highest-priority item from `state-next` (P0, then P1, then P2).
-2. Load the full item with `show-work REPORT_DIR ITEM_ID`.
-3. For every listed node, run `inspect REPORT_DIR NODE_ID`. Read the complete
-   source spans returned for both sides, not only the snippet in the queue.
-4. Use `graph-node REPORT_DIR NODE_ID` to page all incoming/outgoing edges.
-   Trace callers, writes, renders, module edges, re-exports, scopes, and
-   dependency/package bindings until the behavior boundary is understood.
-5. Classify the evidence: exact structural coverage, candidate, ambiguous,
-   changed, missing-local, extra-local, or dependency-only.
-6. Patch the smallest coherent local owner set. Do not edit upstream or copy
-   code blindly from a low-confidence candidate.
-
-## Close the loop
-
-Run focused unit/type tests and, where relevant, the real runtime/rendered
-validation. Then regenerate the report against the same two roots and sync:
+For a long session, an agent may run the optional service:
 
 ```bash
-project-parity LOCAL_DIR UPSTREAM_DIR --out REPORT_DIR
-project-parity state-sync STATE_DB REPORT_DIR
-project-parity state-next STATE_DB 10
+project-parity serve LOCAL_DIR UPSTREAM_DIR \
+  --out LOCAL_DIR/.parity/report \
+  --state LOCAL_DIR/.parity/state.sqlite
 ```
 
-An item is resolved only when its stable id is absent from the fresh queue or
-its disposition is explicitly justified as covered. If the source hashes
-changed unexpectedly, stop and re-audit the affected chain. Do not claim full
-parity while unresolved P0/P1 items, parse failures, or unreviewed ambiguous
-groups remain.
+Use `--mcp` only when the host explicitly needs the stdio MCP transport.
 
-## Required handoff
+## Trust rules
 
-When reporting progress, include the report path, both input hashes, queue
-counts by priority/status, tests and runtime gates actually run, and the exact
-unresolved boundary. A passing CLI/build is structural evidence only.
+- `right`/upstream is authoritative and read-only; `left`/local is editable.
+- `proven-structure` proves normalized AST/binding structure, not runtime,
+  native, asset, timing, media, or pixel equivalence.
+- Ambiguous, candidate, missing, changed, and dependency-only evidence stays
+  in the queue until reviewed; never mark it resolved by filename similarity.
+- If input hashes change unexpectedly, re-audit the affected chain.
+- Finish only when no unresolved P0/P1 work remains, parse failures are handled,
+  and the required runtime checks have passed.
+
+See `references/evidence-boundaries.md` for the proof boundary and
+`references/report-schema.md` when direct artifact inspection is necessary.

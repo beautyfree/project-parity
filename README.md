@@ -95,10 +95,9 @@ claim of runtime, native, asset, or pixel equivalence.
 ## Bundled LLM skill
 
 The [`skill/`](skill/) directory is a portable Codex/LLM skill. Copy it into a
-skill registry or load `skill/SKILL.md` directly. It defines the evidence-first
-loop, queue ordering, inspection commands, patch gates, and resynchronization
-rules without assuming a particular product, version, bundler, or repository
-layout.
+skill registry or load `skill/SKILL.md` directly. Its default path is only
+`init → next task → inspect → patch local → tests → init`; detailed artifact
+contracts live in `skill/references/` and do not clutter the normal workflow.
 
 ### Agent installation
 
