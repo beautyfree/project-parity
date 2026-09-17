@@ -6134,9 +6134,22 @@ fn graph_node(
 }
 
 fn usage() -> &'static str {
-    // `serve` is the agent-friendly long-running entry point; it shares the
-    // same flags and correctness boundaries as `watch`.
-    "Usage:\n  project-parity LEFT_DIR RIGHT_DIR --out DIRECTORY [--oracle FILE] [--bundle-certificates FILE]\n  project-parity watch LEFT_DIR RIGHT_DIR --out DIRECTORY [--state STATE_DB] [--interval MS] [--debounce MS]\n  project-parity serve LEFT_DIR RIGHT_DIR --out DIRECTORY [--state STATE_DB] [--interval MS] [--debounce MS]\n  project-parity inspect REPORT_DIRECTORY UNIT_ID\n  project-parity graph-node REPORT_DIRECTORY NODE_ID [LIMIT] [OFFSET]\n  project-parity show-work REPORT_DIRECTORY WORK_ITEM_ID\n  project-parity show-batch REPORT_DIRECTORY BATCH_ID [LIMIT] [OFFSET]\n  project-parity state-sync STATE_DB REPORT_DIRECTORY\n  project-parity state-next STATE_DB [LIMIT]\n  project-parity state-runs STATE_DB [LIMIT]\n  project-parity graph-import STATE_DB SEMANTIC_GRAPH\n  project-parity codegraph-import STATE_DB CODEGRAPH_DB SIDE"
+    concat!(
+        "Usage:\n",
+        "  project-parity init LOCAL_DIR UPSTREAM_DIR\n",
+        "  project-parity LEFT_DIR RIGHT_DIR --out DIRECTORY [--oracle FILE] [--bundle-certificates FILE]\n",
+        "  project-parity watch LEFT_DIR RIGHT_DIR --out DIRECTORY [--state STATE_DB] [--interval MS] [--debounce MS]\n",
+        "  project-parity serve LEFT_DIR RIGHT_DIR --out DIRECTORY [--state STATE_DB] [--interval MS] [--debounce MS] [--mcp]\n",
+        "  project-parity inspect REPORT_DIRECTORY UNIT_ID\n",
+        "  project-parity graph-node REPORT_DIRECTORY NODE_ID [LIMIT] [OFFSET]\n",
+        "  project-parity show-work REPORT_DIRECTORY WORK_ITEM_ID\n",
+        "  project-parity show-batch REPORT_DIRECTORY BATCH_ID [LIMIT] [OFFSET]\n",
+        "  project-parity state-sync STATE_DB REPORT_DIRECTORY\n",
+        "  project-parity state-next STATE_DB [LIMIT]\n",
+        "  project-parity state-runs STATE_DB [LIMIT]\n",
+        "  project-parity graph-import STATE_DB SEMANTIC_GRAPH\n",
+        "  project-parity codegraph-import STATE_DB CODEGRAPH_DB SIDE",
+    )
 }
 
 fn read_bundle_equivalence_certificates(path: &Path) -> Result<Vec<BundleEquivalenceCertificate>> {
@@ -6413,6 +6426,29 @@ fn main() -> Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.iter().any(|arg| arg == "--help") {
         print_stdout(usage())?;
+        return Ok(());
+    }
+    if args.first().is_some_and(|arg| arg == "init") {
+        if args.len() != 3 {
+            bail!(usage());
+        }
+        let local = Path::new(&args[1]);
+        let upstream = Path::new(&args[2]);
+        let parity = local.join(".parity");
+        let report = parity.join("report");
+        let state_db = parity.join("state.sqlite");
+        fs::create_dir_all(&parity)?;
+        let summary = run(local, upstream, &report)?;
+        let sync = state::sync(&state_db, &report)?;
+        print_json(&serde_json::json!({
+            "schema": "project-parity/init-v1",
+            "local": local,
+            "upstream": upstream,
+            "report": report,
+            "state": state_db,
+            "summary": summary,
+            "stateSync": sync,
+        }))?;
         return Ok(());
     }
     if args

@@ -12,30 +12,27 @@ either tree and never edits either input.
 ## Quick start
 
 ```bash
-cargo run --release -- /path/to/local /path/to/upstream --out reports/run
-
-# keep a report and its queue current while either tree changes
-cargo run --release -- watch /path/to/local /path/to/upstream --out reports/run \
-  --state .parity/state.sqlite
-
-# CodeGraph-style foreground service entry point (agent/daemon wrappers can
-# supervise this process; serve-status.json records its lifecycle state)
-cargo run --release -- serve /path/to/local /path/to/upstream --out reports/run \
-  --state .parity/state.sqlite
-
-# stdio MCP server for an agent host
-cargo run --release -- serve /path/to/local /path/to/upstream --out reports/run \
-  --state .parity/state.sqlite --mcp
-
-# select the next unresolved repair task
-cargo run --release -- state-sync .parity/state.sqlite reports/run
-cargo run --release -- state-next .parity/state.sqlite 10
-
-# inspect complete source and graph evidence for one task
-cargo run --release -- show-work reports/run WORK_ITEM_ID
-cargo run --release -- inspect reports/run NODE_ID
-cargo run --release -- graph-node reports/run NODE_ID 100 0
+./install.sh --target=codex --yes
+project-parity init /path/to/local /path/to/upstream
 ```
+
+`init` creates `/path/to/local/.parity/`, runs the first authoritative
+comparison, and stores the LLM queue in `.parity/state.sqlite`. After that,
+open the local project in your agent and ask it to continue the parity loop.
+
+## Advanced operation
+
+Keep the report and queue current while either tree changes:
+
+```bash
+project-parity serve /path/to/local /path/to/upstream \
+  --out /path/to/local/.parity/report \
+  --state /path/to/local/.parity/state.sqlite
+```
+
+For MCP-capable agent hosts, add `--mcp` to the same command. Manual queue and
+evidence commands (`state-next`, `show-work`, `inspect`, `graph-node`) are
+available when an agent needs direct inspection.
 
 Use `--oracle FILE` when a fixture or reviewed corpus has expected stable
 source locators. Use `codegraph-import` only to add supplementary navigation

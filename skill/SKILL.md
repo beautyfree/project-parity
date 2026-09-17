@@ -24,10 +24,13 @@ evidence generator and queue manager; it is not an automatic patcher.
 ## Start a run
 
 ```bash
-project-parity LOCAL_DIR UPSTREAM_DIR --out REPORT_DIR
-project-parity state-sync STATE_DB REPORT_DIR
-project-parity state-next STATE_DB 10
+project-parity init LOCAL_DIR UPSTREAM_DIR
 ```
+
+This creates `LOCAL_DIR/.parity/report` and `LOCAL_DIR/.parity/state.sqlite`,
+performs the first comparison, and syncs the LLM queue. Use the advanced
+commands below only when a long-running service or direct evidence paging is
+needed.
 
 For a long-running repair session, use the safe watcher:
 
