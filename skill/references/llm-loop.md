@@ -6,6 +6,8 @@ The durable loop is:
 
 `init` is the one-time project setup. `sync` is the short public resync command:
 it regenerates the report and synchronizes the SQLite queue in one step.
+When run from the local project directory, both roots are remembered in
+`.parity/config.json`, so no absolute paths are needed after initialization.
 
 Use batches for routing and the lossless semantic ledgers for completeness.
 Keep the upstream/right input immutable. Prefer a coherent owner-chain patch

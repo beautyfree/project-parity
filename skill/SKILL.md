@@ -17,9 +17,16 @@ If `LOCAL_DIR/.parity/` does not exist, initialize the analysis:
 project-parity init LOCAL_DIR UPSTREAM_DIR
 ```
 
-Do not make the user learn report paths, SQLite commands, or graph file names.
-`init` creates the report, state database, and LLM work queue for you. Run it
-once per project.
+When the agent is started in the local project directory, prefer the shorter
+form:
+
+```bash
+project-parity init UPSTREAM_DIR
+```
+
+The CLI treats the current directory as local and saves the pair in
+`.parity/config.json`. Do not make the user learn report paths, SQLite
+commands, or graph file names. Run `init` once per project.
 
 ## Repair loop
 
@@ -33,8 +40,9 @@ Repeat until the queue is empty:
 4. Patch only the local project. Never edit the upstream tree or copy a
    low-confidence candidate without understanding its contract.
 5. Run the relevant tests/runtime checks, then run:
-   `project-parity sync LOCAL_DIR UPSTREAM_DIR`. The state queue is updated
-   automatically and resolved items disappear.
+   `project-parity sync`. The saved project config supplies both roots; the
+   explicit `sync LOCAL_DIR UPSTREAM_DIR` form remains available. The state
+   queue is updated automatically and resolved items disappear.
 
 For a long session, an agent may run the optional service:
 

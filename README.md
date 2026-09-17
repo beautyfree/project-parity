@@ -26,8 +26,16 @@ project-parity init /path/to/local /path/to/upstream
 
 `init` creates `/path/to/local/.parity/`, runs the first authoritative
 comparison, and stores the LLM queue in `.parity/state.sqlite`. Run it once per
-project. After a local patch, use `project-parity sync LOCAL UPSTREAM`, or let
-the optional `serve` watcher resync automatically.
+project. It also saves the pair in `.parity/config.json`. When working from
+the local project directory, the shorter forms are available:
+
+```bash
+project-parity init /path/to/upstream   # current directory is LOCAL
+project-parity sync                    # uses .parity/config.json
+```
+
+After a local patch, use `project-parity sync`, or let the optional `serve`
+watcher resync automatically.
 
 The public installer downloads a versioned prebuilt binary and the bundled
 skill; it does not require a Rust toolchain. Use

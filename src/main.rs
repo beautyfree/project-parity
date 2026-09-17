@@ -6137,7 +6137,8 @@ fn usage() -> &'static str {
     concat!(
         "Usage:\n",
         "  project-parity init LOCAL_DIR UPSTREAM_DIR\n",
-        "  project-parity sync LOCAL_DIR UPSTREAM_DIR\n",
+        "  project-parity init UPSTREAM_DIR                 # use current directory as LOCAL\n",
+        "  project-parity sync [LOCAL_DIR UPSTREAM_DIR]\n",
         "  project-parity LEFT_DIR RIGHT_DIR --out DIRECTORY [--oracle FILE] [--bundle-certificates FILE]\n",
         "  project-parity watch LEFT_DIR RIGHT_DIR --out DIRECTORY [--state STATE_DB] [--interval MS] [--debounce MS]\n",
         "  project-parity serve LEFT_DIR RIGHT_DIR --out DIRECTORY [--state STATE_DB] [--interval MS] [--debounce MS] [--mcp]\n",
@@ -6417,6 +6418,61 @@ fn print_mcp(value: &impl Serialize) -> Result<()> {
     print_stdout(serde_json::to_string(value)?)
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectConfig {
+    schema: String,
+    local: String,
+    upstream: String,
+}
+
+fn project_config_path(local: &Path) -> PathBuf {
+    local.join(".parity").join("config.json")
+}
+
+fn absolute_existing_path(path: &Path, label: &str) -> Result<PathBuf> {
+    path.canonicalize()
+        .with_context(|| format!("{label} does not exist: {}", path.display()))
+}
+
+fn write_project_config(local: &Path, upstream: &Path) -> Result<PathBuf> {
+    let local = absolute_existing_path(local, "local project")?;
+    let upstream = absolute_existing_path(upstream, "upstream project")?;
+    let path = project_config_path(&local);
+    fs::create_dir_all(path.parent().context("project config has no parent")?)?;
+    let config = ProjectConfig {
+        schema: "project-parity/project-config-v1".to_string(),
+        local: local.to_string_lossy().into_owned(),
+        upstream: upstream.to_string_lossy().into_owned(),
+    };
+    fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+    Ok(path)
+}
+
+fn read_project_config(local: &Path) -> Result<(PathBuf, PathBuf)> {
+    let local = absolute_existing_path(local, "local project")?;
+    let path = project_config_path(&local);
+    let bytes = fs::read(&path).with_context(|| {
+        format!(
+            "no project-parity config at {}; run project-parity init UPSTREAM_DIR here first",
+            path.display()
+        )
+    })?;
+    let config: ProjectConfig = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse project-parity config {}", path.display()))?;
+    let configured_local =
+        absolute_existing_path(Path::new(&config.local), "configured local project")?;
+    if configured_local != local {
+        bail!(
+            "project config belongs to {}; run the command from that project or initialize this directory",
+            configured_local.display()
+        );
+    }
+    let upstream =
+        absolute_existing_path(Path::new(&config.upstream), "configured upstream project")?;
+    Ok((local, upstream))
+}
+
 fn sync_project(local: &Path, upstream: &Path, command: &'static str) -> Result<serde_json::Value> {
     let parity = local.join(".parity");
     let report = parity.join("report");
@@ -6430,12 +6486,14 @@ fn sync_project(local: &Path, upstream: &Path, command: &'static str) -> Result<
     fs::create_dir_all(&parity)?;
     let summary = run(local, upstream, &report)?;
     let sync = state::sync(&state_db, &report)?;
+    let config = write_project_config(local, upstream)?;
     Ok(serde_json::json!({
         "schema": format!("project-parity/{command}-v1"),
         "local": local,
         "upstream": upstream,
         "report": report,
         "state": state_db,
+        "config": config,
         "summary": summary,
         "stateSync": sync,
     }))
@@ -6454,25 +6512,22 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if args.first().is_some_and(|arg| arg == "init") {
-        if args.len() != 3 {
-            bail!(usage());
-        }
-        print_json(&sync_project(
-            Path::new(&args[1]),
-            Path::new(&args[2]),
-            "init",
-        )?)?;
+        let (local, upstream) = match args.len() {
+            2 => (env::current_dir()?, PathBuf::from(&args[1])),
+            3 => (PathBuf::from(&args[1]), PathBuf::from(&args[2])),
+            _ => bail!(usage()),
+        };
+        print_json(&sync_project(&local, &upstream, "init")?)?;
         return Ok(());
     }
     if args.first().is_some_and(|arg| arg == "sync") {
-        if args.len() != 3 {
-            bail!(usage());
-        }
-        print_json(&sync_project(
-            Path::new(&args[1]),
-            Path::new(&args[2]),
-            "sync",
-        )?)?;
+        let (local, upstream) = match args.len() {
+            1 => read_project_config(&env::current_dir()?)?,
+            2 => read_project_config(Path::new(&args[1]))?,
+            3 => (PathBuf::from(&args[1]), PathBuf::from(&args[2])),
+            _ => bail!(usage()),
+        };
+        print_json(&sync_project(&local, &upstream, "sync")?)?;
         return Ok(());
     }
     if args
