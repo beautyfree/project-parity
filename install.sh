@@ -6,7 +6,18 @@
 # run it from a checkout, or set PROJECT_PARITY_SOURCE to another checkout.
 set -eu
 
-SOURCE_DIR=${PROJECT_PARITY_SOURCE:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# When this file is executed via `curl .../install.sh | sh`, there is no
+# checkout beside it. Delegate to the public bootstrap, which downloads the
+# pinned source bundle and release binary before re-entering this installer.
+if [ ! -f "$SCRIPT_DIR/skill/SKILL.md" ] && [ -z "${PROJECT_PARITY_SOURCE:-}" ]; then
+  command -v curl >/dev/null 2>&1 || { echo 'project-parity: curl is required for remote install' >&2; exit 1; }
+  exec sh -s -- "$@" <<EOF
+$(curl -fsSL "https://raw.githubusercontent.com/beautyfree/project-parity/master/bootstrap.sh")
+EOF
+fi
+
+SOURCE_DIR=${PROJECT_PARITY_SOURCE:-$SCRIPT_DIR}
 HOME_DIR=${PROJECT_PARITY_HOME:-${HOME:?HOME is required}}
 BIN_DIR=${PROJECT_PARITY_BIN_DIR:-"$HOME_DIR/.local/bin"}
 CODEX_HOME_DIR=${CODEX_HOME:-"$HOME_DIR/.codex"}

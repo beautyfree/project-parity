@@ -14,7 +14,7 @@ either tree and never edits either input.
 From a clean machine, install the CLI and skill in one command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/beautyfree/project-parity/master/bootstrap.sh \
+curl -fsSL https://raw.githubusercontent.com/beautyfree/project-parity/master/install.sh \
   | sh -s -- --target=codex --yes
 ```
 
@@ -28,10 +28,10 @@ project-parity init /path/to/local /path/to/upstream
 comparison, and stores the LLM queue in `.parity/state.sqlite`. After that,
 open the local project in your agent and ask it to continue the parity loop.
 
-The bootstrap downloads a versioned prebuilt binary and the bundled skill; it
-does not require a Rust toolchain. Use `PROJECT_PARITY_VERSION=vX.Y.Z` to pin a
-release. The repository installer remains available for source builds and
-development.
+The public installer downloads a versioned prebuilt binary and the bundled
+skill; it does not require a Rust toolchain. Use
+`PROJECT_PARITY_VERSION=vX.Y.Z` to pin a release. When run from a checkout,
+the same `install.sh` switches to source-build mode for development.
 
 ## Advanced operation
 
