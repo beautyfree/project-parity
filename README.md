@@ -41,6 +41,11 @@ The public installer downloads a versioned prebuilt binary and the bundled
 skill; it does not require a Rust toolchain. Use
 `PROJECT_PARITY_VERSION=vX.Y.Z` to pin a release. When run from a checkout,
 the same `install.sh` switches to source-build mode for development.
+Verify an installed binary with `project-parity --version`; the capability
+list includes queue routing, batched evidence, upstream-owner routing for
+ownerless work, `state-optimize-queue-v1`, and
+`frontier-behavior-edges-v1`. `show-batch-compact-v1` enables lossless evidence
+deduplication for large ambiguous batches without removing any owner context.
 
 ## Advanced operation
 
@@ -55,6 +60,110 @@ project-parity serve /path/to/local /path/to/upstream \
 For MCP-capable agent hosts, add `--mcp` to the same command. Manual queue and
 evidence commands (`state-next`, `show-work`, `inspect`, `graph-node`) are
 available when an agent needs direct inspection.
+
+For bounded batches, mark a reviewed and locally patched item as waiting for
+the next authoritative resync without running the expensive analysis yet:
+
+```bash
+project-parity state-done STATE_DB WORK_ITEM_ID "local patch complete; batch sync pending"
+```
+
+For larger reviewed batches, use the atomic form (the reason is one shell
+argument, followed by one or more individually reviewed IDs):
+
+```bash
+project-parity state-done-batch STATE_DB "reviewed and patched; batch sync pending" WORK_ITEM_ID...
+```
+
+`state-next` defaults to compact routing output so a bare invocation cannot
+dump 100 large evidence payloads into an agent context. Use `--full` only when
+you explicitly need the legacy full-payload response; `--summary` adds compact
+owner locators to routing output. Use `state-next STATE_DB 100 --routing` for
+each review slice, but amortize the
+expensive sync across up to 1,000 individually reviewed items. Mark each slice
+with `state-done-batch`; run one serialized `sync` when `pendingSync` reaches
+1,000 (or at the end if fewer remain). Never mark unseen work just to reach the
+threshold. The command validates every ID before writing any decision and
+preserves each payload snapshot, so a later sync reopens only changed evidence.
+
+Queue reads default to 100 items. The normal routing form avoids sending full
+evidence before the relevant shared batch is selected. Use `--summary` only when
+its reasons and owner/file counts with sample paths will change which evidence
+you inspect next; load complete evidence and all owner paths with `show-work` or
+`show-batch`.
+
+For the lowest-context routing pass, use
+`project-parity state-next STATE_DB 100`. Each selected ID appears once in
+`items`; `reviewGroups` maps semantic batches to item indexes, and
+`ownerGroups` groups transitively overlapping LOCAL file sets for safe review
+and worker partitioning; `upstreamGroups` groups items that reuse the same
+read-only upstream file owners, including ownerless LOCAL locators. Use the
+latter to avoid reopening the same upstream owner for each item. Both group
+lists are routing aids only; inspect and record each work-item verdict
+independently. Handle `ownerlessItemIndexes` via their upstream groups rather
+than dropping them from the slice.
+`unbatchedItemIndexes` identifies items without a semantic batch. Owner groups
+are routing only, not shared verdicts: validate every ID independently. This
+avoids repeating IDs and batch IDs in the
+response. Add `--summary` only when compact reasons
+and owner/file counts with sample paths will affect which evidence you inspect
+next. Load complete evidence once per group with
+`show-batch`, or use `show-work` for an individual item. Routing output is
+never sufficient evidence to mark work done.
+
+`inspect REPORT_DIRECTORY UNIT_ID [LIMIT] [OFFSET]` returns the exact source
+plus a bounded page of linked relations (25 by default). Continue from
+`nextOffset` until `remaining` is zero when the full relation set is needed;
+pagination bounds response/context size but does not reduce the legacy report
+scan cost.
+
+When a selected slice repeats a `batchId`, use `show-batch REPORT_DIR BATCH_ID`
+once to inspect that semantic owner’s full evidence together instead of making
+one `show-work` call per ID. For high-ambiguity batches, add `--compact`:
+identical fields move to `sharedFields`, and repeated inspection-node IDs are
+interned in `inspectNodeIdTable`; each item retains indexes in original order.
+This is lossless and reconstructs the same per-item evidence, while avoiding
+large repeated upstream candidate lists. The default remains the full v2
+response for compatibility. Still validate every work item separately, and
+only mark IDs from the selected slice that were individually reviewed; a batch
+page can also contain already-decided items or items beyond the slice.
+
+For selected IDs that belong to different batches (especially singleton
+batches), use `show-works REPORT_DIR WORK_ITEM_ID...`. It loads the indexed
+work-item locator once and returns complete evidence in the requested order;
+an unknown ID fails the command rather than returning a partial slice. This
+avoids reparsing the report index once per `show-work` process without
+weakening per-item review.
+
+For an existing state database, `project-parity state-optimize-queue STATE_DB`
+installs the derived priority/evidence-order index used by `state-next`. Within
+each priority/confidence tier, items sharing a semantic evidence batch are kept
+adjacent, reducing repeated `show-batch` loads across review slices. Proven
+evidence still precedes candidates, and weak/unknown evidence follows; this
+changes ordering only, never queue membership or decisions. It does not rescan
+either project. On older databases it adds/backfills only the derived
+`batch_id` locator and index; `sync` maintains that locator on new databases.
+
+For an evidence-backed vendor/compiler segment, the equivalent durable batch
+operation is:
+
+```bash
+project-parity state-skip-batch STATE_DB "installed vendor package" WORK_ITEM_ID...
+```
+
+`state-skip-batch` records durable skips, shown separately by `state-stats`.
+For ordinary reviewed work, `state-done-batch` records `pendingSync`; the next
+`sync` promotes unchanged reviewed payloads to durable `done`, while changed
+payloads return to the queue for fresh review. Use skip only for
+evidence-backed non-actionable/compiler/vendor cases.
+
+`state-next` keeps `remove-or-justify-extra-local` and
+`locate-unlinked-upstream-branch` in late phases so large low-priority cleanup
+candidate sets do not crowd out upstream functionality gaps. Neither phase is
+resolved or hidden: both remain in the queue, count toward `deferred`, and
+surface automatically after earlier phases are exhausted. Unlinked upstream
+roots have unknown ownership and package provenance, so they are P2 locators,
+not confirmed P0 defects.
 
 Use `--oracle FILE` when a fixture or reviewed corpus has expected stable
 source locators. Use `codegraph-import` only to add supplementary navigation
@@ -96,10 +205,13 @@ transport facade over the same parity engine; it cannot edit either input.
 
 Discovery is recursive and build-system agnostic. Common generated and vendor
 directories (`node_modules`, `target`, `coverage`, reports, and build output)
-are skipped to avoid duplicate owners; pass a prepared projection directory as
-an input when a build emits the authoritative executable surface. Upstream is
-read-only by convention. AST/graph correspondence is source evidence, not a
-claim of runtime, native, asset, or pixel equivalence.
+are skipped to avoid duplicate owners. One deliberate exception is a root
+`dist/` in a distribution-only input with no root `src/`, `source/`, or `lib/`:
+that directory is treated as the authoritative executable surface, while
+nested build directories remain excluded. This covers unpacked releases whose
+renderer exists only as shipped chunks. Upstream is read-only by convention.
+AST/graph correspondence is source evidence, not a claim of runtime, native,
+asset, or pixel equivalence.
 
 ## Bundled LLM skill
 

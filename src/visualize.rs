@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
 };
@@ -11,6 +11,24 @@ use serde_json::{json, Value};
 const MAX_SNIPPET_BYTES: usize = 24_000;
 const MAX_GRAPH_SNIPPET_BYTES: usize = 8_000;
 const GRAPH_OVERLAY_ARTIFACT: &str = "graph-overlay.json";
+
+#[derive(Default)]
+struct SourceCache {
+    files: HashMap<PathBuf, std::result::Result<String, String>>,
+}
+
+impl SourceCache {
+    fn read_to_string(&mut self, path: &Path) -> std::result::Result<&str, &str> {
+        let source = self
+            .files
+            .entry(path.to_path_buf())
+            .or_insert_with(|| fs::read_to_string(path).map_err(|error| error.to_string()));
+        match source {
+            Ok(source) => Ok(source),
+            Err(error) => Err(error),
+        }
+    }
+}
 
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,6 +106,15 @@ fn line_window(source: &str, line: usize) -> &str {
 }
 
 fn location_source_with_limit(root: &Path, location: &Value, limit: usize) -> Value {
+    location_source_with_cache(root, location, limit, &mut SourceCache::default())
+}
+
+fn location_source_with_cache(
+    root: &Path,
+    location: &Value,
+    limit: usize,
+    source_cache: &mut SourceCache,
+) -> Value {
     let Some(relative) = location.get("file").and_then(Value::as_str) else {
         return json!({"error": "location has no file"});
     };
@@ -98,7 +125,7 @@ fn location_source_with_limit(root: &Path, location: &Value, limit: usize) -> Va
         return json!({"error": "location has no end"});
     };
     let path = root.join(relative);
-    let source = match fs::read_to_string(&path) {
+    let source = match source_cache.read_to_string(&path) {
         Ok(source) => source,
         Err(error) => return json!({"error": format!("read {}: {error}", path.display())}),
     };
@@ -107,7 +134,7 @@ fn location_source_with_limit(root: &Path, location: &Value, limit: usize) -> Va
     let span = source.get(start..end).filter(|snippet| !snippet.is_empty());
     let snippet = span.unwrap_or_else(|| {
         line_window(
-            &source,
+            source,
             location.get("line").and_then(Value::as_u64).unwrap_or(1) as usize,
         )
     });
@@ -133,7 +160,12 @@ fn read_json_lines(path: &Path) -> Result<Vec<Value>> {
         .collect()
 }
 
-fn collect_graph_node(nodes: &mut BTreeMap<String, Value>, root: &Path, node: &Value) {
+fn collect_graph_node(
+    nodes: &mut BTreeMap<String, Value>,
+    root: &Path,
+    node: &Value,
+    source_cache: &mut SourceCache,
+) {
     let Some(id) = node.get("id").and_then(Value::as_str) else {
         return;
     };
@@ -141,7 +173,8 @@ fn collect_graph_node(nodes: &mut BTreeMap<String, Value>, root: &Path, node: &V
         return;
     }
     let mut enriched = node.clone();
-    enriched["source"] = location_source_with_limit(root, node, MAX_GRAPH_SNIPPET_BYTES);
+    enriched["source"] =
+        location_source_with_cache(root, node, MAX_GRAPH_SNIPPET_BYTES, source_cache);
     nodes.insert(id.to_string(), enriched);
 }
 
@@ -283,22 +316,58 @@ fn write_graph_overlay_artifact(output: &Path, report: &Value) -> Result<()> {
     let relations = read_json_lines(&output.join("graph-relations.jsonl"))?;
     let frontiers = read_json_lines(&output.join("divergence-frontiers.jsonl"))?;
     let mut nodes = BTreeMap::<String, Value>::new();
+    let mut source_cache = SourceCache::default();
     for relation in &relations {
-        collect_graph_node(&mut nodes, &left_root, &relation["left"]);
-        collect_graph_node(&mut nodes, &right_root, &relation["right"]);
+        collect_graph_node(&mut nodes, &left_root, &relation["left"], &mut source_cache);
+        collect_graph_node(
+            &mut nodes,
+            &right_root,
+            &relation["right"],
+            &mut source_cache,
+        );
         if relation.get("source").is_some_and(Value::is_object) {
-            collect_graph_node(&mut nodes, &left_root, &relation["source"]["left"]);
-            collect_graph_node(&mut nodes, &right_root, &relation["source"]["right"]);
+            collect_graph_node(
+                &mut nodes,
+                &left_root,
+                &relation["source"]["left"],
+                &mut source_cache,
+            );
+            collect_graph_node(
+                &mut nodes,
+                &right_root,
+                &relation["source"]["right"],
+                &mut source_cache,
+            );
         }
     }
     for frontier in &frontiers {
-        collect_graph_node(&mut nodes, &left_root, &frontier["sourceLeft"]);
-        collect_graph_node(&mut nodes, &right_root, &frontier["sourceRight"]);
+        collect_graph_node(
+            &mut nodes,
+            &left_root,
+            &frontier["sourceLeft"],
+            &mut source_cache,
+        );
+        collect_graph_node(
+            &mut nodes,
+            &right_root,
+            &frontier["sourceRight"],
+            &mut source_cache,
+        );
         if frontier.get("leftEdge").is_some_and(Value::is_object) {
-            collect_graph_node(&mut nodes, &left_root, &frontier["leftEdge"]["target"]);
+            collect_graph_node(
+                &mut nodes,
+                &left_root,
+                &frontier["leftEdge"]["target"],
+                &mut source_cache,
+            );
         }
         if frontier.get("rightEdge").is_some_and(Value::is_object) {
-            collect_graph_node(&mut nodes, &right_root, &frontier["rightEdge"]["target"]);
+            collect_graph_node(
+                &mut nodes,
+                &right_root,
+                &frontier["rightEdge"]["target"],
+                &mut source_cache,
+            );
         }
     }
     let system_map = build_system_map(report, &relations, &frontiers);
@@ -462,5 +531,34 @@ mod tests {
         assert!(excerpt["text"]
             .as_str()
             .is_some_and(|text| text.contains("const beta = 2;")));
+    }
+
+    #[test]
+    fn graph_overlay_source_cache_reads_each_source_path_once() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join("owner.ts"),
+            "const alpha = 1;\nconst beta = 2;\n",
+        )
+        .unwrap();
+        let mut nodes = BTreeMap::new();
+        let mut source_cache = SourceCache::default();
+
+        collect_graph_node(
+            &mut nodes,
+            root.path(),
+            &json!({"id": "left:first", "file": "owner.ts", "start": 0, "end": 16}),
+            &mut source_cache,
+        );
+        collect_graph_node(
+            &mut nodes,
+            root.path(),
+            &json!({"id": "left:second", "file": "owner.ts", "start": 17, "end": 32}),
+            &mut source_cache,
+        );
+
+        assert_eq!(source_cache.files.len(), 1);
+        assert_eq!(nodes["left:first"]["source"]["text"], "const alpha = 1;");
+        assert_eq!(nodes["left:second"]["source"]["text"], "const beta = 2;");
     }
 }
