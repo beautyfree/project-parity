@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet}, sync::Arc};
 
 use oxc_ast::ast::ImportOrExportKind;
 use oxc_ast::{
@@ -7,8 +7,11 @@ use oxc_ast::{
         ComputedMemberExpression, Declaration, ExportAllDeclaration, ExportDefaultDeclaration,
         ExportNamedDeclaration, Function, IdentifierReference, ImportDeclaration,
         ImportDeclarationSpecifier, ImportExpression, JSXElement, JSXElementName, ModuleExportName,
-        NewExpression, Program, PropertyKey, Statement, StaticMemberExpression, TSExportAssignment,
-        TSImportEqualsDeclaration, TSModuleReference, VariableDeclarator,
+        NewExpression, ParenthesizedExpression, Program, PropertyKey, Statement,
+        StaticMemberExpression, TSAsExpression, TSExportAssignment, TSImportEqualsDeclaration,
+        TSInstantiationExpression, TSModuleReference, TSNonNullExpression, TSSatisfiesExpression,
+        TSTypeAnnotation, TSTypeAssertion, TSTypeParameterDeclaration, TSTypeParameterInstantiation,
+        VariableDeclaration, VariableDeclarator,
     },
     AstKind,
 };
@@ -32,18 +35,30 @@ pub(crate) struct GraphNode {
     pub line: usize,
     pub scope: Option<String>,
     pub linked_sha256: String,
-    pub tokens: BTreeSet<String>,
+    pub tokens: BTreeSet<Arc<str>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GraphEdge {
-    pub source: String,
-    pub target: String,
+    pub source: Arc<String>,
+    pub target: Arc<String>,
     pub kind: String,
     pub dynamic: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+}
+
+pub(crate) fn share_graph_edge_ids(edges: &mut [GraphEdge], ids: &mut HashSet<Arc<String>>) {
+    for edge in edges {
+        for id in [&mut edge.source, &mut edge.target] {
+            if let Some(shared) = ids.get(id.as_ref()) {
+                *id = shared.clone();
+            } else {
+                ids.insert(id.clone());
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -65,6 +80,7 @@ struct GraphCollector<'a, 's> {
     semantic: &'a Semantic<'a>,
     nodes: Vec<PendingNode>,
     edges: BTreeSet<GraphEdge>,
+    edge_ids: HashSet<Arc<String>>,
     scope_stack: Vec<String>,
     owner_stack: Vec<String>,
     active_feature_nodes: Vec<usize>,
@@ -91,6 +107,7 @@ impl<'a, 's> GraphCollector<'a, 's> {
             semantic,
             nodes: Vec::new(),
             edges: BTreeSet::new(),
+            edge_ids: HashSet::new(),
             scope_stack: Vec::new(),
             owner_stack: Vec::new(),
             active_feature_nodes: Vec::new(),
@@ -152,13 +169,15 @@ impl<'a, 's> GraphCollector<'a, 's> {
         dynamic: bool,
         label: Option<String>,
     ) {
-        self.edges.insert(GraphEdge {
-            source: source.into(),
-            target: target.into(),
+        let mut edge = GraphEdge {
+            source: Arc::new(source.into()),
+            target: Arc::new(target.into()),
             kind: kind.to_string(),
             dynamic,
             label,
-        });
+        };
+        share_graph_edge_ids(std::slice::from_mut(&mut edge), &mut self.edge_ids);
+        self.edges.insert(edge);
     }
 
     fn begin_owned_node(&mut self, kind: &str, label: &str, span: Span) -> (String, usize) {
@@ -170,6 +189,15 @@ impl<'a, 's> GraphCollector<'a, 's> {
         self.owner_stack.push(id.clone());
         self.active_feature_nodes.push(index);
         (id, index)
+    }
+
+    fn begin_statement(&mut self, label: &str, span: Span) -> usize {
+        let container = self.current_container();
+        let (id, index) = self.begin_owned_node("Statement", label, span);
+        if let Some(previous) = self.last_statement_by_container.insert(container, id.clone()) {
+            self.add_edge(previous, id, "NextStatement", false, None);
+        }
+        index
     }
 
     /// Preserve source-level occurrences instead of collapsing every use of a
@@ -185,7 +213,9 @@ impl<'a, 's> GraphCollector<'a, 's> {
     }
 
     fn end_owned_node(&mut self, expected_index: usize) {
-        debug_assert_eq!(self.active_feature_nodes.pop(), Some(expected_index));
+        // Stack cleanup must run in release builds too; debug assertions may only inspect it.
+        let completed_index = self.active_feature_nodes.pop();
+        debug_assert_eq!(completed_index, Some(expected_index));
         self.owner_stack.pop();
     }
 
@@ -584,6 +614,7 @@ impl<'a, 's> GraphCollector<'a, 's> {
                 let graph_kind = match kind {
                     AstKind::Function(_) | AstKind::ArrowFunctionExpression(_) => "Function",
                     AstKind::Class(_) => "Class",
+                    AstKind::VariableDeclarator(_) => "Statement",
                     _ if kind.is_statement() || kind.is_declaration() => "Statement",
                     _ => return None,
                 };
@@ -638,6 +669,37 @@ impl<'a, 's> GraphCollector<'a, 's> {
 }
 
 impl<'a> Visit<'a> for GraphCollector<'a, '_> {
+    // Match CanonicalUnitCollector's runtime traversal before recording ordered features.
+    fn visit_parenthesized_expression(&mut self, expression: &ParenthesizedExpression<'a>) {
+        self.visit_expression(&expression.expression);
+    }
+
+    fn visit_ts_type_annotation(&mut self, _annotation: &TSTypeAnnotation<'a>) {}
+
+    fn visit_ts_type_parameter_declaration(&mut self, _parameters: &TSTypeParameterDeclaration<'a>) {}
+
+    fn visit_ts_type_parameter_instantiation(&mut self, _parameters: &TSTypeParameterInstantiation<'a>) {}
+
+    fn visit_ts_as_expression(&mut self, expression: &TSAsExpression<'a>) {
+        self.visit_expression(&expression.expression);
+    }
+
+    fn visit_ts_satisfies_expression(&mut self, expression: &TSSatisfiesExpression<'a>) {
+        self.visit_expression(&expression.expression);
+    }
+
+    fn visit_ts_type_assertion(&mut self, expression: &TSTypeAssertion<'a>) {
+        self.visit_expression(&expression.expression);
+    }
+
+    fn visit_ts_non_null_expression(&mut self, expression: &TSNonNullExpression<'a>) {
+        self.visit_expression(&expression.expression);
+    }
+
+    fn visit_ts_instantiation_expression(&mut self, expression: &TSInstantiationExpression<'a>) {
+        self.visit_expression(&expression.expression);
+    }
+
     fn enter_node(&mut self, kind: AstKind<'a>) {
         // Parent/child relationships carry nested behavior. Recording an AST node into every
         // enclosing statement makes monolithic bundles quadratic in lexical depth and also
@@ -675,18 +737,24 @@ impl<'a> Visit<'a> for GraphCollector<'a, '_> {
     }
 
     fn visit_statement(&mut self, statement: &Statement<'a>) {
+        // Grouped and separate declarations execute the same initializers in source order.
+        if let Statement::VariableDeclaration(declaration) = statement {
+            self.visit_variable_declaration(declaration);
+            return;
+        }
         let span = statement.span();
         let label = format!("{:?}", std::mem::discriminant(statement));
-        let container = self.current_container();
-        let (id, index) = self.begin_owned_node("Statement", &label, span);
-        if let Some(previous) = self
-            .last_statement_by_container
-            .insert(container, id.clone())
-        {
-            self.add_edge(previous, id, "NextStatement", false, None);
-        }
+        let index = self.begin_statement(&label, span);
         walk::walk_statement(self, statement);
         self.end_owned_node(index);
+    }
+
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        for declarator in &declaration.declarations {
+            let index = self.begin_statement("VariableDeclarator", declarator.span);
+            self.visit_variable_declarator(declarator);
+            self.end_owned_node(index);
+        }
     }
 
     fn visit_function(&mut self, function: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {

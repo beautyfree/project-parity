@@ -12,7 +12,52 @@ use std::{
 
 use super::ENGINE_VERSION;
 
+fn routing_reclassification_preserves_evidence(previous: &str, current: &str) -> bool {
+    let Ok(mut previous) = serde_json::from_str::<Value>(previous) else {
+        return false;
+    };
+    let Ok(mut current) = serde_json::from_str::<Value>(current) else {
+        return false;
+    };
+    let previous_action = previous["action"].as_str();
+    let current_action = current["action"].as_str();
+    let same_frontier = matches!(
+        (previous_action, current_action),
+        (
+            Some("port-missing-upstream-branch"),
+            Some("inspect-unverified-missing-branch")
+        ) | (
+            Some("reconcile-changed-branch"),
+            Some("inspect-unverified-changed-branch")
+        ) | (
+            Some("port-missing-upstream-branch"),
+            Some("inspect-weak-missing-branch")
+        )
+            | (Some("reconcile-changed-branch"), Some("inspect-weak-changed-branch"))
+            | (
+                Some("inspect-weak-missing-branch"),
+                Some("inspect-unverified-missing-branch")
+            )
+            | (
+                Some("inspect-weak-changed-branch"),
+                Some("inspect-unverified-changed-branch")
+            )
+    );
+    if !same_frontier {
+        return false;
+    }
+    for value in [&mut previous, &mut current] {
+        if let Some(object) = value.as_object_mut() {
+            for key in ["action", "priority", "confidence", "reason", "batchId"] {
+                object.remove(key);
+            }
+        }
+    }
+    previous == current
+}
+
 pub fn sync(db_path: &Path, report: &Path) -> Result<Value> {
+    let shared = super::llm_context::read_shared_work_evidence(report)?;
     let conn = Connection::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, report TEXT NOT NULL, upstream_hash TEXT, local_hash TEXT, synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS work_items (id TEXT PRIMARY KEY, run_id INTEGER NOT NULL, action TEXT, priority TEXT, confidence TEXT, payload TEXT NOT NULL, first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, resolved_at TEXT, batch_id TEXT, FOREIGN KEY(run_id) REFERENCES runs(id)); CREATE TABLE IF NOT EXISTS work_item_decisions (work_item_id TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN ('skipped','pending_sync','done')), reason TEXT NOT NULL, decided_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, payload TEXT, FOREIGN KEY(work_item_id) REFERENCES work_items(id)); CREATE INDEX IF NOT EXISTS work_items_queue ON work_items(resolved_at, priority, id); CREATE INDEX IF NOT EXISTS work_items_queue_phase ON work_items(resolved_at, CASE WHEN action='remove-or-justify-extra-local' THEN 4 WHEN action='locate-unlinked-upstream-branch' THEN 5 WHEN priority='P0' THEN 0 WHEN priority='P1' THEN 1 ELSE 2 END, id); CREATE INDEX IF NOT EXISTS work_items_queue_phase_confidence ON work_items(resolved_at, CASE WHEN action='remove-or-justify-extra-local' THEN 4 WHEN action='locate-unlinked-upstream-branch' THEN 5 WHEN priority='P0' THEN 0 WHEN priority='P1' THEN 1 ELSE 2 END, CASE confidence WHEN 'proven-structure' THEN 0 WHEN 'proven-bundle-normalized' THEN 0 WHEN 'candidate' THEN 1 WHEN 'weak-candidate' THEN 2 ELSE 3 END, id); CREATE INDEX IF NOT EXISTS work_item_decisions_status ON work_item_decisions(status);")?;
     ensure_batch_schema(&conn)?;
@@ -24,6 +69,7 @@ pub fn sync(db_path: &Path, report: &Path) -> Result<Value> {
         [],
         |row| row.get(0),
     )?;
+    let tx = conn.unchecked_transaction()?;
     conn.execute(
         "INSERT INTO runs(report, upstream_hash, local_hash) VALUES (?1,?2,?3)",
         params![
@@ -36,7 +82,6 @@ pub fn sync(db_path: &Path, report: &Path) -> Result<Value> {
     )?;
     let run_id = conn.last_insert_rowid();
     let file = fs::File::open(report.join("llm-work-items.jsonl"))?;
-    let tx = conn.unchecked_transaction()?;
     let mut seen = 0usize;
     for line in BufReader::new(file).lines() {
         let line = line?;
@@ -44,6 +89,14 @@ pub fn sync(db_path: &Path, report: &Path) -> Result<Value> {
             continue;
         }
         let item: Value = serde_json::from_str(&line)?;
+        let compact = item.get("upstreamEvidenceRef").is_some()
+            || item.get("inspectNodeIdsFromOwners").is_some();
+        let item = super::llm_context::expand_work_evidence(item, &shared)?;
+        let line = if compact {
+            serde_json::to_string(&item)?
+        } else {
+            line
+        };
         let id = item["id"].as_str().context("work item has no id")?;
         tx.execute("INSERT INTO work_items(id,run_id,action,priority,confidence,payload,last_seen,resolved_at,batch_id) VALUES (?1,?2,?3,?4,?5,?6,CURRENT_TIMESTAMP,NULL,?7) ON CONFLICT(id) DO UPDATE SET run_id=excluded.run_id, action=excluded.action, priority=excluded.priority, confidence=excluded.confidence, payload=excluded.payload, last_seen=CURRENT_TIMESTAMP, resolved_at=NULL, batch_id=excluded.batch_id", params![id, run_id, item["action"].as_str(), item["priority"].as_str(), item["confidence"].as_str(), line, item["batchId"].as_str()])?;
         seen += 1;
@@ -52,7 +105,31 @@ pub fn sync(db_path: &Path, report: &Path) -> Result<Value> {
         "UPDATE work_items SET resolved_at=CURRENT_TIMESTAMP WHERE run_id <> ?1 AND resolved_at IS NULL",
         params![run_id],
     )?;
-    tx.commit()?;
+    // A graph-only frontier is now routed as an inspection rather than a
+    // repair. Preserve a reviewed decision only when its owner and complete
+    // evidence payload are unchanged; substantive evidence changes still
+    // reopen the item below.
+    let reclassified = {
+        let mut stmt = tx.prepare(
+            "SELECT d.work_item_id, d.payload, w.payload FROM work_item_decisions d JOIN work_items w ON w.id=d.work_item_id WHERE w.run_id=?1 AND w.resolved_at IS NULL AND d.payload IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![run_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, previous, current) in reclassified {
+        if routing_reclassification_preserves_evidence(&previous, &current) {
+            tx.execute(
+                "UPDATE work_item_decisions SET payload=?2 WHERE work_item_id=?1",
+                params![id, current],
+            )?;
+        }
+    }
     let reopened: i64 = conn.query_row(
         "SELECT COUNT(*) FROM work_item_decisions d JOIN work_items w ON w.id=d.work_item_id WHERE w.run_id=?1 AND w.resolved_at IS NULL AND d.payload IS NOT NULL AND w.payload <> d.payload",
         params![run_id],
@@ -73,6 +150,7 @@ pub fn sync(db_path: &Path, report: &Path) -> Result<Value> {
     )?;
     let new_items = (remaining - previous_unresolved).max(0);
     let resolved = (previous_unresolved - remaining).max(0);
+    tx.commit()?;
     Ok(
         serde_json::json!({"schema":"project-parity/state-sync-v1","runId":run_id,"workItems":seen,"new":new_items,"resolved":resolved,"reopened":reopened,"pendingReleased":pending_released,"remaining":remaining,"db":db_path}),
     )
@@ -1649,6 +1727,99 @@ mod tests {
         let result = sync(&db, root.path()).unwrap();
         assert_eq!(result["reopened"], 1);
         assert_eq!(next(&db, 10).unwrap()["count"], 1);
+    }
+
+    #[test]
+    fn structural_reclassification_preserves_same_evidence_but_reopens_changed_evidence() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("state.sqlite");
+        fs::write(
+            root.path().join("llm-manifest.json"),
+            r#"{"inputHashes":{"upstream":"u","reproduction":"l"}}"#,
+        )
+        .unwrap();
+        let mut item = serde_json::json!({
+            "id":"work:owner-pair",
+            "action":"port-missing-upstream-branch",
+            "priority":"P0",
+            "confidence":"candidate",
+            "reason":"A typed upstream edge has no local counterpart.",
+            "batchId":"batch:port",
+            "local":[{"id":"left:edge","file":"src/local.ts","line":10}],
+            "upstream":[{"id":"right:edge","file":"dist/chunk.js","line":20}],
+            "evidencePath":[{"basis":"seed-unit","left":{"id":"left:owner"},"right":{"id":"right:owner"}}],
+            "inspectNodeIds":["left:edge","right:edge"]
+        });
+        fs::write(
+            root.path().join("llm-work-items.jsonl"),
+            format!("{}\n", serde_json::to_string(&item).unwrap()),
+        )
+        .unwrap();
+        sync(&db, root.path()).unwrap();
+        mark_pending_sync(&db, "work:owner-pair", "reviewed; no local change needed").unwrap();
+
+        item["action"] = serde_json::json!("inspect-unverified-missing-branch");
+        item["priority"] = serde_json::json!("P2");
+        item["confidence"] = serde_json::json!("weak-candidate");
+        item["reason"] = serde_json::json!("Inspect behavior before proposing a source change.");
+        item["batchId"] = serde_json::json!("batch:inspect");
+        fs::write(
+            root.path().join("llm-work-items.jsonl"),
+            format!("{}\n", serde_json::to_string(&item).unwrap()),
+        )
+        .unwrap();
+        let result = sync(&db, root.path()).unwrap();
+        assert_eq!(result["reopened"], 0);
+        assert_eq!(stats(&db).unwrap()["done"], 1);
+
+        item["upstream"][0]["line"] = serde_json::json!(21);
+        fs::write(
+            root.path().join("llm-work-items.jsonl"),
+            format!("{}\n", serde_json::to_string(&item).unwrap()),
+        )
+        .unwrap();
+        let result = sync(&db, root.path()).unwrap();
+        assert_eq!(result["reopened"], 1);
+        assert_eq!(next(&db, 10).unwrap()["count"], 1);
+    }
+
+    #[test]
+    fn weak_to_unverified_reclassification_preserves_reviewed_evidence() {
+        for (previous_action, current_action) in [
+            (
+                "inspect-weak-missing-branch",
+                "inspect-unverified-missing-branch",
+            ),
+            (
+                "inspect-weak-changed-branch",
+                "inspect-unverified-changed-branch",
+            ),
+        ] {
+            let previous = serde_json::json!({
+                "id": "work:owner-pair",
+                "action": previous_action,
+                "priority": "P2",
+                "confidence": "weak-candidate",
+                "reason": "Only structural AST edges differ.",
+                "batchId": "batch:old",
+                "local": [{"id":"left:edge","file":"src/local.ts","line":10}],
+                "upstream": [{"id":"right:edge","file":"dist/chunk.js","line":20}]
+            });
+            let current = serde_json::json!({
+                "id": "work:owner-pair",
+                "action": current_action,
+                "priority": "P2",
+                "confidence": "weak-candidate",
+                "reason": "Inspect semantics before proposing a source change.",
+                "batchId": "batch:new",
+                "local": [{"id":"left:edge","file":"src/local.ts","line":10}],
+                "upstream": [{"id":"right:edge","file":"dist/chunk.js","line":20}]
+            });
+            assert!(routing_reclassification_preserves_evidence(
+                &previous.to_string(),
+                &current.to_string()
+            ));
+        }
     }
 
     #[test]

@@ -177,6 +177,22 @@ lossless compressed graph/ledger artifacts, source-hash-checked inspectors,
 are prioritized P0/P1/P2 and retain missing, changed, ambiguous, candidate,
 dependency, caller, scope, import, export, and package provenance evidence.
 
+Group candidates require every member to explain additional target feature
+counts and score better together than the best individual member. Repeated
+operations are counted, while unrelated lookalike functions
+cannot improve a group merely by increasing its size. These are still candidate
+correspondences; rejected groups retain their individual ranked ambiguities
+and work items for review.
+
+Large repeated ambiguity candidate arrays are stored once in
+`llm-shared-evidence.jsonl`, addressed by SHA256 through
+`upstreamEvidenceRef`. An exact owner-ID sequence may also be represented by
+`inspectNodeIdsFromOwners`. CLI inspectors restore the complete evidence;
+`state-sync` stores and compares the expanded canonical payload, so this storage
+change preserves existing review decisions. Missing or corrupt shared evidence
+fails the operation and rolls back state synchronization. Older inline reports
+remain readable; the engine version guards queue use across format changes.
+
 Byte-identical source files are promoted to proven coverage before fuzzy
 matching, including their non-executable graph context. Auditing a project
 against itself therefore produces an empty repair queue instead of false work

@@ -5,7 +5,7 @@ use std::{
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime},
 };
@@ -34,19 +34,22 @@ use sha2::{Digest, Sha256};
 use sourcemap::DecodedMap;
 use walkdir::{DirEntry, WalkDir};
 
+mod dependency_entry;
 mod llm_context;
+mod project_cache;
 mod semantic_graph;
+mod source_file_filter;
 mod state;
 mod visualize;
 
-use semantic_graph::{GraphEdge, GraphNode, SemanticGraph};
+use semantic_graph::{share_graph_edge_ids, GraphEdge, GraphNode, SemanticGraph};
 
 const CODE_EXTENSIONS: &[&str] = &["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"];
-const ENGINE_VERSION: &str = "rust-oxc-0.126.0/v39";
+const ENGINE_VERSION: &str = "rust-oxc-0.126.0/v71";
 // Graph extraction is cache material: change this whenever semantic nodes or
 // edges change, otherwise an old cache silently erases newly added ownership
 // links from a report.
-const INDEX_CACHE_VERSION: &str = "rust-oxc-0.126.0/v32";
+const INDEX_CACHE_VERSION: &str = "rust-oxc-0.126.0/v38";
 thread_local! {
     // Graph similarity compares many pairs that reuse the same finite token
     // vocabulary. Cache the pure token normalization, not pair scores, so
@@ -57,6 +60,8 @@ thread_local! {
 }
 const SKIP_DIRECTORIES: &[&str] = &[
     ".git",
+    // Tool-owned reports, snapshots and fixture runtimes are not project source.
+    ".parity",
     ".cache",
     ".output",
     "build",
@@ -93,7 +98,7 @@ struct Unit {
     nodes_approx: usize,
     strict_sha256: String,
     linked_sha256: String,
-    tokens: BTreeSet<String>,
+    tokens: BTreeSet<Arc<str>>,
     features: FeatureChannels,
 }
 
@@ -108,12 +113,12 @@ struct SourceOrigin {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct FeatureChannels {
-    shape: BTreeMap<String, u32>,
-    ordered: BTreeMap<String, u32>,
-    literals: BTreeMap<String, u32>,
-    operators: BTreeMap<String, u32>,
-    properties: BTreeMap<String, u32>,
-    externals: BTreeMap<String, u32>,
+    shape: BTreeMap<Arc<str>, u32>,
+    ordered: BTreeMap<Arc<str>, u32>,
+    literals: BTreeMap<Arc<str>, u32>,
+    operators: BTreeMap<Arc<str>, u32>,
+    properties: BTreeMap<Arc<str>, u32>,
+    externals: BTreeMap<Arc<str>, u32>,
     #[serde(skip)]
     last_event: Option<String>,
     #[serde(skip)]
@@ -686,11 +691,11 @@ impl<'a> Visit<'a> for UnitCollector {
 }
 
 impl FeatureChannels {
-    fn increment(channel: &mut BTreeMap<String, u32>, value: impl Into<String>) {
-        *channel.entry(value.into()).or_default() += 1;
+    fn increment(channel: &mut BTreeMap<Arc<str>, u32>, value: impl Into<String>) {
+        *channel.entry(Arc::from(value.into())).or_default() += 1;
     }
 
-    fn token_set(&self) -> BTreeSet<String> {
+    fn token_set(&self) -> BTreeSet<Arc<str>> {
         let mut tokens = BTreeSet::new();
         for (channel, values) in [
             ("shape", &self.shape),
@@ -703,7 +708,7 @@ impl FeatureChannels {
             tokens.extend(
                 values
                     .iter()
-                    .map(|(value, count)| format!("{channel}:{value}:{count}")),
+                    .map(|(value, count)| Arc::<str>::from(format!("{channel}:{value}:{count}"))),
             );
         }
         tokens
@@ -762,6 +767,20 @@ fn record_ast_feature(features: &mut FeatureChannels, source: &str, kind: AstKin
     let node = format!("{:?}", kind.ty());
     FeatureChannels::increment(&mut features.shape, &node);
     features.record_event(format!("node:{node}"));
+    // Execution modifiers must participate in the existing operator gate.
+    let protocol = match kind {
+        AstKind::AwaitExpression(_) => Some("Await"),
+        AstKind::CallExpression(call) if call.optional => Some("OptionalCall"),
+        AstKind::Function(function) if function.r#async && function.generator => Some("AsyncGeneratorFunction"),
+        AstKind::Function(function) if function.r#async => Some("AsyncFunction"),
+        AstKind::Function(function) if function.generator => Some("GeneratorFunction"),
+        AstKind::ArrowFunctionExpression(function) if function.r#async => Some("AsyncFunction"),
+        _ => None,
+    };
+    if let Some(protocol) = protocol {
+        FeatureChannels::increment(&mut features.operators, protocol);
+        features.record_event(format!("operator:{protocol}"));
+    }
     match kind {
         AstKind::BindingIdentifier(identifier) => {
             let name = identifier.name.as_str();
@@ -1073,8 +1092,7 @@ fn is_derivative_duplicate(path: &Path) -> bool {
     };
     // webcrack's numbered module directory is another projection of the
     // deobfuscated main bundle. Keeping both projections as executable owners
-    // manufactures dependency-only work items (for example core-js helpers)
-    // with no additional shipped behavior.
+    // manufactures dependency-only work items with no extra shipped behavior.
     if parent_name == "dist-electron-unpacked"
         && parent
             .parent()
@@ -1092,6 +1110,104 @@ fn is_derivative_duplicate(path: &Path) -> bool {
         .with_file_name(format!("{parent_name}-deobfuscated"))
         .join(file_name)
         .is_file()
+}
+
+fn is_conventionally_filtered_source(relative: &str) -> bool {
+    relative.contains("/__tests__/")
+        || [".test.", ".spec.", ".stories."]
+            .iter()
+            .any(|needle| relative.contains(needle))
+}
+
+/// Read only runtime module edges from a source file. A parse failure leaves the
+/// file out of the rescue set: discovery must not guess an import target.
+fn runtime_module_specifiers(path: &Path, relative: &str) -> BTreeSet<String> {
+    let Ok(source) = fs::read_to_string(path) else {
+        return BTreeSet::new();
+    };
+    let Ok(source_type) = SourceType::from_path(path) else {
+        return BTreeSet::new();
+    };
+    let source_type = if source_type.is_javascript() {
+        source_type.with_jsx(true)
+    } else {
+        source_type
+    };
+    let Ok((_, _, graph)) = canonicalize(&source, source_type, relative, "discovery") else {
+        return BTreeSet::new();
+    };
+    let module_nodes = graph
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node.label.as_str()))
+        .collect::<HashMap<_, _>>();
+    graph
+        .edges
+        .iter()
+        .filter(|edge| {
+            matches!(
+                edge.kind.as_str(),
+                "Imports"
+                    | "ImportsBinding"
+                    | "Requires"
+                    | "RequiresBinding"
+                    | "DynamicImports"
+                    | "DynamicImportsBinding"
+                    | "ReExports"
+                    | "ReExportsBinding"
+            )
+        })
+        .filter_map(|edge| module_nodes.get(edge.target.as_str()))
+        .filter_map(|label| label.strip_prefix("module:"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Filename conventions are a useful bulk-corpus reduction, but a module
+/// reached through an exact relative runtime import still belongs to the
+/// executable graph. Follow only paths that resolve uniquely and were already
+/// observed candidate files; unresolved and package imports
+/// remain outside the rescue set.
+fn rescue_reachable_source_candidates(
+    root: &Path,
+    files: &mut Vec<(PathBuf, String)>,
+    filtered: Vec<(PathBuf, String)>,
+) {
+    let candidates = filtered
+        .into_iter()
+        .filter_map(|(path, relative)| path.canonicalize().ok().map(|path| (path, relative)))
+        .collect::<HashMap<_, _>>();
+    if candidates.is_empty() {
+        return;
+    }
+    let mut included = files
+        .iter()
+        .filter_map(|(path, relative)| path.canonicalize().ok().map(|path| (path, relative.clone())))
+        .collect::<HashMap<_, _>>();
+    let mut queue = included.keys().cloned().collect::<VecDeque<_>>();
+    while let Some(importer) = queue.pop_front() {
+        let Some(importer_relative) = included.get(&importer) else {
+            continue;
+        };
+        for specifier in runtime_module_specifiers(&importer, importer_relative) {
+            if !specifier.starts_with('.') {
+                continue;
+            }
+            let Some(resolved) = resolve_relative_source(&importer, &specifier) else {
+                continue;
+            };
+            if !resolved.starts_with(root) || included.contains_key(&resolved) {
+                continue;
+            }
+            let Some(relative) = candidates.get(&resolved) else {
+                continue;
+            };
+            included.insert(resolved.clone(), relative.clone());
+            queue.push_back(resolved);
+        }
+    }
+    *files = included.into_iter().collect();
+    files.sort_by(|left, right| left.1.cmp(&right.1));
 }
 
 fn discover(input: &Path) -> Result<Discovery> {
@@ -1133,6 +1249,7 @@ fn discover(input: &Path) -> Result<Discovery> {
         projection_tool: None,
     };
     let mut files = Vec::new();
+    let mut filtered = Vec::new();
     let mut skipped = Vec::new();
     for selected_root in selected {
         for entry in WalkDir::new(&selected_root)
@@ -1165,9 +1282,6 @@ fn discover(input: &Path) -> Result<Discovery> {
             if !CODE_EXTENSIONS.contains(&extension) {
                 continue;
             }
-            // A deobfuscated sibling is the source-faithful analysis view of
-            // the same shipped bundle. Do not create impossible LOCAL parity
-            // work for the raw derivative when both artifacts are present.
             if is_derivative_duplicate(path) {
                 continue;
             }
@@ -1176,17 +1290,14 @@ fn discover(input: &Path) -> Result<Discovery> {
                 .unwrap_or(path)
                 .to_string_lossy()
                 .to_string();
-            if relative.contains("/__tests__/")
-                || [".test.", ".spec.", ".stories."]
-                    .iter()
-                    .any(|needle| relative.contains(needle))
-            {
+            if is_conventionally_filtered_source(&relative) {
+                filtered.push((path.to_path_buf(), relative));
                 continue;
             }
             files.push((path.to_path_buf(), relative));
         }
     }
-    files.sort_by(|left, right| left.1.cmp(&right.1));
+    rescue_reachable_source_candidates(&root, &mut files, filtered);
     skipped.sort();
     skipped.dedup();
     Ok(Discovery {
@@ -1203,6 +1314,10 @@ struct PackageManifest {
     version: Option<String>,
     #[serde(default)]
     main: Option<String>,
+    #[serde(default)]
+    module: Option<String>,
+    #[serde(default)]
+    bin: Option<JsonValue>,
     #[serde(default)]
     exports: Option<JsonValue>,
     #[serde(default)]
@@ -1620,6 +1735,130 @@ fn package_export_paths(
     }
 }
 
+/// Manifest declarations express executable package intent even when an entry
+/// happens to live below a normally pruned fixture/test directory.  Preserve
+/// the legacy `main` declaration and exact export subpaths, but do not invent
+/// a concrete target for wildcard or unresolved conditional exports.
+fn manifest_declared_runtime_entries(
+    package_root: &Path,
+    manifest: &PackageManifest,
+) -> HashSet<PathBuf> {
+    let mut entries = HashSet::new();
+
+    // `main` can coexist with `exports` in packages that retain a legacy
+    // executable entry for older consumers.  Without exports, preserve the
+    // normal Node fallback to index.js as well.
+    if manifest.main.is_some() || manifest.exports.is_none() {
+        let main = manifest.main.as_deref().unwrap_or("index.js");
+        if let Some(path) = resolve_package_file(package_root, main) {
+            entries.insert(path);
+        }
+    }
+
+    // `module` and `bin` are executable declarations too. They may be the
+    // only reference to a file outside the selected distribution directory,
+    // and therefore must bypass bulk documentation filtering below.
+    if let Some(module) = manifest.module.as_deref() {
+        if let Some(path) = resolve_package_file(package_root, module) {
+            entries.insert(path);
+        }
+    }
+    if let Some(bin) = &manifest.bin {
+        let mut add_bin = |target: &str| {
+            if let Some(path) = resolve_package_file(package_root, target) {
+                entries.insert(path);
+            }
+        };
+        match bin {
+            JsonValue::String(target) => add_bin(target),
+            JsonValue::Object(entries_by_name) => {
+                for target in entries_by_name.values().filter_map(JsonValue::as_str) {
+                    add_bin(target);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(exports) = &manifest.exports {
+        let mut add_exact_paths = |paths: PackageExportPaths| {
+            if paths.paths.len() == 1 && !paths.blocked_or_unresolved {
+                entries.extend(paths.paths);
+            }
+        };
+        if let JsonValue::Object(map) = exports {
+            if map.keys().any(|key| key.starts_with('.')) {
+                for (key, value) in map {
+                    if key.starts_with('.') && !key.contains('*') {
+                        add_exact_paths(package_export_paths(package_root, value, ""));
+                    }
+                }
+            } else {
+                add_exact_paths(package_export_paths(package_root, exports, ""));
+            }
+        } else {
+            add_exact_paths(package_export_paths(package_root, exports, ""));
+        }
+    }
+
+    entries.retain(|entry| {
+        entry.extension().and_then(|ext| ext.to_str())
+            .is_some_and(|ext| CODE_EXTENSIONS.contains(&ext))
+            && !entry.to_string_lossy().ends_with(".d.ts")
+    });
+    entries
+}
+
+/// The selected dependency root remains the bulk corpus. This second walk is
+/// only an exact-resolution candidate set, so an entrypoint can retain a
+/// relative closure that crosses into source, tests, or another package-local
+/// directory without indexing those directories wholesale.
+fn dependency_reachable_source_candidates(
+    package_root: &Path,
+    package_key: &str,
+) -> Vec<(PathBuf, String)> {
+    let mut candidates = Vec::new();
+    for entry in WalkDir::new(package_root)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            !(entry.file_type().is_dir()
+                && matches!(
+                    entry.file_name().to_string_lossy().as_ref(),
+                    ".git" | ".history" | "node_modules"
+                ))
+        })
+    {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".d.ts"))
+        {
+            continue;
+        }
+        let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+            continue;
+        };
+        if !CODE_EXTENSIONS.contains(&extension) {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(package_root) else {
+            continue;
+        };
+        candidates.push((
+            path.to_path_buf(),
+            format!("npm/{package_key}//{}", relative.display()),
+        ));
+    }
+    candidates
+}
+
 fn resolve_installed_package_entry(
     package_root: &Path,
     manifest: &PackageManifest,
@@ -1900,7 +2139,7 @@ fn dependency_provenance(index: &ProjectIndex, side: &str) -> Vec<DependencyProv
             edge.kind.as_str(),
             "ImportsBinding" | "TypeImportsBinding" | "RequiresBinding" | "DynamicImportsBinding"
         )
-        .then(|| edge.source.clone());
+        .then(|| edge.source.as_ref().clone());
         let importer_file = nodes
             .get(edge.source.as_str())
             .map(|node| node.file.clone())
@@ -2517,8 +2756,34 @@ fn discover_dependencies(
         let selected_root = ["dist", "lib", "cjs", "esm", "build"]
             .into_iter()
             .map(|relative| package_root.join(relative))
-            .find(|candidate| candidate.is_dir())
+            .find(|candidate| {
+                candidate.is_dir() && WalkDir::new(candidate).follow_links(false).into_iter()
+                    .filter_map(|entry| entry.ok())
+                    .any(|entry| entry.file_type().is_file()
+                        && !entry.file_name().to_string_lossy().ends_with(".d.ts")
+                        && entry.path().extension().and_then(|ext| ext.to_str())
+                            .is_some_and(|ext| CODE_EXTENSIONS.contains(&ext))
+                        && !is_conventionally_filtered_source(
+                            &entry.path()
+                                .strip_prefix(package_root)
+                                .unwrap_or(entry.path())
+                                .to_string_lossy(),
+                        )
+                        && !is_dependency_readme_documentation(entry.path()))
+            })
             .unwrap_or_else(|| package_root.clone());
+        // Generated/native output directories must not hide declared package entrypoints.
+        // A manifest is executable intent, so it overrides the source-oracle
+        // filename convention even when the entry lives in the selected root.
+        let declared_entries = read_package_manifest(&package_root.join("package.json"))
+            .map(|manifest| manifest_declared_runtime_entries(package_root, &manifest))
+            .unwrap_or_default();
+        let mut package_files = Vec::new();
+        let mut filtered = Vec::new();
+        for entry in &declared_entries {
+            let Ok(relative) = entry.strip_prefix(package_root) else { continue };
+            package_files.push((entry.clone(), format!("npm/{package_key}//{}", relative.display())));
+        }
         for entry in WalkDir::new(&selected_root)
             .follow_links(false)
             .sort_by_file_name()
@@ -2570,25 +2835,36 @@ fn discover_dependencies(
             if !CODE_EXTENSIONS.contains(&extension) {
                 continue;
             }
-            let package_relative = path.strip_prefix(&selected_root).unwrap_or(path);
-            if [".test.", ".spec.", ".stories."]
-                .iter()
-                .any(|needle| package_relative.to_string_lossy().contains(needle))
-            {
+            // Declared entries were injected above with their package-root
+            // locator, which is the one authenticated against PackageEntry.
+            // Do not add a second selected-root locator for the same file.
+            if declared_entries.contains(path) {
                 continue;
             }
-            files.push((
-                path.to_path_buf(),
-                format!(
-                    "npm/{package_key}/{}/{}",
-                    selected_root
-                        .strip_prefix(package_root)
-                        .unwrap_or(&selected_root)
-                        .display(),
-                    package_relative.display()
-                ),
-            ));
+            if is_dependency_readme_documentation(path) {
+                continue;
+            }
+            let package_relative = path.strip_prefix(&selected_root).unwrap_or(path);
+            let locator = format!(
+                "npm/{package_key}/{}/{}",
+                selected_root
+                    .strip_prefix(package_root)
+                    .unwrap_or(&selected_root)
+                    .display(),
+                package_relative.display()
+            );
+            if is_conventionally_filtered_source(&package_relative.to_string_lossy()) {
+                filtered.push((path.to_path_buf(), locator));
+                continue;
+            }
+            package_files.push((path.to_path_buf(), locator));
         }
+        let mut candidates = dependency_reachable_source_candidates(package_root, &package_key);
+        // Preserve the selected-root locator for its conventionally filtered
+        // files; candidates outside that root use the package-root locator.
+        candidates.extend(filtered);
+        rescue_reachable_source_candidates(package_root, &mut package_files, candidates);
+        files.extend(package_files);
     }
     files.sort_by(|left, right| left.1.cmp(&right.1));
     files.dedup_by(|left, right| left.1 == right.1);
@@ -2609,6 +2885,47 @@ fn discover_dependencies(
             projection_tool: None,
         },
     }))
+}
+
+fn looks_like_markdown_documentation(source: &str) -> bool {
+    source
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| {
+            let line = line.trim_start();
+            line.starts_with("# ")
+                || line.starts_with("##")
+                || line.starts_with("**")
+                || line.starts_with("```")
+                || line.starts_with("- ")
+        })
+}
+
+/// README filenames alone are not enough to reject a dependency file: some
+/// packages intentionally expose a README.js entrypoint. Suppress the file
+/// only when it cannot parse as its declared code family and its contents have
+/// a Markdown marker. Unreadable or malformed runtime code stays visible as a
+/// normal parse failure instead of being silently hidden.
+fn is_dependency_readme_documentation(path: &Path) -> bool {
+    if !source_file_filter::is_dependency_readme_candidate(path, CODE_EXTENSIONS) {
+        return false;
+    }
+    let Ok(source) = fs::read_to_string(path) else {
+        return false;
+    };
+    if !looks_like_markdown_documentation(&source) {
+        return false;
+    }
+    let Ok(source_type) = SourceType::from_path(path) else {
+        return false;
+    };
+    let source_type = if source_type.is_javascript() {
+        source_type.with_jsx(true)
+    } else {
+        source_type
+    };
+    let allocator = Allocator::default();
+    !Parser::new(&allocator, &source, source_type).parse().errors.is_empty()
 }
 
 fn cache_root() -> PathBuf {
@@ -2659,6 +2976,105 @@ fn load_adjacent_source_map(path: &Path) -> Option<LoadedSourceMap> {
     }
 }
 
+fn index_cache_path(
+    path: &Path,
+    relative: &str,
+    side: &str,
+    cache_dir: &Path,
+    source_sha256: &str,
+    source_map_fingerprint: &str,
+) -> PathBuf {
+    let cache_key = sha256(format!(
+        "{INDEX_CACHE_VERSION}\0{}\0{side}\0{relative}\0{source_sha256}\0{source_map_fingerprint}",
+        path.display()
+    ));
+    cache_dir.join(format!("{cache_key}.json.zst"))
+}
+
+struct ProjectCacheSpools(Vec<PathBuf>);
+impl Drop for ProjectCacheSpools {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Validate a cached file through bounded record streaming before publishing
+/// its graph. Separate compressed spools preserve node-before-edge order even
+/// when a cache's object fields arrive in another order. Failed cache reads
+/// never leak partial records into the project's authoritative graph stream.
+fn index_project_file(
+    path: &Path,
+    relative: &str,
+    side: &str,
+    cache_dir: &Path,
+    graph_output: &mut dyn Write,
+    compact: bool,
+    retain_edges: bool,
+) -> Result<(IndexedFile, bool, bool)> {
+    use serde::de::DeserializeSeed;
+    if compact {
+        let source = fs::read_to_string(path)?;
+        let source_map = load_adjacent_source_map(path);
+        let fingerprint = match source_map.as_ref() {
+            None => "absent",
+            Some(map) => map.sha256.as_deref().unwrap_or("unreadable"),
+        };
+        let cache_path = index_cache_path(
+            path,
+            relative,
+            side,
+            cache_dir,
+            &sha256(&source),
+            fingerprint,
+        );
+        drop(source_map);
+        drop(source);
+        if let Ok(cached) = fs::File::open(&cache_path) {
+            if let Ok(decoded) = zstd::stream::read::Decoder::new(cached) {
+                let paths = ProjectCacheSpools(
+                    ["nodes", "edges"]
+                        .iter()
+                        .map(|kind| {
+                            cache_path
+                                .with_extension(format!("{kind}-{}.tmp.zst", std::process::id()))
+                        })
+                        .collect(),
+                );
+                let mut nodes =
+                    zstd::stream::write::Encoder::new(fs::File::create(&paths.0[0])?, 1)?;
+                let mut edges =
+                    zstd::stream::write::Encoder::new(fs::File::create(&paths.0[1])?, 1)?;
+                let mut deserializer =
+                    serde_json::Deserializer::from_reader(BufReader::new(decoded));
+                let indexed = project_cache::CacheSeed {
+                    nodes: &mut nodes,
+                    edges: &mut edges,
+                    side,
+                    compact,
+                    retain_edges,
+                }
+                .deserialize(&mut deserializer);
+                if let Ok(indexed) = indexed {
+                    if deserializer.end().is_ok() {
+                        nodes.finish()?;
+                        edges.finish()?;
+                        for file in &paths.0 {
+                            let mut decoded =
+                                zstd::stream::read::Decoder::new(fs::File::open(file)?)?;
+                            io::copy(&mut decoded, graph_output)?;
+                        }
+                        return Ok((indexed, true, true));
+                    }
+                }
+            }
+        }
+    }
+    let (indexed, hit) = index_file(path, relative, side, cache_dir)?;
+    Ok((indexed, hit, false))
+}
+
 fn index_file(
     path: &Path,
     relative: &str,
@@ -2672,20 +3088,29 @@ fn index_file(
         None => "absent",
         Some(source_map) => source_map.sha256.as_deref().unwrap_or("unreadable"),
     };
-    let cache_key = sha256(format!(
-        "{INDEX_CACHE_VERSION}\0{}\0{side}\0{relative}\0{source_sha256}\0{source_map_fingerprint}",
-        path.display()
-    ));
-    let cache_path = cache_dir.join(format!("{cache_key}.json.zst"));
-    if let Ok(cached) = fs::read(&cache_path) {
-        if let Ok(decoded) = zstd::stream::decode_all(cached.as_slice()) {
-            if let Ok(indexed) = serde_json::from_slice::<IndexedFile>(&decoded) {
+    let cache_path = index_cache_path(
+        path,
+        relative,
+        side,
+        cache_dir,
+        &source_sha256,
+        source_map_fingerprint,
+    );
+    if let Ok(cached) = fs::File::open(&cache_path) {
+        if let Ok(decoded) = zstd::stream::read::Decoder::new(cached) {
+            // Large package bundles have gigabyte-scale expanded caches.
+            // Deserialize from the decoder instead of retaining compressed
+            // bytes plus the complete expanded JSON alongside its AST.
+            if let Ok(indexed) = serde_json::from_reader::<_, IndexedFile>(BufReader::new(decoded))
+            {
                 return Ok((indexed, true));
             }
         }
     }
     let source_type =
         SourceType::from_path(path).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    // Unpackers recover JSX inside shipped .js files; keep TypeScript's filename semantics.
+    let source_type = if source_type.is_javascript() { source_type.with_jsx(true) } else { source_type };
     let (canonical, original_units, graph) = canonicalize(&source, source_type, relative, side)?;
     let units = collect_units(
         &canonical,
@@ -2714,10 +3139,20 @@ fn index_file(
         units,
         graph,
     };
-    if let Ok(serialized) = serde_json::to_vec(&indexed) {
-        if let Ok(compressed) = zstd::stream::encode_all(serialized.as_slice(), 3) {
-            let _ = fs::write(&cache_path, compressed);
-        }
+    // Serialize directly into compression: large bundle graphs must not also
+    // allocate their complete expanded JSON and compressed byte buffers.
+    // Publish only a finished stream; a failed cache write remains optional.
+    let temporary_cache = cache_path.with_extension(format!("tmp-{}", std::process::id()));
+    let cache_result = (|| -> Result<()> {
+        let file = fs::File::create(&temporary_cache)?;
+        let mut encoder = zstd::stream::write::Encoder::new(file, 3)?;
+        serde_json::to_writer(&mut encoder, &indexed)?;
+        encoder.finish()?;
+        fs::rename(&temporary_cache, &cache_path)?;
+        Ok(())
+    })();
+    if cache_result.is_err() {
+        let _ = fs::remove_file(&temporary_cache);
     }
     Ok((indexed, false))
 }
@@ -2742,7 +3177,27 @@ fn compact_semantic_graph(graph: &mut SemanticGraph) {
     graph.nodes.retain(|node| retained.contains(&node.id));
     graph
         .edges
-        .retain(|edge| retained.contains(&edge.source) && retained.contains(&edge.target));
+        .retain(|edge| retained.contains(edge.source.as_str()) && retained.contains(edge.target.as_str()));
+}
+
+const DEPENDENCY_FULL_GRAPH_LIMIT: usize = 250_000;
+
+// The large-dependency summary already discards all edges. Release them as
+// soon as that outcome is certain, after the lossless per-file stream is
+// written. Node count only increases during indexing, so this is irreversible
+// within a run without changing the eventual projection.
+fn keep_project_graph_edges(side: &str, node_count: usize) -> bool {
+    side != "dependency" || node_count <= DEPENDENCY_FULL_GRAPH_LIMIT
+}
+
+// Dependency Unit ownership uses only exact hashes and source locations.
+// Tokens/features are matcher scratch for LOCAL/upstream application owners;
+// lossless dependency graph records and full file caches are retained separately.
+fn release_dependency_unit_features(units: &mut [Unit]) {
+    for unit in units {
+        unit.tokens = BTreeSet::new();
+        unit.features = FeatureChannels::default();
+    }
 }
 
 fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
@@ -2774,14 +3229,14 @@ fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
     let mut failures = Vec::new();
     let mut cache_hits = 0;
     let mut cache_misses = 0;
+    let mut token_strings = HashSet::<Arc<str>>::new();
+    let mut graph_ids = HashSet::<Arc<String>>::new();
     // File count is a conservative proxy for bundle scale. A single emitted
     // chunk can contain hundreds of thousands of nodes, so a 50-file
     // projection must use the same compact correspondence tier as a large
     // multi-chunk renderer tree.
-    // Compact both sides of the Screen Studio comparison symmetrically. The
-    // bundled upstream has fewer files than LOCAL but still contains a large
-    // executable graph; using 100 as a file-only proxy compacted LOCAL while
-    // leaving upstream lossless, manufacturing missing typed edges.
+    // Select the same compact correspondence tier for either input when its
+    // file count or source volume indicates a large executable graph.
     let discovered_bytes = discovered
         .iter()
         .filter_map(|(path, _)| fs::metadata(path).ok().map(|metadata| metadata.len()))
@@ -2797,35 +3252,86 @@ fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
     // report to be killed by the OS before publication.
     for (path, relative) in discovered {
         let file = relative.clone();
-        let result = index_file(&path, &relative, side, &cache_dir);
+        let retain_edges = keep_project_graph_edges(side, graph_nodes.len());
+        let result = index_project_file(
+            &path,
+            &relative,
+            side,
+            &cache_dir,
+            &mut graph_output,
+            compact_large_graph,
+            retain_edges,
+        );
         match result {
-            Ok((mut indexed, cache_hit)) => {
+            Ok((mut indexed, cache_hit, graph_streamed)) => {
                 if cache_hit {
                     cache_hits += 1;
                 } else {
                     cache_misses += 1;
                 }
                 files.push(indexed.record);
-                for node in &indexed.graph.nodes {
-                    serde_json::to_writer(
-                        &mut graph_output,
-                        &serde_json::json!({"recordType":"node","side":side,"node":node}),
-                    )?;
-                    graph_output.write_all(b"\n")?;
+                if !graph_streamed {
+                    for node in &indexed.graph.nodes {
+                        project_cache::write_graph_record(&mut graph_output, side, node)?;
+                    }
+                    for edge in &indexed.graph.edges {
+                        project_cache::write_graph_record(&mut graph_output, side, edge)?;
+                    }
                 }
-                for edge in &indexed.graph.edges {
-                    serde_json::to_writer(
-                        &mut graph_output,
-                        &serde_json::json!({"recordType":"edge","side":side,"edge":edge}),
-                    )?;
-                    graph_output.write_all(b"\n")?;
-                }
-                if compact_large_graph {
+                // The lossless stream above retains all edges. Once the
+                // dependency projection is already beyond its existing cap,
+                // no subsequent file's edges can enter the project matcher.
+                if !retain_edges { indexed.graph.edges = Vec::new(); }
+                if compact_large_graph && !graph_streamed {
                     compact_semantic_graph(&mut indexed.graph);
+                }
+                if side == "dependency" {
+                    release_dependency_unit_features(&mut indexed.units);
+                }
+                // Share equal token strings across retained units and nodes.
+                // Equality/order and serialized arrays remain byte-identical;
+                // the pool belongs to this index build, not a global cache.
+                for tokens in indexed.units.iter_mut().map(|unit| &mut unit.tokens)
+                    .chain(indexed.graph.nodes.iter_mut().map(|node| &mut node.tokens)) {
+                    let original = std::mem::take(tokens);
+                    *tokens = original.into_iter().map(|token| {
+                        if let Some(shared) = token_strings.get(token.as_ref()) {
+                            shared.clone()
+                        } else {
+                            token_strings.insert(token.clone());
+                            token
+                        }
+                    }).collect();
+                }
+                for unit in &mut indexed.units {
+                    for channel in [
+                        &mut unit.features.shape, &mut unit.features.ordered,
+                        &mut unit.features.literals, &mut unit.features.operators,
+                        &mut unit.features.properties, &mut unit.features.externals,
+                    ] {
+                        let original = std::mem::take(channel);
+                        *channel = original.into_iter().map(|(key, count)| {
+                            let key = if let Some(shared) = token_strings.get(key.as_ref()) {
+                                shared.clone()
+                            } else {
+                                token_strings.insert(key.clone());
+                                key
+                            };
+                            (key, count)
+                        }).collect();
+                    }
                 }
                 units.extend(indexed.units);
                 graph_nodes.extend(indexed.graph.nodes);
-                graph_edges.extend(indexed.graph.edges);
+                if keep_project_graph_edges(side, graph_nodes.len()) {
+                    share_graph_edge_ids(&mut indexed.graph.edges, &mut graph_ids);
+                    graph_edges.extend(indexed.graph.edges);
+                } else {
+                    // Drop capacity too: clear alone leaves the multi-million
+                    // edge allocation resident during dependency preparation.
+                    graph_edges = Vec::new();
+                    graph_ids = HashSet::new();
+                }
             }
             Err(error) => failures.push(Failure {
                 file,
@@ -2839,6 +3345,10 @@ fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
     graph_nodes.sort_by(|left, right| left.id.cmp(&right.id));
     graph_edges.sort();
     failures.sort_by(|left, right| left.file.cmp(&right.file));
+    let edge_id_bytes = graph_edges.iter().map(|edge| edge.source.len() + edge.target.len()).sum::<usize>();
+    let shared_id_bytes = graph_ids.iter().map(|id| id.len()).sum::<usize>();
+    eprintln!("indexed {side}: retained file-edge IDs {} references / {} unique strings, {} lexical bytes / {} shared bytes",
+        graph_edges.len() * 2, graph_ids.len(), edge_id_bytes, shared_id_bytes);
     let project_sha256 = sha256(
         files
             .iter()
@@ -2872,7 +3382,9 @@ fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
         failures,
         skipped,
     };
-    link_relative_module_owners(&mut project);
+    if keep_project_graph_edges(side, project.graph_nodes.len()) {
+        link_relative_module_owners(&mut project);
+    }
     Ok(project)
 }
 
@@ -2889,7 +3401,6 @@ fn index_project(input: &Path, side: &str) -> Result<ProjectIndex> {
 fn index_dependency_evidence(
     discovery: Discovery,
     direct_dependency_packages: &BTreeSet<String>,
-    large_dependency_files: &BTreeSet<String>,
 ) -> Result<ProjectIndex> {
     if discovery.files.len() <= 200 {
         return index_discovery(discovery, "dependency");
@@ -2900,13 +3411,9 @@ fn index_dependency_evidence(
         skipped,
         corpus,
     } = discovery;
-    // A large dependency closure must not force us to choose between a
-    // multi-million-node AST and an opaque file-hash-only corpus. Bundlers
-    // commonly inline small runtime packages (execa, mime, core-js, ...), so
-    // their owner chains can only be proven when the package's source graph is
-    // retained. Parse small package closures individually and keep the full
-    // file inventory for provenance/parse accounting. Large packages remain
-    // hash-only as before.
+    // Keep bounded AST evidence for package closures while retaining the full
+    // file inventory for provenance and parse accounting. Large packages
+    // remain hash-only when indexing them would exceed the explicit budget.
     let package_key = |relative: &str| {
         let path = relative.strip_prefix("npm/")?;
         let mut parts = path.split('/');
@@ -2938,17 +3445,8 @@ fn index_dependency_evidence(
         let package = package_key(relative).unwrap_or_default();
         *package_counts.entry(package.to_string()).or_default() += 1;
     }
-    // execa@9.6.1 is a 105-file runtime package.  The old 100-file cutoff
-    // excluded the whole package before graph matching, so its bundled
-    // verbose helpers became synthetic unlinked P0 branches despite valid
-    // installed-package provenance. Keep this bounded and just above the
-    // observed package closure.
-    // Direct runtime packages up to this bound are cheap enough to retain as
-    // AST evidence.  The previous 128-file cap left direct zod/framer-motion
-    // owners and transitive Sentry subpackages hash-only, which manufactured
-    // unlinked P0 roots even though LOCAL imports the same runtime contracts.
-    // Keep the bound explicit so a large node_modules closure cannot turn
-    // report generation into an unbounded dependency parse.
+    // Direct runtime packages up to this bound are retained as AST evidence;
+    // larger package corpora remain represented by file hashes and provenance.
     const MAX_INDEXED_PACKAGE_FILES: usize = 512;
     let indexed_discovered = discovered
         .iter()
@@ -2966,48 +3464,22 @@ fn index_dependency_evidence(
             let Some(package) = package_key(relative) else {
                 return false;
             };
-            // Workspace packages are already part of the local project graph.
-            // Re-parsing their symlinked node_modules copies as dependencies
-            // duplicates the same AST and is the dominant source of memory
-            // spikes in this repository.
-            if package.starts_with("@ss/") {
-                return false;
-            }
-            // Tiny transitive shims are frequently inlined without leaving a
-            // package-name marker in the bundle (is-nan is a five-file
-            // example). Keep this narrow fallback in addition to the exact
-            // manifest closure; the previous all-small-package experiment
-            // was intentionally rejected as too expensive.
+            // Small transitive packages can be inlined without leaving a
+            // package-name marker in the bundle. Keep this bounded fallback
+            // alongside the exact manifest closure.
             let is_tiny_transitive_shim = package_counts
                 .get(&package)
                 .copied()
                 .is_some_and(|count| count <= 8);
-            // Sentry's tracing helper is a small, stable owner boundary, but
-            // @sentry/utils itself is large enough to be excluded from the
-            // bounded dependency AST.  The bundled trace-parent regexp is
-            // otherwise reported as an unlinked executable branch.  Retain
-            // only the one runtime file whose source owns that contract.
-            let is_sentry_trace_owner =
-                package == "@sentry/utils" && relative.ends_with("/tracing.js");
-            let is_sentry_family = package.starts_with("@sentry/")
-                && direct_dependency_packages
-                    .iter()
-                    .any(|direct| direct.starts_with("@sentry/"));
-            if !direct_dependency_packages.contains(&package)
-                && !is_tiny_transitive_shim
-                && !is_sentry_trace_owner
-                && !is_sentry_family
+            if !direct_dependency_packages.contains(&package) && !is_tiny_transitive_shim
             {
                 return false;
             }
             // Count only executable source above, so declaration-heavy
             // packages do not get excluded before their runtime owner is
-            // inspected. The observed closure already follows the runtime
-            // import graph; retain small transitive vendor packages as well.
+            // inspected. The observed closure follows runtime imports, while
+            // the small-package fallback catches inlined transitive owners.
             package_counts.get(&package).copied().unwrap_or(usize::MAX) <= MAX_INDEXED_PACKAGE_FILES
-                || large_dependency_files.contains(relative)
-                || is_sentry_trace_owner
-                || is_sentry_family
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -3098,7 +3570,7 @@ static PROJECT_MODULE_RESOLUTION_CACHE: OnceLock<Mutex<ProjectModuleResolutionCa
 
 /// Materialize installed package boundaries in the same graph as the project
 /// source.  The dependency corpus remains useful for broad package analysis,
-/// but a source import must not terminate at an opaque `module:lodash` node:
+/// but a source import must not terminate at an opaque `module:example-runtime` node:
 /// it has a resolved package/version/entry contract, or an explicit set of
 /// conditional entry candidates.  We intentionally model package boundaries
 /// here rather than pretending that every installed package file is part of
@@ -3162,6 +3634,8 @@ fn link_installed_package_entries(index: &mut ProjectIndex) {
             entry.candidates.into_iter().collect::<Vec<_>>()
         };
         for candidate in candidates {
+            let entry_sha256 = fs::read(&candidate).ok().map(sha256);
+            let package_root_sha256 = sha256(package_root.to_string_lossy().as_bytes());
             let relative = candidate
                 .strip_prefix(&package_root)
                 .unwrap_or(&candidate)
@@ -3171,7 +3645,7 @@ fn link_installed_package_entries(index: &mut ProjectIndex) {
             let id = format!(
                 "{}:package-entry:{}",
                 index.root,
-                sha256(format!("{package}\0{version}\0{relative}"))
+                sha256(format!("{package}\0{version}\0{package_root_sha256}\0{relative}"))
             );
             nodes_to_add.entry(id.clone()).or_insert_with(|| GraphNode {
                 id: id.clone(),
@@ -3182,20 +3656,21 @@ fn link_installed_package_entries(index: &mut ProjectIndex) {
                 end: 0,
                 line: 1,
                 scope: None,
-                linked_sha256: fs::read(&candidate)
-                    .ok()
-                    .map(sha256)
+                linked_sha256: entry_sha256.clone()
                     .unwrap_or_else(|| sha256(&label)),
                 tokens: BTreeSet::from([
-                    "PackageEntry".to_string(),
-                    package.clone(),
-                    version.clone(),
-                    relative,
-                ]),
+                    Arc::from("PackageEntry"),
+                    Arc::from(package.as_str()),
+                    Arc::from(version.as_str()),
+                    Arc::from(relative),
+                    Arc::from(format!("EntryPackageRoot:{}", &package_root_sha256[..10])),
+                ]).into_iter().chain(entry_sha256.as_ref().map(|hash| {
+                    Arc::from(format!("EntrySourceSha256:{hash}"))
+                })).collect(),
             });
             additions.insert(GraphEdge {
-                source: module.id.clone(),
-                target: id,
+                source: module.id.clone().into(),
+                target: id.into(),
                 kind: if entry.path.is_some() {
                     "ResolvesToPackage"
                 } else {
@@ -3243,14 +3718,14 @@ fn merge_dependency_graph(project: &mut ProjectIndex, dependencies: &ProjectInde
     let mut dependency_edges = Vec::with_capacity(dependencies.graph_edges.len());
     for edge in &dependencies.graph_edges {
         let (Some(source), Some(target)) = (
-            dependency_ids.get(&edge.source),
-            dependency_ids.get(&edge.target),
+            dependency_ids.get(edge.source.as_ref()),
+            dependency_ids.get(edge.target.as_ref()),
         ) else {
             continue;
         };
         let mut edge = edge.clone();
-        edge.source = source.clone();
-        edge.target = target.clone();
+        edge.source = source.clone().into();
+        edge.target = target.clone().into();
         dependency_edges.push(edge);
     }
     project.graph_nodes.extend(dependency_nodes);
@@ -3277,8 +3752,8 @@ fn merge_dependency_graph(project: &mut ProjectIndex, dependencies: &ProjectInde
         for file in &dependency_files {
             if file.file.starts_with(&prefix) && file.file.ends_with(&format!("/{relative}")) {
                 links.insert(GraphEdge {
-                    source: entry.id.clone(),
-                    target: file.id.clone(),
+                    source: entry.id.clone().into(),
+                    target: file.id.clone().into(),
                     kind: "ResolvesToDependencySource".to_string(),
                     dynamic: false,
                     label: Some(relative.to_string()),
@@ -3298,31 +3773,51 @@ fn merge_dependency_graph(project: &mut ProjectIndex, dependencies: &ProjectInde
 /// The complete dependency AST remains in the separate evidence corpus; the
 /// primary graph carries this bounded boundary edge for provenance queries.
 fn link_dependency_entry_sources(project: &mut ProjectIndex, dependencies: &ProjectIndex) {
+    let file_hashes = dependencies.files.iter()
+        .map(|file| (file.file.as_str(), file.source_sha256.as_str()))
+        .collect::<HashMap<_, _>>();
     let dependency_files = dependencies
         .graph_nodes
         .iter()
         .filter(|node| node.kind == "File")
+        .filter_map(|node| file_hashes.get(node.file.as_str()).map(|hash| (node, *hash)))
         .collect::<Vec<_>>();
+    let resolved_entries = project.graph_edges.iter()
+        .filter(|edge| edge.kind == "ResolvesToPackage")
+        .map(|edge| edge.target.as_str())
+        .collect::<HashSet<_>>();
     let entries = project
         .graph_nodes
         .iter()
         .filter(|node| node.kind == "PackageEntry")
+        .filter(|node| resolved_entries.contains(node.id.as_str()))
         .cloned()
         .collect::<Vec<_>>();
     let mut additions = Vec::new();
     for entry in entries {
-        let Some((_, relative)) = entry.label.split_once(':') else {
+        // A failed file read uses a label-derived graph hash. That remains
+        // locator evidence, never an authenticated entry-source fingerprint.
+        if !entry.tokens.contains(format!("EntrySourceSha256:{}", entry.linked_sha256).as_str()) {
             continue;
-        };
-        let Some(source) = dependency_files
-            .iter()
-            .find(|node| node.file.ends_with(relative) || node.label.ends_with(relative))
+        }
+        let roots = entry.tokens.iter()
+            .filter_map(|token| token.strip_prefix("EntryPackageRoot:"))
+            .collect::<Vec<_>>();
+        let [root_key] = roots.as_slice() else { continue };
+        let Some(source_index) = dependency_entry::unique_entry_source(
+            &entry.label,
+            &entry.linked_sha256,
+            root_key,
+            dependency_files.iter().map(|(node, hash)| (node.file.as_str(), *hash)),
+        )
         else {
             continue;
         };
+        let source = dependency_files[source_index].0;
+        let (_, relative) = entry.label.split_once(':').expect("validated entry label");
         additions.push(GraphEdge {
-            source: entry.id.clone(),
-            target: format!("dependency:{}", source.id),
+            source: entry.id.clone().into(),
+            target: format!("dependency:{}", source.id).into(),
             kind: "ResolvesToDependencySource".to_string(),
             dynamic: false,
             label: Some(relative.to_string()),
@@ -3463,7 +3958,7 @@ fn link_relative_module_owners(index: &mut ProjectIndex) {
         destination
             .entry((module.file.clone(), exported.clone()))
             .or_default()
-            .push(edge.source.clone());
+            .push(edge.source.as_ref().clone());
     }
 
     // Resolve every project-local module leg once.  This table is reused for
@@ -3513,7 +4008,7 @@ fn link_relative_module_owners(index: &mut ProjectIndex) {
             let Some(current_module) = nodes.get(edge.source.as_str()) else {
                 continue;
             };
-            let Some(source_file) = resolved_modules.get(&edge.target) else {
+            let Some(source_file) = resolved_modules.get(edge.target.as_str()) else {
                 continue;
             };
             let Some(label) = &edge.label else {
@@ -3556,8 +4051,8 @@ fn link_relative_module_owners(index: &mut ProjectIndex) {
                     destination.push(owner.clone());
                     changed = true;
                     additions.insert(GraphEdge {
-                        source: current_module.id.clone(),
-                        target: owner,
+                        source: current_module.id.clone().into(),
+                        target: owner.into(),
                         kind: reexport_kind.to_string(),
                         dynamic: false,
                         label: Some(if imported == "*" {
@@ -3603,8 +4098,8 @@ fn link_relative_module_owners(index: &mut ProjectIndex) {
             continue;
         };
         additions.insert(GraphEdge {
-            source: module.id.clone(),
-            target: target.clone(),
+            source: module.id.clone().into(),
+            target: target.clone().into(),
             kind: "ResolvesTo".to_string(),
             dynamic: false,
             label: Some(specifier.to_string()),
@@ -3623,7 +4118,7 @@ fn link_relative_module_owners(index: &mut ProjectIndex) {
         if export_owners.len() == 1 {
             additions.insert(GraphEdge {
                 source: edge.source.clone(),
-                target: export_owners[0].clone(),
+                target: export_owners[0].clone().into(),
                 kind: binding_kind.to_string(),
                 dynamic: false,
                 label: Some(imported.clone()),
@@ -3648,7 +4143,7 @@ fn location(unit: &Unit) -> Location {
     }
 }
 
-fn multiset_similarity(left: &BTreeMap<String, u32>, right: &BTreeMap<String, u32>) -> f64 {
+fn multiset_similarity(left: &BTreeMap<Arc<str>, u32>, right: &BTreeMap<Arc<str>, u32>) -> f64 {
     let mut left = left.iter().peekable();
     let mut right = right.iter().peekable();
     let mut intersection = 0_u64;
@@ -3744,8 +4239,8 @@ fn similarity(left: &Unit, right: &Unit) -> (f64, ChannelScores) {
 }
 
 fn unique_matches<'a>(
-    left: &'a [Unit],
-    right: &'a [Unit],
+    left: impl IntoIterator<Item = &'a Unit>,
+    right: impl IntoIterator<Item = &'a Unit>,
     key: impl Fn(&Unit) -> &str,
 ) -> Vec<(&'a Unit, &'a Unit)> {
     let mut left_groups = HashMap::<(String, String), Vec<&Unit>>::new();
@@ -3771,9 +4266,9 @@ fn unique_matches<'a>(
         .collect()
 }
 
-fn ambiguous_groups(
-    left: &[Unit],
-    right: &[Unit],
+fn ambiguous_groups<'a>(
+    left: impl IntoIterator<Item = &'a Unit>,
+    right: impl IntoIterator<Item = &'a Unit>,
     basis: &'static str,
     key: impl Fn(&Unit) -> &str,
 ) -> Vec<AmbiguousGroup> {
@@ -4050,7 +4545,11 @@ fn merge_reverse_candidates(primary: &mut [Unmatched], reverse: &[Unmatched]) {
     }
 }
 
-fn best_is_distinct(record: &Unmatched) -> bool {
+fn best_is_distinct(record: &Unmatched, ambiguous_owners: &HashSet<String>) -> bool {
+    // A bounded shortlist cannot overturn multiplicity in the complete index.
+    if ambiguous_owners.contains(&record.location.id) {
+        return false;
+    }
     record.candidates.first().is_some_and(|best| {
         best.score >= 0.72
             && best.channels.ordered >= 0.60
@@ -4162,23 +4661,61 @@ fn infer_file_graph(
     (selected, affinities)
 }
 
-fn group_metrics(target: &Unit, members: &[&Unit]) -> Option<(f64, f64, f64)> {
-    let union = members
-        .iter()
-        .flat_map(|unit| unit.tokens.iter().cloned())
-        .collect::<BTreeSet<_>>();
-    if target.tokens.is_empty() || union.is_empty() {
+fn group_feature_channels(features: &FeatureChannels) -> [&BTreeMap<Arc<str>, u32>; 6] {
+    [&features.shape, &features.ordered, &features.literals, &features.operators, &features.properties, &features.externals]
+}
+
+fn raw_group_metrics(target: &Unit, members: &[&Unit]) -> Option<(f64, f64, f64, f64)> {
+    let mut intersection = 0_u64;
+    let mut target_total = 0_u64;
+    let mut member_total = 0_u64;
+    for (channel_index, target_channel) in group_feature_channels(&target.features).iter().enumerate() {
+        let mut union = BTreeMap::<&Arc<str>, u64>::new();
+        for member in members {
+            for (key, count) in group_feature_channels(&member.features)[channel_index] {
+                *union.entry(key).or_default() += u64::from(*count);
+            }
+        }
+        target_total += target_channel.values().copied().map(u64::from).sum::<u64>();
+        member_total += union.values().sum::<u64>();
+        intersection += target_channel.iter().map(|(key, count)| u64::from(*count).min(union.get(key).copied().unwrap_or(0))).sum::<u64>();
+    }
+    if target_total == 0 || member_total == 0 {
         return None;
     }
-    let intersection = target.tokens.intersection(&union).count() as f64;
-    let coverage = intersection / target.tokens.len() as f64;
-    let precision = intersection / union.len() as f64;
+    let coverage = intersection as f64 / target_total as f64;
+    let precision = intersection as f64 / member_total as f64;
     let member_size = members.iter().map(|unit| unit.nodes_approx).sum::<usize>();
     let size_ratio = target.nodes_approx.min(member_size) as f64
         / target.nodes_approx.max(member_size).max(1) as f64;
     let score = coverage * 0.55 + precision * 0.25 + size_ratio * 0.2;
+    Some((score, coverage, precision, size_ratio))
+}
+
+fn group_metrics(target: &Unit, members: &[&Unit]) -> Option<(f64, f64, f64)> {
+    let (score, coverage, precision, size_ratio) = raw_group_metrics(target, members)?;
     (coverage >= 0.78 && precision >= 0.55 && size_ratio >= 0.5 && score >= 0.74)
         .then_some((score, coverage, precision))
+}
+
+fn group_members_contribute(target: &Unit, members: &[&Unit]) -> bool {
+    let channels = group_feature_channels(&target.features);
+    // Literals, operators and properties describe behavior; external aliases do not.
+    let material = [2, 3, 4];
+    let relevant: &[usize] = if material.iter().any(|index| !channels[*index].is_empty()) {
+        &material
+    } else {
+        &[0, 1, 5]
+    };
+    members.iter().enumerate().all(|(selected, _)| {
+        relevant.iter().any(|channel_index| {
+            channels[*channel_index].iter().any(|(key, target_count)| {
+                let total = members.iter().map(|member| u64::from(group_feature_channels(&member.features)[*channel_index].get(key).copied().unwrap_or(0))).sum::<u64>();
+                let selected_count = u64::from(group_feature_channels(&members[selected].features)[*channel_index].get(key).copied().unwrap_or(0));
+                total.min(u64::from(*target_count)) > (total - selected_count).min(u64::from(*target_count))
+            })
+        })
+    })
 }
 
 fn consider_group<'a>(target: &Unit, selection: Vec<&'a Unit>, best: &mut Option<BestGroup<'a>>) {
@@ -4188,9 +4725,15 @@ fn consider_group<'a>(target: &Unit, selection: Vec<&'a Unit>, best: &mut Option
     {
         return;
     }
+    if !group_members_contribute(target, &selection) {
+        return;
+    }
     let Some(metrics) = group_metrics(target, &selection) else {
         return;
     };
+    if selection.iter().any(|member| raw_group_metrics(target, &[*member]).is_some_and(|single| metrics.0 <= single.0)) {
+        return;
+    }
     if best
         .as_ref()
         .is_none_or(|(_, current)| metrics.0 > current.0)
@@ -4357,6 +4900,171 @@ fn collect_nested_record_ids(value: &serde_json::Value, ids: &mut BTreeSet<Strin
     }
 }
 
+// Publication only needs exact membership and node-to-chunk lookup, not an
+// in-memory copy of every lossless edge. SQLite owns both bounded-cache scratch
+// tables and the persisted lookup index; TEMP tables disappear on close.
+struct SemanticGraphPublication {
+    connection: rusqlite::Connection,
+    scratch: rusqlite::Connection,
+}
+
+fn publication_symbol_value(value: &str) -> Result<rusqlite::types::Value> {
+    if value.len() > 64 {
+        let compressed = zstd::stream::encode_all(value.as_bytes(), 1)?;
+        if compressed.len() < value.len() {
+            return Ok(rusqlite::types::Value::Blob(compressed));
+        }
+    }
+    Ok(rusqlite::types::Value::Text(value.to_string()))
+}
+
+fn publication_symbol_text(value: rusqlite::types::Value) -> Result<String> {
+    match value {
+        rusqlite::types::Value::Text(text) => Ok(text),
+        rusqlite::types::Value::Blob(bytes) => Ok(String::from_utf8(zstd::stream::decode_all(bytes.as_slice())?)?),
+        _ => anyhow::bail!("invalid publication dictionary value"),
+    }
+}
+
+impl SemanticGraphPublication {
+    fn new(path: &Path, left_hash: &str, right_hash: &str) -> Result<Self> {
+        let connection = rusqlite::Connection::open(path)?;
+        connection.execute_batch(
+            "PRAGMA journal_mode=OFF;
+             PRAGMA synchronous=OFF;
+             PRAGMA cache_size=-8192;
+             PRAGMA temp_store=FILE;
+             PRAGMA temp.cache_size=-8192;
+             DROP TABLE IF EXISTS node_chunks;
+             DROP TABLE IF EXISTS chunks;
+             DROP TABLE IF EXISTS metadata;
+             CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+             CREATE TABLE chunks (id INTEGER PRIMARY KEY, offset INTEGER NOT NULL, length INTEGER NOT NULL);
+             CREATE TABLE node_chunks (node_id TEXT PRIMARY KEY, chunk_ids BLOB NOT NULL) WITHOUT ROWID;
+             BEGIN;",
+        )?;
+        connection.execute(
+            "INSERT INTO metadata(key,value) VALUES ('schema','project-parity/semantic-graph-index-v3'),('leftProjectSha256',?1),('rightProjectSha256',?2)",
+            rusqlite::params![left_hash, right_hash],
+        )?;
+        // Keep scratch in a separate transaction so SQLite can reclaim its
+        // membership pages before the persistent node lookup begins to grow.
+        let scratch = rusqlite::Connection::open_in_memory()?;
+        scratch.execute_batch(
+            "PRAGMA temp_store=MEMORY;
+             PRAGMA temp.auto_vacuum=FULL;
+             PRAGMA temp.journal_mode=OFF;
+             PRAGMA temp.synchronous=OFF;
+             PRAGMA temp.cache_size=-8192;
+             CREATE TEMP TABLE emitted_nodes (id INTEGER PRIMARY KEY) WITHOUT ROWID;
+             CREATE TEMP TABLE graph_symbols (id INTEGER PRIMARY KEY, value TEXT NOT NULL, value_hash BLOB NOT NULL);
+             CREATE INDEX temp.graph_symbols_hash ON graph_symbols(value_hash);
+             CREATE TEMP TABLE emitted_edges (
+                 source INTEGER NOT NULL, target INTEGER NOT NULL, kind INTEGER NOT NULL,
+                 dynamic INTEGER NOT NULL, label INTEGER NOT NULL,
+                 PRIMARY KEY(source,target,kind,dynamic,label)) WITHOUT ROWID;
+             CREATE TEMP TABLE chunk_refs (node_id INTEGER NOT NULL, chunk_id INTEGER NOT NULL,
+                 PRIMARY KEY(node_id,chunk_id)) WITHOUT ROWID;
+             BEGIN;",
+        )?;
+        Ok(Self { connection, scratch })
+    }
+
+    fn insert_node(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .scratch
+            .prepare_cached("INSERT OR IGNORE INTO emitted_nodes(id) VALUES (?1)")?
+            .execute([self.intern_symbol(id)?])?
+            != 0)
+    }
+
+    fn intern_symbol(&self, value: &str) -> Result<i64> {
+        // The hash is only an index locator. Compare the full lexical value
+        // within its bucket so collisions cannot merge graph identities.
+        // Indexing the digest avoids a second copy of every long node ID.
+        let digest = Sha256::digest(value.as_bytes());
+        let hash: &[u8] = digest.as_ref();
+        // Deterministic, lossless encoding retains exact equality within each
+        // digest bucket without storing long repeated owner paths verbatim.
+        let value = publication_symbol_value(value)?;
+        let existing = self.scratch
+            .prepare_cached("SELECT id FROM graph_symbols WHERE value_hash=?1 AND value=?2")?
+            .query_row(rusqlite::params![hash, value], |row| row.get(0)).optional()?;
+        if let Some(id) = existing { return Ok(id); }
+        self.scratch
+            .prepare_cached("INSERT INTO graph_symbols(value,value_hash) VALUES (?1,?2)")?
+            .execute(rusqlite::params![value, hash])?;
+        Ok(self.scratch.last_insert_rowid())
+    }
+
+    fn insert_edge(&self, edge: &GraphEdge) -> Result<bool> {
+        // Exact lexical dictionary IDs preserve every equality field without
+        // repeating full source/target IDs in each edge. Zero encodes None;
+        // even an empty Some(label) receives a positive dictionary ID.
+        let source = self.intern_symbol(&edge.source)?;
+        let target = self.intern_symbol(&edge.target)?;
+        let kind = self.intern_symbol(&edge.kind)?;
+        let label = edge.label.as_deref().map(|label| self.intern_symbol(label)).transpose()?.unwrap_or(0);
+        Ok(self
+            .scratch
+            .prepare_cached("INSERT OR IGNORE INTO emitted_edges(source,target,kind,dynamic,label) VALUES (?1,?2,?3,?4,?5)")?
+            .execute(rusqlite::params![source, target, kind, edge.dynamic, label])?
+            != 0)
+    }
+
+    fn record_chunk(
+        &self,
+        chunk_id: usize,
+        offset: u64,
+        length: usize,
+        ids: &BTreeSet<String>,
+    ) -> Result<()> {
+        self.connection
+            .prepare_cached("INSERT INTO chunks(id,offset,length) VALUES (?1,?2,?3)")?
+            .execute(rusqlite::params![chunk_id as u64, offset, length as u64])?;
+        let mut insert = self
+            .scratch
+            .prepare_cached("INSERT INTO chunk_refs(node_id,chunk_id) VALUES (?1,?2)")?;
+        for id in ids {
+            insert.execute(rusqlite::params![self.intern_symbol(id)?, chunk_id as u64])?;
+        }
+        Ok(())
+    }
+
+    fn release_membership(&self) -> Result<()> {
+        self.scratch.flush_prepared_statement_cache();
+        self.scratch.execute_batch(
+            "DROP TABLE emitted_nodes; DROP TABLE emitted_edges; DROP INDEX graph_symbols_hash; COMMIT;",
+        )?;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<()> {
+        self.release_membership()?;
+        {
+            // The final node_chunks primary key owns lexical lookup ordering.
+            // Walk the scratch dictionary without sorting compressed values.
+            let mut select = self.scratch.prepare(
+                "SELECT id,value FROM graph_symbols WHERE EXISTS
+                 (SELECT 1 FROM chunk_refs WHERE node_id=graph_symbols.id) ORDER BY id")?;
+            let mut rows = select.query([])?;
+            let mut select_chunks = self.scratch.prepare_cached(
+                "SELECT chunk_id FROM chunk_refs WHERE node_id=?1 ORDER BY chunk_id")?;
+            let mut insert = self.connection.prepare_cached(
+                "INSERT INTO node_chunks(node_id,chunk_ids) VALUES (?1,?2)")?;
+            while let Some(row) = rows.next()? {
+                let symbol_id: i64 = row.get(0)?;
+                let node_id = publication_symbol_text(row.get(1)?)?;
+                let chunk_ids = select_chunks.query_map([symbol_id], |row| row.get::<_, usize>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                insert.execute(rusqlite::params![node_id, encode_chunk_ids(&chunk_ids)])?;
+            }
+        }
+        self.connection.execute_batch("COMMIT; PRAGMA optimize;")?;
+        Ok(())
+    }
+}
+
 fn write_lossless_semantic_graph(
     output: &Path,
     left: &ProjectIndex,
@@ -4389,12 +5097,14 @@ fn write_lossless_semantic_graph(
     // preserving the v1 artifact contract for existing consumers.
     let mut chunk = Vec::new();
     let mut chunk_node_ids = BTreeSet::<String>::new();
-    let mut emitted_nodes = HashSet::<String>::new();
-    let mut emitted_edges = BTreeSet::<GraphEdge>::new();
+    let publication = SemanticGraphPublication::new(
+        &output.join("semantic-graph.index.sqlite"),
+        &left.project_sha256,
+        &right.project_sha256,
+    )?;
     let mut lossless_nodes = [0usize; 2];
     let mut lossless_edges = [0usize; 2];
-    let mut index = BTreeMap::<String, Vec<usize>>::new();
-    let mut chunks_meta = Vec::new();
+    let mut chunk_count = 0;
     let mut flush = |chunk: &mut Vec<u8>, ids: &mut BTreeSet<String>| -> Result<()> {
         if chunk.is_empty() {
             return Ok(());
@@ -4402,14 +5112,8 @@ fn write_lossless_semantic_graph(
         let compressed = zstd::stream::encode_all(chunk.as_slice(), 3)?;
         let offset = file.stream_position()?;
         file.write_all(&compressed)?;
-        let chunk_index = chunks_meta.len();
-        for id in ids.iter() {
-            index.entry(id.clone()).or_default().push(chunk_index);
-        }
-        chunks_meta.push(serde_json::json!({
-            "offset": offset,
-            "length": compressed.len(),
-        }));
+        publication.record_chunk(chunk_count, offset, compressed.len(), ids)?;
+        chunk_count += 1;
         chunk.clear();
         ids.clear();
         Ok(())
@@ -4451,7 +5155,7 @@ fn write_lossless_semantic_graph(
                     Some("node") => {
                         lossless_nodes[usize::from(side == "right")] += 1;
                         if let Some(id) = record["node"]["id"].as_str() {
-                            if !emitted_nodes.insert(id.to_string()) {
+                            if !publication.insert_node(id)? {
                                 continue;
                             }
                         }
@@ -4459,7 +5163,7 @@ fn write_lossless_semantic_graph(
                     Some("edge") => {
                         lossless_edges[usize::from(side == "right")] += 1;
                         let edge: GraphEdge = serde_json::from_value(record["edge"].clone())?;
-                        if !emitted_edges.insert(edge) {
+                        if !publication.insert_edge(&edge)? {
                             continue;
                         }
                     }
@@ -4471,14 +5175,14 @@ fn write_lossless_semantic_graph(
         // Package-entry and resolver edges are added after per-file indexing;
         // append only those records not already covered by the lossless stream.
         for node in &project.graph_nodes {
-            if emitted_nodes.insert(node.id.clone()) {
+            if publication.insert_node(&node.id)? {
                 lossless_nodes[usize::from(side == "right")] += 1;
                 let record = serde_json::json!({"recordType": "node", "side": side, "node": node});
                 append_record(record, &mut chunk_node_ids, &mut chunk)?;
             }
         }
         for edge in &project.graph_edges {
-            if emitted_edges.insert(edge.clone()) {
+            if publication.insert_edge(edge)? {
                 lossless_edges[usize::from(side == "right")] += 1;
                 let record = serde_json::json!({"recordType": "edge", "side": side, "edge": edge});
                 append_record(record, &mut chunk_node_ids, &mut chunk)?;
@@ -4490,13 +5194,7 @@ fn write_lossless_semantic_graph(
     summary.left_edges = lossless_edges[0];
     summary.right_edges = lossless_edges[1];
     flush(&mut chunk, &mut chunk_node_ids)?;
-    write_semantic_graph_lookup_index(
-        &output.join("semantic-graph.index.sqlite"),
-        &left.project_sha256,
-        &right.project_sha256,
-        &chunks_meta,
-        &index,
-    )?;
+    publication.finish()?;
     Ok(summary)
 }
 
@@ -4628,6 +5326,91 @@ fn same_graph_edge_contract(left: &GraphEdge, right: &GraphEdge) -> bool {
     left.kind == right.kind && left.dynamic == right.dynamic && left.label == right.label
 }
 
+fn graph_node_has_shape(node: &GraphNode, shape: &str) -> bool {
+    node.tokens.iter().any(|token| {
+        token
+            .as_ref()
+            .strip_prefix("shape:")
+            .and_then(|value| value.strip_suffix(":1"))
+            == Some(shape)
+    })
+}
+
+fn is_control_flow_consequent_owner(node: &GraphNode) -> bool {
+    [
+        "IfStatement",
+        "WhileStatement",
+        "DoWhileStatement",
+        "ForStatement",
+        "ForInStatement",
+        "ForOfStatement",
+        "WithStatement",
+    ]
+    .iter()
+    .any(|shape| graph_node_has_shape(node, shape))
+}
+
+fn is_terminal_control_flow_statement(node: &GraphNode) -> bool {
+    [
+        "ReturnStatement",
+        "ThrowStatement",
+        "BreakStatement",
+        "ContinueStatement",
+    ]
+    .iter()
+    .any(|shape| graph_node_has_shape(node, shape))
+}
+
+/// A control-flow consequent with a sole terminal statement has the same
+/// runtime effect with or without a brace-only BlockStatement.  Keep the
+/// block itself when it owns declarations, expressions, or multiple
+/// statements: those can change lexical scope or behavior.
+fn semantic_control_flow_consequent_edges<'a>(
+    parent: &GraphNode,
+    edges: &[&'a GraphEdge],
+    nodes: &HashMap<&str, &GraphNode>,
+    outgoing: &HashMap<&str, Vec<&'a GraphEdge>>,
+) -> Vec<&'a GraphEdge> {
+    if !is_control_flow_consequent_owner(parent) {
+        return edges.to_vec();
+    }
+    edges
+        .iter()
+        .flat_map(|edge| {
+            if edge.kind != "Contains" {
+                return vec![*edge];
+            }
+            let Some(block) = nodes.get(edge.target.as_str()) else {
+                return vec![*edge];
+            };
+            if !graph_node_has_shape(block, "BlockStatement") {
+                return vec![*edge];
+            }
+            let children = outgoing
+                .get(block.id.as_str())
+                .into_iter()
+                .flatten()
+                .filter(|child| child.kind == "Contains")
+                .filter_map(|child| {
+                    nodes
+                        .get(child.target.as_str())
+                        .filter(|node| node.kind != "Scope")
+                        .map(|_| *child)
+                })
+                .collect::<Vec<_>>();
+            if let [child] = children.as_slice() {
+                if nodes
+                    .get(child.target.as_str())
+                    .is_some_and(|node| is_terminal_control_flow_statement(node))
+                {
+                    return vec![*child];
+                }
+            }
+            vec![*edge]
+        })
+        .collect()
+}
+
 /// Normalize JavaScript number spellings only when their runtime Number value
 /// is unambiguous. BigInts and non-finite/unsupported forms stay lexical.
 fn normalized_number_literal(raw: &str) -> Option<String> {
@@ -4751,21 +5534,21 @@ fn graph_similarity(left: &GraphNode, right: &GraphNode) -> f64 {
     let normalized_score = NORMALIZED_GRAPH_TOKEN_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         for token in left.tokens.iter().chain(right.tokens.iter()) {
-            if !cache.contains_key(token.as_str()) {
-                cache.insert(token.clone(), normalized_graph_token(token));
+            if !cache.contains_key(token.as_ref()) {
+                cache.insert(token.to_string(), normalized_graph_token(token));
             }
         }
         let mut left_without_external = left
             .tokens
             .iter()
-            .filter_map(|token| cache.get(token.as_str()).and_then(Option::as_deref))
+            .filter_map(|token| cache.get(token.as_ref()).and_then(Option::as_deref))
             .collect::<Vec<_>>();
         left_without_external.sort_unstable();
         left_without_external.dedup();
         let mut right_without_external = right
             .tokens
             .iter()
-            .filter_map(|token| cache.get(token.as_str()).and_then(Option::as_deref))
+            .filter_map(|token| cache.get(token.as_ref()).and_then(Option::as_deref))
             .collect::<Vec<_>>();
         right_without_external.sort_unstable();
         right_without_external.dedup();
@@ -4818,6 +5601,7 @@ fn insert_graph_pair(
 ) {
     if let Some(existing) = pair_meta.get_mut(&key) {
         let candidate_key = (
+            candidate.basis != "neighbor-binding-owner",
             candidate.depth,
             candidate.basis,
             candidate.via_edge.as_deref().unwrap_or(""),
@@ -4833,6 +5617,7 @@ fn insert_graph_pair(
                 .unwrap_or(""),
         );
         let existing_key = (
+            existing.basis != "neighbor-binding-owner",
             existing.depth,
             existing.basis,
             existing.via_edge.as_deref().unwrap_or(""),
@@ -4947,7 +5732,7 @@ fn graph_behavior_hashes(project: &ProjectIndex) -> BehaviorHashes {
                             edge.dynamic,
                             edge.label.as_deref().unwrap_or(""),
                             hashes
-                                .get(&edge.target)
+                                .get(edge.target.as_str())
                                 .map(String::as_str)
                                 .unwrap_or("unknown")
                         )
@@ -4979,8 +5764,93 @@ fn graph_behavior_hashes(project: &ProjectIndex) -> BehaviorHashes {
 }
 
 fn is_global_behavior_seed(node: &GraphNode) -> bool {
-    !(matches!(node.kind.as_str(), "File" | "Dynamic" | "External")
-        || node.kind == "Scope" && node.label.starts_with("depth-0:"))
+    !matches!(node.kind.as_str(), "File" | "Dynamic" | "External" | "Symbol")
+}
+
+fn graph_contains_parents(index: &ProjectIndex) -> HashMap<String, String> {
+    index
+        .graph_edges
+        .iter()
+        .filter(|edge| edge.kind == "Contains")
+        .map(|edge| (edge.target.as_ref().clone(), edge.source.as_ref().clone()))
+        .collect()
+}
+
+fn nearest_executable_owner<'a>(
+    node_id: &str,
+    nodes: &HashMap<&'a str, &'a GraphNode>,
+    parents: &HashMap<String, String>,
+) -> Option<&'a GraphNode> {
+    let mut parent_id = parents.get(node_id)?;
+    loop {
+        let parent = *nodes.get(parent_id.as_str())?;
+        if matches!(parent.kind.as_str(), "Function" | "Class") {
+            return Some(parent);
+        }
+        parent_id = parents.get(parent.id.as_str())?;
+    }
+}
+
+fn owner_context_is_proven(
+    left_node: &GraphNode,
+    right_node: &GraphNode,
+    left_nodes: &HashMap<&str, &GraphNode>,
+    right_nodes: &HashMap<&str, &GraphNode>,
+    left_parents: &HashMap<String, String>,
+    right_parents: &HashMap<String, String>,
+    proven_owner_pairs: &HashSet<(String, String)>,
+) -> bool {
+    if !matches!(left_node.kind.as_str(), "Function" | "Class")
+        && !matches!(right_node.kind.as_str(), "Function" | "Class")
+    {
+        let left_owner = nearest_executable_owner(&left_node.id, left_nodes, left_parents);
+        let right_owner = nearest_executable_owner(&right_node.id, right_nodes, right_parents);
+        match (left_owner, right_owner) {
+            (None, None) => return true,
+            (Some(left_owner), Some(right_owner)) => {
+                let left_parent =
+                    nearest_executable_owner(&left_owner.id, left_nodes, left_parents);
+                let right_parent =
+                    nearest_executable_owner(&right_owner.id, right_nodes, right_parents);
+                if matches!((&left_parent, &right_parent), (None, None)) {
+                    return true;
+                }
+                if !matches!((&left_parent, &right_parent), (Some(_), Some(_)))
+                    || !proven_owner_pairs
+                        .contains(&(left_owner.id.clone(), right_owner.id.clone()))
+                {
+                    return false;
+                }
+                return owner_context_is_proven(
+                    left_owner,
+                    right_owner,
+                    left_nodes,
+                    right_nodes,
+                    left_parents,
+                    right_parents,
+                    proven_owner_pairs,
+                );
+            }
+            _ => return false,
+        }
+    }
+
+    let (mut left_child, mut right_child) = (left_node, right_node);
+    loop {
+        let left_owner = nearest_executable_owner(&left_child.id, left_nodes, left_parents);
+        let right_owner = nearest_executable_owner(&right_child.id, right_nodes, right_parents);
+        match (left_owner, right_owner) {
+            (None, None) => return true,
+            (Some(left_owner), Some(right_owner)) => {
+                if !proven_owner_pairs.contains(&(left_owner.id.clone(), right_owner.id.clone())) {
+                    return false;
+                }
+                left_child = left_owner;
+                right_child = right_owner;
+            }
+            _ => return false,
+        }
+    }
 }
 
 fn analyze_semantic_graph(
@@ -5054,11 +5924,35 @@ fn analyze_semantic_graph(
             .cmp(&right.left.id)
             .then_with(|| left.right.id.cmp(&right.right.id))
     });
+    let proven_owner_pairs = matches
+        .iter()
+        .filter(|matched| matched.confidence.starts_with("proven-"))
+        .filter_map(|matched| {
+            let left_node = graph_location_node(left, &matched.left)?;
+            let right_node = graph_location_node(right, &matched.right)?;
+            (matches!(left_node.kind.as_str(), "Function" | "Class")
+                && matches!(right_node.kind.as_str(), "Function" | "Class"))
+            .then(|| (left_node.id.clone(), right_node.id.clone()))
+        })
+        .collect::<HashSet<_>>();
+    let left_contains_parents = graph_contains_parents(left);
+    let right_contains_parents = graph_contains_parents(right);
     for matched in matched_seeds {
         if let (Some(left_node), Some(right_node)) = (
             graph_location_node(left, &matched.left),
             graph_location_node(right, &matched.right),
         ) {
+            if !owner_context_is_proven(
+                left_node,
+                right_node,
+                &left_nodes,
+                &right_nodes,
+                &left_contains_parents,
+                &right_contains_parents,
+                &proven_owner_pairs,
+            ) {
+                continue;
+            }
             insert_graph_pair(
                 &mut pair_meta,
                 &mut left_to_right,
@@ -5089,8 +5983,8 @@ fn analyze_semantic_graph(
             if !matches!(edge.kind.as_str(), "Contains" | "NextStatement") {
                 continue;
             }
-            if reserved_right_nodes.insert(edge.target.clone()) {
-                reservation_queue.push_back(edge.target.clone());
+            if reserved_right_nodes.insert(edge.target.as_ref().clone()) {
+                reservation_queue.push_back(edge.target.as_ref().clone());
             }
         }
     }
@@ -5147,6 +6041,15 @@ fn analyze_semantic_graph(
         if left_group.len() == 1
             && right_group.len() == 1
             && !reserved_right_nodes.contains(&right_group[0].id)
+            && owner_context_is_proven(
+                left_group[0],
+                right_group[0],
+                &left_nodes,
+                &right_nodes,
+                &left_contains_parents,
+                &right_contains_parents,
+                &proven_owner_pairs,
+            )
         {
             insert_graph_pair(
                 &mut pair_meta,
@@ -5165,7 +6068,23 @@ fn analyze_semantic_graph(
         }
     }
 
-    while let Some((left_id, right_id)) = queue.pop_front() {
+    let mut fuzzy_queue = VecDeque::<((String, String), PairMeta)>::new();
+    loop {
+        // Binding and exact paths must settle before shape-only neighbors can claim their owners.
+        if queue.is_empty() {
+            let Some((key, candidate)) = fuzzy_queue.pop_front() else { break };
+            let contradicts_binding = left_to_right.get(&key.0).is_some_and(|mapped| {
+                mapped != &key.1 && pair_meta.get(&(key.0.clone(), mapped.clone()))
+                    .is_some_and(|meta| meta.basis == "neighbor-binding-owner")
+            }) || right_to_left.get(&key.1).is_some_and(|mapped| {
+                mapped != &key.0 && pair_meta.get(&(mapped.clone(), key.1.clone()))
+                    .is_some_and(|meta| meta.basis == "neighbor-binding-owner")
+            });
+            if contradicts_binding { continue; }
+            insert_graph_pair(&mut pair_meta, &mut left_to_right, &mut right_to_left,
+                &mut queue, &mut correspondence_conflicts, key, candidate);
+        }
+        let Some((left_id, right_id)) = queue.pop_front() else { continue };
         let depth = pair_meta
             .get(&(left_id.clone(), right_id.clone()))
             .map(|meta| meta.depth)
@@ -5174,10 +6093,32 @@ fn analyze_semantic_graph(
             .get(left_id.as_str())
             .cloned()
             .unwrap_or_default();
+        let left_edges = left_nodes
+            .get(left_id.as_str())
+            .map(|parent| {
+                semantic_control_flow_consequent_edges(
+                    parent,
+                    &left_edges,
+                    &left_nodes,
+                    &left_outgoing,
+                )
+            })
+            .unwrap_or(left_edges);
         let right_edges = right_outgoing
             .get(right_id.as_str())
             .cloned()
             .unwrap_or_default();
+        let right_edges = right_nodes
+            .get(right_id.as_str())
+            .map(|parent| {
+                semantic_control_flow_consequent_edges(
+                    parent,
+                    &right_edges,
+                    &right_nodes,
+                    &right_outgoing,
+                )
+            })
+            .unwrap_or(right_edges);
         let positional_scope_symbols = match (
             left_nodes.get(left_id.as_str()),
             right_nodes.get(right_id.as_str()),
@@ -5224,6 +6165,25 @@ fn analyze_semantic_graph(
                         "neighbor-exact",
                         left_edge.kind.clone(),
                     ));
+                    continue;
+                }
+            }
+            if left_edge.kind == "Defines"
+                && left_nodes.get(left_id.as_str()).is_some_and(|node| node.kind == "Symbol")
+                && pair_meta.get(&(left_id.clone(), right_id.clone())).is_some_and(|meta|
+                    matches!(meta.basis, "seed-unit" | "neighbor-exact" | "neighbor-structural-exact"))
+            {
+                let definitions = right_edges.iter()
+                    .filter(|edge| same_graph_edge_contract(left_edge, edge))
+                    .filter_map(|edge| right_nodes.get(edge.target.as_str()))
+                    .filter(|node| node.kind == left_target.kind).collect::<Vec<_>>();
+                let reverse_count = left_edges.iter()
+                    .filter(|edge| same_graph_edge_contract(left_edge, edge))
+                    .filter_map(|edge| left_nodes.get(edge.target.as_str()))
+                    .filter(|node| node.kind == left_target.kind).count();
+                if definitions.len() == 1 && reverse_count == 1 {
+                    proposed.push((left_target.id.clone(), definitions[0].id.clone(),
+                        "neighbor-binding-owner", left_edge.kind.clone()));
                     continue;
                 }
             }
@@ -5308,8 +6268,7 @@ fn analyze_semantic_graph(
                 // Keep a bounded fuzzy floor here; exact structure and
                 // operand-order guards remain unchanged elsewhere.
                 best.0 >= 0.55
-                    && (best.0 >= 0.95
-                        || best.0 - scored.get(1).map(|second| second.0).unwrap_or(0.0) >= 0.03)
+                    && best.0 - scored.get(1).map(|second| second.0).unwrap_or(0.0) >= 0.03
             }) {
                 proposed.push((
                     left_target.id.clone(),
@@ -5360,8 +6319,7 @@ fn analyze_semantic_graph(
             scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
             if scored.first().is_some_and(|best| {
                 best.0 >= 0.55
-                    && (best.0 >= 0.95
-                        || best.0 - scored.get(1).map(|second| second.0).unwrap_or(0.0) >= 0.03)
+                    && best.0 - scored.get(1).map(|second| second.0).unwrap_or(0.0) >= 0.03
             }) {
                 proposed.push((
                     left_parent.id.clone(),
@@ -5376,24 +6334,29 @@ fn analyze_semantic_graph(
             }
         }
         for (left_target, right_target, basis, edge_kind) in proposed {
-            insert_graph_pair(
-                &mut pair_meta,
-                &mut left_to_right,
-                &mut right_to_left,
-                &mut queue,
-                &mut correspondence_conflicts,
-                (left_target, right_target),
-                PairMeta {
-                    basis,
-                    depth: depth + 1,
-                    via_edge: Some(edge_kind),
-                    source: Some((left_id.clone(), right_id.clone())),
-                },
-            );
+            let key = (left_target, right_target);
+            let candidate = PairMeta {
+                basis,
+                depth: depth + 1,
+                via_edge: Some(edge_kind),
+                source: Some((left_id.clone(), right_id.clone())),
+            };
+            if matches!(basis, "neighbor-fuzzy" | "neighbor-normalized") {
+                fuzzy_queue.push_back((key, candidate));
+            } else {
+                insert_graph_pair(&mut pair_meta, &mut left_to_right, &mut right_to_left,
+                    &mut queue, &mut correspondence_conflicts, key, candidate);
+            }
         }
     }
 
     let relation_pairs = pair_meta.keys().cloned().collect::<BTreeSet<_>>();
+    let mut left_candidates = HashMap::<&str, HashSet<&str>>::new();
+    let mut right_candidates = HashMap::<&str, HashSet<&str>>::new();
+    for (left_id, right_id) in relation_pairs.iter().chain(&correspondence_conflicts) {
+        left_candidates.entry(left_id).or_default().insert(right_id);
+        right_candidates.entry(right_id).or_default().insert(left_id);
+    }
     let mut frontiers = Vec::new();
     let mut frontier_keys = BTreeSet::new();
     for ((left_id, right_id), meta) in &pair_meta {
@@ -5408,10 +6371,32 @@ fn analyze_semantic_graph(
             .get(left_id.as_str())
             .cloned()
             .unwrap_or_default();
+        let left_edges = left_nodes
+            .get(left_id.as_str())
+            .map(|parent| {
+                semantic_control_flow_consequent_edges(
+                    parent,
+                    &left_edges,
+                    &left_nodes,
+                    &left_outgoing,
+                )
+            })
+            .unwrap_or(left_edges);
         let right_edges = right_outgoing
             .get(right_id.as_str())
             .cloned()
             .unwrap_or_default();
+        let right_edges = right_nodes
+            .get(right_id.as_str())
+            .map(|parent| {
+                semantic_control_flow_consequent_edges(
+                    parent,
+                    &right_edges,
+                    &right_nodes,
+                    &right_outgoing,
+                )
+            })
+            .unwrap_or(right_edges);
         // `NextStatement` remains in the lossless graph and relation
         // traversal, but it is execution-order metadata rather than an
         // independently actionable semantic branch. Bundling changes these
@@ -5441,11 +6426,31 @@ fn analyze_semantic_graph(
                 right_edges.iter().enumerate().find(|(_, right_edge)| {
                     same_graph_edge_contract(left_edge, right_edge)
                         && relation_pairs
-                            .contains(&(left_edge.target.clone(), right_edge.target.clone()))
+                            .contains(&(left_edge.target.as_ref().clone(), right_edge.target.as_ref().clone()))
                 })
             {
                 used_left.insert(left_index);
                 used_right.insert(right_index);
+                let right_edge = right_edges[right_index];
+                let key = (left_edge.target.as_ref().clone(), right_edge.target.as_ref().clone());
+                if pair_meta.get(&key).is_some_and(|meta| meta.basis == "neighbor-binding-owner") {
+                    let left_target = left_nodes[left_edge.target.as_str()];
+                    let right_target = right_nodes[right_edge.target.as_str()];
+                    // Binding identity does not prove that the initializer is unchanged.
+                    if graph_similarity(left_target, right_target) < 1.0
+                        && frontier_keys.insert(format!("binding:{left_id}:{right_id}:{}:{}", key.0, key.1))
+                    {
+                        frontiers.push(DivergenceFrontier {
+                            classification: "ambiguous-correspondence",
+                            confidence: "candidate",
+                            depth: depth + 1,
+                            source_left: graph_node_ref(left_source),
+                            source_right: graph_node_ref(right_source),
+                            left_edge: graph_edge_ref(left_edge, &left_nodes),
+                            right_edge: graph_edge_ref(right_edge, &right_nodes),
+                        });
+                    }
+                }
             }
         }
         for (left_index, left_edge) in left_edges.iter().enumerate() {
@@ -5460,6 +6465,14 @@ fn analyze_semantic_graph(
                 .enumerate()
                 .filter(|(right_index, _)| !used_right.contains(right_index))
                 .filter(|(_, right_edge)| same_graph_edge_contract(left_edge, right_edge))
+                // Frontier fallback must respect correspondence found through
+                // other owners/bindings instead of inventing a crossing pair.
+                .filter(|(_, right_edge)| {
+                    left_candidates.get(left_edge.target.as_str())
+                        .is_none_or(|candidates| candidates.contains(right_edge.target.as_str()))
+                        && right_candidates.get(right_edge.target.as_str())
+                            .is_none_or(|candidates| candidates.contains(left_edge.target.as_str()))
+                })
                 .filter_map(|(right_index, right_edge)| {
                     let right_target = right_nodes.get(right_edge.target.as_str())?;
                     (left_target.kind == right_target.kind).then_some((
@@ -5479,20 +6492,16 @@ fn analyze_semantic_graph(
             if let Some((score, right_index, right_edge)) = changed.filter(|item| item.0 >= 0.35) {
                 used_left.insert(left_index);
                 used_right.insert(right_index);
-                let right_target = right_nodes
-                    .get(right_edge.target.as_str())
-                    .expect("changed edge target must exist");
-                let exact_renamed_owner = left_target.kind == "Symbol"
-                    && right_target.kind == "Symbol"
-                    && left_target.label == right_target.label
-                    && left_target.linked_sha256 == right_target.linked_sha256;
+                // Equal runtime shapes locate candidates, not a changed branch or
+                // a unique correspondence between repeated sibling operations.
+                let same_runtime_shape = score == 1.0;
                 let key = format!(
                     "changed:{left_id}:{right_id}:{}:{}",
                     left_edge.target, right_edge.target
                 );
                 if frontier_keys.insert(key) {
                     frontiers.push(DivergenceFrontier {
-                        classification: if exact_renamed_owner {
+                        classification: if same_runtime_shape {
                             "ambiguous-correspondence"
                         } else {
                             "changed-branch"
@@ -5775,20 +6784,18 @@ fn run_with_certificates(
         .filter_map(|row| row.package.clone())
         .collect::<BTreeSet<_>>();
     let dependency_discovery = discover_dependencies(left_path, Some(&left))?;
-    // Bundled upstream code contains transitive runtime packages that are not
-    // imported directly by LOCAL (AJV is one concrete example). Restricting
-    // dependency AST indexing to LOCAL's direct imports therefore leaves the
+    // Bundled upstream code can contain transitive runtime packages that are
+    // not imported directly by LOCAL. Restricting dependency AST indexing to
+    // direct imports therefore leaves the
     // bundled owner chain opaque and manufactures P0 "unlinked" branches.
-    // Expand the allow-list only for packages visibly mentioned by the
-    // authoritative bundle. index_dependency_evidence still applies the
-    // per-package file bound and excludes workspace duplicates, so this
-    // retains provenance without copying dependency code into LOCAL.
+    // Expand the allow-list for packages visibly mentioned by the
+    // authoritative bundle. `index_dependency_evidence` applies a per-package
+    // file bound so the extra provenance remains bounded.
     let mut dependency_packages = direct_dependency_packages.clone();
-    let mut large_dependency_files = BTreeSet::new();
     // Resolve the installed dependency closure from package manifests.  A
     // bundled upstream module may come from a transitive package that LOCAL
-    // never imports directly (for example assert -> is-nan), so direct
-    // provenance alone is insufficient.  Keep this bounded by the already
+    // never imports directly, so direct provenance alone is insufficient.
+    // Keep this bounded by the already
     // enforced per-package runtime-file limit in index_dependency_evidence.
     if let Some(discovery) = dependency_discovery.as_ref() {
         let mut package_dependencies = BTreeMap::<String, BTreeSet<String>>::new();
@@ -5867,99 +6874,47 @@ fn run_with_certificates(
             &upstream_text,
             installed_packages.iter().map(String::as_str),
         )?;
-        let has_debug_markers =
-            upstream_text.contains("formatargs") && upstream_text.contains("selectcolor");
-        let has_is_nan_marker = upstream_text.contains("number.isnan");
-        for (file_path, relative) in &discovery.files {
-            let Some(path) = relative.strip_prefix("npm/") else {
+        for (_, relative) in &discovery.files {
+            let Some(package_name) = npm_package_name_from_relative(relative) else {
                 continue;
             };
-            let Some(package) = npm_package_specifier_from_relative(relative) else {
-                continue;
-            };
-            let Some(version_at) = package.rfind('@').filter(|index| *index > 0) else {
-                if upstream_packages.contains(&package.to_ascii_lowercase()) {
-                    dependency_packages.insert(package);
-                }
-                continue;
-            };
-            let package_name = package[..version_at].to_string();
-            // The bundled trace-parent parser is owned by this exact Sentry
-            // runtime file.  Admit only its package/file boundary so the
-            // bounded dependency index can prove the owner without parsing
-            // the rest of @sentry/utils.
-            if package_name == "@sentry/utils" && path.ends_with("/tracing.js") {
-                dependency_packages.insert(package_name.clone());
-                large_dependency_files.insert(relative.clone());
-            }
-            // The bundled debug@4 runtime erases its package boundary and
-            // keeps the formatter counter as an apparently unlinked branch.
-            // Admit only the installed debug package when both distinctive
-            // runtime-owned markers are present in the authoritative bundle;
-            // the normal bounded dependency index then proves its full owner
-            // chain without treating the branch as application code.
-            if package_name == "debug" && has_debug_markers {
-                dependency_packages.insert(package_name.clone());
-            }
-            // Some bundled helpers come from a large transitive package whose
-            // package name is erased by bundling.  Admit that package only
-            // when a rare source marker is present on both sides; this keeps
-            // the bounded index targeted (es-abstract/helpers/isNaN.js is a
-            // concrete example) instead of indexing every large package.
-            let source_has_is_nan_marker = has_is_nan_marker
-                && fs::read_to_string(file_path)
-                    .ok()
-                    .is_some_and(|source| source.contains("Number.isNaN || function"));
-            if source_has_is_nan_marker {
-                dependency_packages.insert(package_name.clone());
-                large_dependency_files.insert(relative.clone());
-            }
-            if upstream_packages.contains(&package_name) {
+            if upstream_packages.contains(&package_name.to_ascii_lowercase()) {
                 dependency_packages.insert(package_name);
             }
         }
     }
     let mut dependencies = dependency_discovery
         .map(|discovery| {
-            index_dependency_evidence(discovery, &dependency_packages, &large_dependency_files)
+            index_dependency_evidence(discovery, &dependency_packages)
         })
         .transpose()?;
+    if let Some(dependencies) = &dependencies {
+        // Link against the full dependency graph before transferring its
+        // ownership to the existing bounded correspondence projection.
+        left.project_sha256 = sha256(format!(
+            "{}\0dependency\0{}",
+            left.project_sha256, dependencies.project_sha256
+        ));
+        link_dependency_entry_sources(&mut left, dependencies);
+    }
     // Keep the heavy dependency AST out of the primary matching lifetime.
     // Provenance and package-entry links are computed below; LLM routing only
     // needs the dependency file inventory and parse status after that point.
-    let dependency_summary = dependencies.as_ref().map(|index| {
+    let dependency_summary = dependencies.take().map(|mut index| {
         // Keep the bounded ASTs for small package closures. The dependency
         // corpus may contain many such packages, so the aggregate can exceed
         // the old 10k cutoff even though no individual closure is large.
         // Retain a finite upper bound to avoid bringing a full node_modules
         // graph back into the main matcher.
         // Keep the bounded-package AST long enough for dependency-owned
-        // bundled branches (execa/mime/core-js helpers) to receive exact
-        // provenance.  The previous 250k aggregate cutoff discarded every
-        // retained package as soon as the closure crossed that boundary,
+        // bundled branches to receive exact provenance. The previous aggregate
+        // cutoff discarded retained packages when the closure crossed that
+        // boundary,
         // leaving only file-level provenance and manufacturing P0 owners.
-        // This remains bounded; the current Screen Studio closure is below
-        // three million semantic nodes and the matcher already uses a bounded
-        // two-worker pool.
-        if index.graph_nodes.len() <= 250_000 {
-            return ProjectIndex {
-                root: index.root.clone(),
-                corpus: CorpusSelection {
-                    mode: index.corpus.mode,
-                    roots: index.corpus.roots.clone(),
-                    excluded_derivative_roots: index.corpus.excluded_derivative_roots.clone(),
-                    source_root: index.corpus.source_root.clone(),
-                    projection_tool: index.corpus.projection_tool.clone(),
-                },
-                project_sha256: index.project_sha256.clone(),
-                files: index.files.clone(),
-                units: index.units.clone(),
-                graph_nodes: index.graph_nodes.clone(),
-                graph_edges: index.graph_edges.clone(),
-                graph_artifact: index.graph_artifact.clone(),
-                failures: index.failures.clone(),
-                skipped: index.skipped.clone(),
-            };
+        // This remains bounded by the configured graph limit and the matcher
+        // uses a bounded worker pool.
+        if index.graph_nodes.len() <= DEPENDENCY_FULL_GRAPH_LIMIT {
+            return index;
         }
         // For a large dependency corpus, retain nodes whose exact structural
         // seed is present in the authoritative upstream graph, plus a bounded
@@ -5978,92 +6933,45 @@ fn run_with_certificates(
             .collect::<Vec<_>>();
         let mut retained_direct_package_nodes = HashMap::<String, usize>::new();
         let mut retained_direct_nodes = 0usize;
-        let graph_nodes = index
-            .graph_nodes
-            .iter()
-            .filter(|node| {
-                if !matches!(node.kind.as_str(), "Statement" | "Function" | "Class") {
-                    return false;
-                }
-                if upstream_hashes
-                    .contains(&sha256(format!("{}\0{}", node.kind, node.linked_sha256)))
-                {
-                    return true;
-                }
-                let Some(prefix) = direct_package_prefixes
-                    .iter()
-                    .find(|prefix| node.file.starts_with(prefix.as_str()))
-                else {
-                    return false;
-                };
-                // Exact bundled-owner certificates may target a transitive
-                // package whose projection would otherwise be evicted by the
-                // global cap. Keep these small packages available for the
-                // certificate matcher before applying aggregate limits.
-                let exact_certificate_package = node.file.starts_with("npm/atomically@1.7.0-");
-                if exact_certificate_package {
-                    return true;
-                }
-                // The primary application graph remains bounded separately;
-                // this projection is only the dependency evidence corpus used
-                // to classify bundled package owners.  The old 100k aggregate
-                // cap was reached by the alphabetically earlier workspace
-                // packages, so later direct imports (notably execa) vanished
-                // before owner matching and manufactured P0 unlinked branches.
-                // Keep the per-package bound, but give the direct-package
-                // projection enough room to cover all installed imports.
-                if retained_direct_nodes >= 500_000 {
-                    return false;
-                }
-                let retained = retained_direct_package_nodes
-                    .entry(prefix.clone())
-                    .or_default();
-                // Keep the package projection aligned with the fuzzy-index
-                // admission bound below. A package's later files (for
-                // example execa/lib/verbose/custom.js) otherwise disappear
-                // before provenance matching can inspect them.
-                if *retained >= 100_000 {
-                    return false;
-                }
-                *retained += 1;
-                retained_direct_nodes += 1;
-                true
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        ProjectIndex {
-            root: index.root.clone(),
-            corpus: CorpusSelection {
-                mode: index.corpus.mode,
-                roots: index.corpus.roots.clone(),
-                excluded_derivative_roots: index.corpus.excluded_derivative_roots.clone(),
-                source_root: index.corpus.source_root.clone(),
-                projection_tool: index.corpus.projection_tool.clone(),
-            },
-            project_sha256: index.project_sha256.clone(),
-            files: index.files.clone(),
-            units: index.units.clone(),
-            graph_nodes,
-            graph_edges: Vec::new(),
-            graph_artifact: index.graph_artifact.clone(),
-            failures: index.failures.clone(),
-            skipped: index.skipped.clone(),
-        }
+        index.graph_nodes.retain(|node| {
+            if !matches!(node.kind.as_str(), "Statement" | "Function" | "Class") {
+                return false;
+            }
+            if upstream_hashes.contains(&sha256(format!("{}\0{}", node.kind, node.linked_sha256))) {
+                return true;
+            }
+            let Some(prefix) = direct_package_prefixes
+                .iter()
+                .find(|prefix| node.file.starts_with(prefix.as_str()))
+            else {
+                return false;
+            };
+            // The primary application graph remains bounded separately;
+            // this projection is only the dependency evidence corpus used
+            // to classify bundled package owners.  The old 100k aggregate
+            // cap was reached before later direct imports were retained,
+            // leaving package owners unlinked before the matcher could inspect
+            // their evidence.
+            // Keep the per-package bound, but give the direct-package
+            // projection enough room to cover all installed imports.
+            if retained_direct_nodes >= 500_000 {
+                return false;
+            }
+            let retained = retained_direct_package_nodes
+                .entry(prefix.clone())
+                .or_default();
+            // Keep the package projection within the fuzzy-index admission
+            // bound so provenance matching can inspect the selected files.
+            if *retained >= 100_000 {
+                return false;
+            }
+            *retained += 1;
+            retained_direct_nodes += 1;
+            true
+        });
+        index.graph_edges = Vec::new();
+        index
     });
-    if let Some(dependencies) = &dependencies {
-        // Dependency source is retained in its own evidence corpus and linked
-        // through PackageEntry nodes/provenance.  Do not merge the complete
-        // node_modules AST into the application graph: large workspaces can
-        // contain millions of dependency nodes and would make the primary
-        // correspondence graph exceed the process memory ceiling.
-        // Include its corpus hash in report identity so package updates still
-        // invalidate prior evidence.
-        left.project_sha256 = sha256(format!(
-            "{}\0dependency\0{}",
-            left.project_sha256, dependencies.project_sha256
-        ));
-        link_dependency_entry_sources(&mut left, dependencies);
-    }
     // Release the full dependency AST before the expensive correspondence
     // phase; only the bounded summary is needed for output/routing below.
     dependencies = dependency_summary;
@@ -6165,15 +7073,20 @@ fn run_with_certificates(
         .units
         .iter()
         .filter(|unit| !used_left.contains(&unit.id))
-        .cloned()
         .collect::<Vec<_>>();
     let linked_right = right
         .units
         .iter()
         .filter(|unit| !used_right.contains(&unit.id))
-        .cloned()
         .collect::<Vec<_>>();
-    for (old, new) in unique_matches(&linked_left, &linked_right, |unit| &unit.linked_sha256) {
+    // The project indexes retain these owners for the entire comparison.
+    // Borrow the unmatched subset: cloning its feature maps duplicates almost
+    // the whole corpus before ranking/graph publication on large bundles.
+    for (old, new) in unique_matches(
+        linked_left.iter().copied(),
+        linked_right.iter().copied(),
+        |unit| &unit.linked_sha256,
+    ) {
         used_left.insert(old.id.clone());
         used_right.insert(new.id.clone());
         let context_equal = units_have_equivalent_dependency_context(
@@ -6208,8 +7121,8 @@ fn run_with_certificates(
         &unit.strict_sha256
     });
     ambiguous.extend(ambiguous_groups(
-        &linked_left,
-        &linked_right,
+        linked_left.iter().copied(),
+        linked_right.iter().copied(),
         "linked",
         |unit| &unit.linked_sha256,
     ));
@@ -6229,6 +7142,11 @@ fn run_with_certificates(
                     .cmp(&right.right.first().map(|item| &item.id))
             })
     });
+    let ambiguous_owners = ambiguous
+        .iter()
+        .flat_map(|group| group.left.iter().chain(&group.right))
+        .map(|owner| owner.id.clone())
+        .collect::<HashSet<_>>();
     let remaining_left = left
         .units
         .iter()
@@ -6248,14 +7166,14 @@ fn run_with_certificates(
     let mut mutual_left = HashSet::new();
     let mut mutual_right = HashSet::new();
     for right_record in &ranked_right {
-        if !best_is_distinct(right_record) {
+        if !best_is_distinct(right_record, &ambiguous_owners) {
             continue;
         }
         let best_left = &right_record.candidates[0];
         let Some(left_record) = left_ranked_by_id.get(&best_left.location.id) else {
             continue;
         };
-        if !best_is_distinct(left_record)
+        if !best_is_distinct(left_record, &ambiguous_owners)
             || left_record.candidates[0].location.id != right_record.location.id
         {
             continue;
@@ -6336,6 +7254,24 @@ fn run_with_certificates(
             })
     });
     matches.sort_by(|a, b| a.left.id.cmp(&b.left.id));
+    // Matching scratch owns cloned units and ranked candidate payloads. The
+    // final matches/groups now own all candidate evidence needed downstream.
+    // Release it before graph analysis allocates its result, not at publication.
+    drop(left_ranked_by_id);
+    drop(ranked_left);
+    drop(ranked_right);
+    drop(linked_left);
+    drop(linked_right);
+    drop(left_dependency_contexts);
+    drop(right_dependency_contexts);
+    drop(left_affinities);
+    drop(right_affinities);
+    drop(left_units_by_id);
+    drop(right_units_by_id);
+    drop(used_left);
+    drop(used_right);
+    drop(mutual_left);
+    drop(mutual_right);
     let (graph_summary, graph_relations, divergence_frontiers) =
         analyze_semantic_graph(&left, &right, &matches, &file_graph_candidates);
     eprintln!(
@@ -7103,11 +8039,16 @@ fn inspect_unit_page(
                 continue;
             }
         }
+        let shared = if artifact == "llm-work-items.jsonl" {
+            llm_context::read_shared_work_evidence(output)?
+        } else {
+            HashMap::new()
+        };
         for line in fs::read_to_string(&path)?
             .lines()
             .filter(|line| !line.is_empty())
         {
-            let record: serde_json::Value = serde_json::from_str(line)?;
+            let record = llm_context::expand_work_evidence(serde_json::from_str(line)?, &shared)?;
             if json_contains_unit_id(&record, unit_id) {
                 relations.push(record);
             }
@@ -7335,11 +8276,22 @@ fn read_bundle_equivalence_certificates(path: &Path) -> Result<Vec<BundleEquival
 }
 
 fn read_json_lines(path: &Path) -> Result<Vec<serde_json::Value>> {
+    let shared = if path
+        .file_name()
+        .is_some_and(|name| name == "llm-work-items.jsonl")
+    {
+        llm_context::read_shared_work_evidence(
+            path.parent()
+                .context("work items have no report directory")?,
+        )?
+    } else {
+        HashMap::new()
+    };
     fs::read_to_string(path)
         .with_context(|| format!("read {}", path.display()))?
         .lines()
         .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_str(line).map_err(Into::into))
+        .map(|line| llm_context::expand_work_evidence(serde_json::from_str(line)?, &shared))
         .collect()
 }
 
@@ -7451,7 +8403,10 @@ fn read_indexed_json_group(path: &Path, group: &str) -> Result<Option<Vec<serde_
 fn show_work(output: &Path, id: &str) -> Result<serde_json::Value> {
     let path = output.join("llm-work-items.jsonl");
     if let Some(item) = read_indexed_json_record(&path, id)? {
-        return Ok(item);
+        return llm_context::expand_work_evidence(
+            item,
+            &llm_context::read_shared_work_evidence(output)?,
+        );
     }
     read_json_lines(&path)?
         .into_iter()
@@ -7492,6 +8447,11 @@ fn show_works(output: &Path, ids: &[String]) -> Result<serde_json::Value> {
             })
             .collect::<Result<Vec<_>>>()?
     };
+    let shared = llm_context::read_shared_work_evidence(output)?;
+    let items = items
+        .into_iter()
+        .map(|item| llm_context::expand_work_evidence(item, &shared))
+        .collect::<Result<Vec<_>>>()?;
     Ok(serde_json::json!({
         "schema": "project-parity/show-works-v1",
         "count": items.len(),
@@ -7525,6 +8485,11 @@ fn show_batch(output: &Path, id: &str, limit: usize, offset: usize) -> Result<se
     .skip(offset)
     .take(limit)
     .collect::<Vec<_>>();
+    let shared = llm_context::read_shared_work_evidence(output)?;
+    let items = items
+        .into_iter()
+        .map(|item| llm_context::expand_work_evidence(item, &shared))
+        .collect::<Result<Vec<_>>>()?;
     let returned = items.len();
     Ok(serde_json::json!({
         "schema": "project-parity/llm-batch-view-v2",
@@ -7606,7 +8571,10 @@ fn compact_batch_view(mut view: JsonValue) -> Result<JsonValue> {
             indexes.push(index);
         }
         if let Some(object) = item.as_object_mut() {
-            object.insert("inspectNodeIdIndexes".to_string(), serde_json::json!(indexes));
+            object.insert(
+                "inspectNodeIdIndexes".to_string(),
+                serde_json::json!(indexes),
+            );
         }
     }
 
@@ -7980,7 +8948,7 @@ fn main() -> Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.len() == 1 && (args[0] == "--version" || args[0] == "-V") {
         print_stdout(&format!(
-            "project-parity {} (state-next-v2, state-next-owner-groups-v1, state-next-upstream-groups-v1, state-next-local-context-v1, state-done-batch-v1, state-done-sync-progress-v1, state-skip-batch-v1, show-works-v1, show-batch-compact-v1, state-optimize-queue-v1, frontier-triage-v2, frontier-behavior-edges-v1)",
+            "project-parity {} (state-next-v2, state-next-owner-groups-v1, state-next-upstream-groups-v1, state-next-local-context-v1, state-done-batch-v1, state-done-sync-progress-v1, state-skip-batch-v1, show-works-v1, show-batch-compact-v1, state-optimize-queue-v1, frontier-triage-v2, frontier-behavior-edges-v1, shared-work-evidence-v1, js-family-jsx-v1)",
             env!("CARGO_PKG_VERSION")
         ))?;
         return Ok(());
@@ -8362,6 +9330,127 @@ mod tests {
     use super::*;
 
     #[test]
+    fn graph_edge_id_sharing_preserves_wire_values_and_distinct_identifiers() {
+        let wire = r#"[
+            {"source":"owner/x","target":"owner/y","kind":"Calls","dynamic":false},
+            {"source":"owner/x","target":"owner/z","kind":"References","dynamic":true,"label":""},
+            {"source":"owner/y","target":"owner/z","kind":"Defines","dynamic":false,"label":"binding"},
+            {"source":"owner/x\u0000suffix","target":"owner/z","kind":"Calls","dynamic":false}
+        ]"#;
+        let mut edges: Vec<GraphEdge> = serde_json::from_str(wire).unwrap();
+        assert!(!Arc::ptr_eq(&edges[0].source, &edges[1].source));
+        let before = serde_json::to_vec(&edges).unwrap();
+        let mut ids = HashSet::new();
+        share_graph_edge_ids(&mut edges[..2], &mut ids);
+        share_graph_edge_ids(&mut edges[2..], &mut ids);
+        assert_eq!(before, serde_json::to_vec(&edges).unwrap());
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&before).unwrap(), serde_json::from_str::<serde_json::Value>(wire).unwrap());
+        assert_eq!(ids.len(), 4);
+        assert!(Arc::ptr_eq(&edges[0].source, &edges[1].source));
+        assert!(Arc::ptr_eq(&edges[0].target, &edges[2].source));
+        assert!(Arc::ptr_eq(&edges[1].target, &edges[3].target));
+        assert!(!Arc::ptr_eq(&edges[0].source, &edges[3].source));
+    }
+
+    #[test]
+    fn repeated_graph_edge_ids_retain_one_long_string_per_identity() {
+        let prefix = "module/long-owner-coordinate/".repeat(12);
+        let mut edges = (0..32).flat_map(|source| {
+            let prefix = &prefix;
+            (0..32).map(move |target| GraphEdge {
+                source: format!("{prefix}node:{source}").into(),
+                target: format!("{prefix}node:{target}").into(),
+                kind: "Calls".into(), dynamic: false, label: None,
+            })
+        }).collect::<Vec<_>>();
+        let before = serde_json::to_vec(&edges).unwrap();
+        let repeated_bytes = edges.iter().map(|edge| edge.source.len() + edge.target.len()).sum::<usize>();
+        let mut ids = HashSet::new();
+        share_graph_edge_ids(&mut edges, &mut ids);
+        let retained_bytes = ids.iter().map(|id| id.len()).sum::<usize>();
+        assert_eq!(ids.len(), 32);
+        assert_eq!(before, serde_json::to_vec(&edges).unwrap());
+        assert_eq!(edges.iter().cloned().collect::<BTreeSet<_>>().len(), 1024);
+        assert_eq!(repeated_bytes, retained_bytes * 64);
+    }
+
+    #[test]
+    fn cold_file_collection_shares_repeated_graph_edge_ids() {
+        let source = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let file = source.path().join("owner.js");
+        fs::write(&file, "export function owner(value) { return value + value; }").unwrap();
+        let (indexed, cache_hit) = index_file(&file, "owner.js", "left", cache.path()).unwrap();
+        assert!(!cache_hit);
+        let mut seen = HashMap::<&str, &Arc<String>>::new();
+        let mut shared = 0;
+        for edge in &indexed.graph.edges {
+            for id in [&edge.source, &edge.target] {
+                if let Some(previous) = seen.insert(id.as_str(), id) {
+                    assert!(Arc::ptr_eq(previous, id));
+                    shared += 1;
+                }
+            }
+        }
+        assert!(shared > 10, "fixture must exercise repeated source and target identities");
+    }
+
+    #[test]
+    fn project_token_strings_share_storage_without_changing_serialized_values() {
+        let directory = tempfile::tempdir().unwrap();
+        for file in ["a.js", "b.js"] {
+            fs::write(directory.path().join(file), "export function value(x) { return x + 42; }\n").unwrap();
+        }
+        let mut index = index_project(directory.path(), "left").unwrap();
+        let first = index.units.iter().find(|unit| unit.file == "a.js").unwrap();
+        let second = index.units.iter().find(|unit| unit.file == "b.js").unwrap();
+        assert!(!first.tokens.is_empty());
+        assert_eq!(first.tokens, second.tokens);
+        for token in &first.tokens {
+            assert!(Arc::ptr_eq(token, second.tokens.get(token.as_ref()).unwrap()));
+        }
+        for tokens in index.units.iter().map(|unit| &unit.tokens)
+            .chain(index.graph_nodes.iter().map(|node| &node.tokens)) {
+            let old_representation = tokens.iter().map(|token| token.to_string()).collect::<BTreeSet<_>>();
+            assert_eq!(serde_json::to_vec(tokens).unwrap(), serde_json::to_vec(&old_representation).unwrap());
+        }
+        // Feature dictionaries preserve the old lexical map serialization and
+        // scoring while sharing repeated keys across different source owners.
+        for (one, two) in [
+            (&first.features.shape, &second.features.shape),
+            (&first.features.ordered, &second.features.ordered),
+            (&first.features.literals, &second.features.literals),
+            (&first.features.operators, &second.features.operators),
+            (&first.features.properties, &second.features.properties),
+            (&first.features.externals, &second.features.externals),
+        ] {
+            assert_eq!(one, two);
+            let original = one.iter().map(|(key, count)| (key.to_string(), *count)).collect::<BTreeMap<_, _>>();
+            assert_eq!(serde_json::to_vec(one).unwrap(), serde_json::to_vec(&original).unwrap());
+            assert_eq!(multiset_similarity(one, two), if one.is_empty() { 0.0 } else { 1.0 });
+            for key in one.keys() { assert!(Arc::ptr_eq(key, two.get_key_value(key.as_ref()).unwrap().0)); }
+        }
+        // A node's projection remains independently mutable even though its
+        // immutable strings are shared with other nodes and unit records.
+        let before = index.units[0].tokens.clone();
+        for node in &mut index.graph_nodes { node.tokens.clear(); }
+        assert_eq!(index.units[0].tokens, before);
+    }
+
+    #[test]
+    fn dependency_edge_release_matches_the_final_projection_boundary() {
+        for side in ["left", "right"] {
+            assert!(keep_project_graph_edges(side, DEPENDENCY_FULL_GRAPH_LIMIT + 1));
+            assert!(keep_project_graph_edges(side, usize::MAX));
+        }
+        assert!(keep_project_graph_edges("dependency", DEPENDENCY_FULL_GRAPH_LIMIT));
+        assert!(!keep_project_graph_edges("dependency", DEPENDENCY_FULL_GRAPH_LIMIT + 1));
+        // A later file can never make a discarded dependency edge relevant:
+        // the accumulated node count cannot return below the summary limit.
+        assert!(!keep_project_graph_edges("dependency", usize::MAX));
+    }
+
+    #[test]
     fn upstream_package_marker_index_matches_the_existing_contains_rules() {
         let packages = ["foo", "foo-bar", "@scope/pkg", "unused"];
         let found =
@@ -8448,7 +9537,7 @@ mod tests {
             .map(|index| {
                 serde_json::json!({
                     "id": format!("right:bundle:{index}:100:0"),
-                    "file": "dist-electron-deobfuscated/index.js",
+                    "file": "bundle/main.js",
                     "kind": "Function",
                     "start": index * 100,
                     "end": index * 100 + 100,
@@ -8500,12 +9589,13 @@ mod tests {
         );
         let compact_size = serde_json::to_vec(&compact).unwrap().len();
         let full_size = serde_json::to_vec(&full).unwrap().len();
-        assert!(compact_size < full_size, "compact={compact_size} full={full_size}");
+        assert!(
+            compact_size < full_size,
+            "compact={compact_size} full={full_size}"
+        );
 
         let shared = compact["sharedFields"].as_object().unwrap();
-        let node_values = compact["inspectNodeIdTable"]["values"]
-            .as_array()
-            .unwrap();
+        let node_values = compact["inspectNodeIdTable"]["values"].as_array().unwrap();
         let mut reconstructed = Vec::new();
         for item in compact["items"].as_array().unwrap() {
             let mut restored = shared.clone();
@@ -8527,26 +9617,19 @@ mod tests {
     }
 
     #[test]
-    fn derivative_projection_is_skipped_when_deobfuscated_bundle_exists() {
+    fn distinct_source_projections_remain_visible_to_the_analyzer() {
         let root = tempdir().unwrap();
-        let projection = root.path().join("dist-electron-unpacked");
-        let deobfuscated = root.path().join("dist-electron-deobfuscated");
-        fs::create_dir_all(&projection).unwrap();
-        fs::create_dir_all(&deobfuscated).unwrap();
-        fs::write(deobfuscated.join("index.js"), "export {};").unwrap();
-        let module = projection.join("23.js");
-        fs::write(&module, "module.exports = 23;").unwrap();
+        let source = root.path().join("generated/modules");
+        let bundle = root.path().join("generated/deobfuscated");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(source.join("module.js"), "module.exports = 23;").unwrap();
+        fs::write(bundle.join("main.js"), "export const answer = 23;").unwrap();
 
-        assert!(is_derivative_duplicate(&module));
         let discovery = discover(root.path()).unwrap();
-        assert!(discovery
-            .files
-            .iter()
-            .all(|(_, file)| file != "dist-electron-unpacked/23.js"));
-        assert_eq!(
-            discovery.corpus.excluded_derivative_roots,
-            vec!["dist-electron-unpacked"]
-        );
+        assert!(discovery.files.iter().any(|(_, file)| file == "generated/modules/module.js"));
+        assert!(discovery.files.iter().any(|(_, file)| file == "generated/deobfuscated/main.js"));
+        assert!(discovery.corpus.excluded_derivative_roots.is_empty());
     }
 
     #[test]
@@ -8605,6 +9688,442 @@ mod tests {
     }
     use tempfile::tempdir;
 
+    #[test]
+    fn borrowed_graph_records_match_value_bytes_and_propagate_write_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.js");
+        let cache = temp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(&path, "export function outer(x) { const read = () => x.value; return read(); }\n").unwrap();
+        let (indexed, _) = index_file(&path, "source.js", "left", &cache).unwrap();
+        let mut expected = Vec::new();
+        let mut actual = Vec::new();
+        for node in &indexed.graph.nodes {
+            for scope in [None, Some("scope \"α\"\n".to_owned())] {
+                let mut node = node.clone();
+                node.scope = scope;
+                node.label = "escaped \"α\"\n\t".to_owned();
+                node.tokens.insert(Arc::from("token \"β\"\n"));
+                serde_json::to_writer(&mut expected, &serde_json::json!({"recordType":"node", "side":"left", "node":node})).unwrap();
+                expected.push(b'\n');
+                project_cache::write_graph_record(&mut actual, "left", &node).unwrap();
+            }
+        }
+        assert!(!indexed.graph.edges.is_empty());
+        for edge in &indexed.graph.edges {
+            for label in [None, Some("label \"β\"\n".to_owned())] {
+                for dynamic in [false, true] {
+                    let mut edge = edge.clone();
+                    edge.label = label.clone();
+                    edge.dynamic = dynamic;
+                    serde_json::to_writer(&mut expected, &serde_json::json!({"recordType":"edge", "side":"dependency", "edge":edge})).unwrap();
+                    expected.push(b'\n');
+                    project_cache::write_graph_record(&mut actual, "dependency", &edge).unwrap();
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+        struct FailWriter;
+        impl std::io::Write for FailWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::Other, "fixture write failed"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let error = project_cache::write_graph_record(&mut FailWriter, "left", &indexed.graph.nodes[0]).unwrap_err();
+        assert!(error.is_io());
+    }
+
+    #[test]
+    fn streamed_project_cache_preserves_projection_records_and_rolls_back_corruption() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.js");
+        let cache = temp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(
+            &path,
+            "export function outer(x) { const read = () => x.value; return read(); }\n",
+        )
+        .unwrap();
+        let (mut baseline, _) = index_file(&path, "source.js", "left", &cache).unwrap();
+        let original = serde_json::to_value(&baseline).unwrap();
+        let mut expected_records = Vec::new();
+        for node in &baseline.graph.nodes {
+            serde_json::to_writer(
+                &mut expected_records,
+                &serde_json::json!({"recordType":"node","side":"left","node":node}),
+            )
+            .unwrap();
+            expected_records.push(b'\n');
+        }
+        for edge in &baseline.graph.edges {
+            serde_json::to_writer(
+                &mut expected_records,
+                &serde_json::json!({"recordType":"edge","side":"left","edge":edge}),
+            )
+            .unwrap();
+            expected_records.push(b'\n');
+        }
+        compact_semantic_graph(&mut baseline.graph);
+        let expected = serde_json::to_value(&baseline).unwrap();
+        let cache_path = fs::read_dir(&cache)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        // Value serialization sorts object fields: graph edges precede nodes.
+        // Lossless project publication must still preserve nodes-before-edges.
+        let bytes = serde_json::to_vec(&original).unwrap();
+        fs::write(
+            &cache_path,
+            zstd::stream::encode_all(bytes.as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        let mut records = Vec::new();
+        let (actual, hit, streamed) =
+            index_project_file(&path, "source.js", "left", &cache, &mut records, true, true).unwrap();
+        assert!(hit && streamed);
+        assert_eq!(serde_json::to_value(&actual).unwrap(), expected);
+        assert_eq!(records, expected_records);
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 1);
+        // The existing dependency cap discards retained edges, but the raw
+        // publication must remain complete, byte-identical and node-first.
+        let mut limited_records = Vec::new();
+        let (limited, hit, streamed) = index_project_file(
+            &path, "source.js", "left", &cache, &mut limited_records, true, false,
+        ).unwrap();
+        assert!(hit && streamed);
+        assert_eq!(limited_records, expected_records);
+        assert!(limited.graph.edges.is_empty());
+        assert_eq!(serde_json::to_value(&limited.graph.nodes).unwrap(), expected["graph"]["nodes"]);
+        assert_eq!(serde_json::to_value(&limited.units).unwrap(), expected["units"]);
+        // Truncate after emitted records so rollback tests a real partial spool.
+        fs::write(
+            &cache_path,
+            zstd::stream::encode_all(&bytes[..bytes.len() - 4], 1).unwrap(),
+        )
+        .unwrap();
+        let mut failed_records = Vec::new();
+        let (recovered, hit, streamed) = index_project_file(
+            &path,
+            "source.js",
+            "left",
+            &cache,
+            &mut failed_records,
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(!hit && !streamed);
+        assert_eq!(serde_json::to_value(&recovered).unwrap(), original);
+        assert!(failed_records.is_empty());
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn streaming_file_cache_preserves_index_and_recovers_from_truncation() {
+        let root = tempdir().unwrap();
+        let cache = root.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        let source = root.path().join("module.js");
+        fs::write(
+            &source,
+            "export function greet(name) { return `Hello ${name} 🌍`; }",
+        )
+        .unwrap();
+        let (cold, cold_hit) = index_file(&source, "module.js", "left", &cache).unwrap();
+        let (warm, warm_hit) = index_file(&source, "module.js", "left", &cache).unwrap();
+        assert!(!cold_hit);
+        assert!(warm_hit);
+        let expected = serde_json::to_value(&cold).unwrap();
+        assert_eq!(serde_json::to_value(&warm).unwrap(), expected);
+        let cache_path = fs::read_dir(&cache)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let bytes = fs::read(&cache_path).unwrap();
+        assert_eq!(
+            zstd::stream::decode_all(bytes.as_slice()).unwrap(),
+            serde_json::to_vec(&cold).unwrap()
+        );
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 1);
+        fs::write(&cache_path, &bytes[..bytes.len() / 2]).unwrap();
+        let (recovered, cache_hit) = index_file(&source, "module.js", "left", &cache).unwrap();
+        assert!(!cache_hit);
+        assert_eq!(serde_json::to_value(&recovered).unwrap(), expected);
+    }
+
+    #[test]
+    fn stale_v37_index_cache_is_not_reused_after_execution_features_change() {
+        let root = tempdir().unwrap();
+        let cache = root.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        let source = root.path().join("module.js");
+        let source_text = "export async function load(){ await request(); }";
+        fs::write(&source, source_text).unwrap();
+
+        let (mut stale, _) = index_file(&source, "module.js", "left", &cache).unwrap();
+        assert!(stale
+            .units
+            .iter()
+            .any(|unit| unit.features.operators.contains_key("Await")));
+        for unit in &mut stale.units {
+            unit.features.operators.remove("Await");
+            unit.features
+                .ordered
+                .retain(|event, _| event.as_ref() != "operator:Await");
+        }
+
+        let source_sha256 = sha256(source_text.as_bytes());
+        let cache_key = sha256(format!(
+            "rust-oxc-0.126.0/v37\0{}\0left\0module.js\0{source_sha256}\0absent",
+            source.display()
+        ));
+        let legacy_cache_path = cache.join(format!("{cache_key}.json.zst"));
+        let current_cache_path = index_cache_path(
+            &source,
+            "module.js",
+            "left",
+            &cache,
+            &source_sha256,
+            "absent",
+        );
+        fs::remove_file(current_cache_path).unwrap();
+        let stale_bytes = serde_json::to_vec(&stale).unwrap();
+        let stale_compressed = zstd::stream::encode_all(stale_bytes.as_slice(), 3).unwrap();
+        fs::write(legacy_cache_path, stale_compressed).unwrap();
+
+        let (fresh, cache_hit) = index_file(&source, "module.js", "left", &cache).unwrap();
+
+        assert!(!cache_hit, "v37 cache must not bypass the new AST features");
+        assert!(fresh
+            .units
+            .iter()
+            .any(|unit| unit.features.operators.contains_key("Await")));
+    }
+
+    #[test]
+    fn normalized_publication_edges_use_less_scratch_disk_than_full_json_keys() {
+        let root = tempdir().unwrap();
+        let publication = SemanticGraphPublication::new(&root.path().join("normalized.sqlite"), "left", "right").unwrap();
+        let original = rusqlite::Connection::open(root.path().join("original.sqlite")).unwrap();
+        original.execute_batch("PRAGMA temp_store=FILE; CREATE TEMP TABLE emitted_edges(edge BLOB PRIMARY KEY) WITHOUT ROWID; BEGIN;").unwrap();
+        let prefix = "module/long-owner-coordinate/".repeat(12);
+        for source in 0..32 {
+            for target in 0..32 {
+                let edge = GraphEdge {
+                    source: format!("{prefix}source:{source}").into(),
+                    target: format!("{prefix}target:{target}").into(),
+                    kind: "Calls".into(), dynamic: source % 2 == 0,
+                    label: Some(format!("{prefix}label:{}", target % 4)),
+                };
+                assert!(publication.insert_edge(&edge).unwrap());
+                original.execute("INSERT INTO emitted_edges(edge) VALUES (?1)", [serde_json::to_vec(&edge).unwrap()]).unwrap();
+            }
+        }
+        let normalized_pages: u64 = publication.scratch.query_row("PRAGMA temp.page_count", [], |row| row.get(0)).unwrap();
+        let original_pages: u64 = original.query_row("PRAGMA temp.page_count", [], |row| row.get(0)).unwrap();
+        let normalized_count: u64 = publication.scratch.query_row("SELECT count(*) FROM emitted_edges", [], |row| row.get(0)).unwrap();
+        assert_eq!(normalized_count, 1024);
+        assert!(normalized_pages * 3 < original_pages, "normalized {normalized_pages}, original {original_pages}");
+        eprintln!("edge scratch pages: normalized={normalized_pages} original={original_pages}");
+    }
+
+    #[test]
+    fn publication_hash_index_preserves_exact_values_on_collision() {
+        let root = tempdir().unwrap();
+        let publication = SemanticGraphPublication::new(&root.path().join("index.sqlite"), "left", "right").unwrap();
+        let digest = Sha256::digest(b"collision-target");
+        let hash: &[u8] = digest.as_ref();
+        // Deliberately put a different value in the same locator bucket.
+        publication.scratch.execute(
+            "INSERT INTO graph_symbols(value,value_hash) VALUES (?1,?2)",
+            rusqlite::params!["different-value", hash],
+        ).unwrap();
+        let different_id = publication.scratch.last_insert_rowid();
+        let target_id = publication.intern_symbol("collision-target").unwrap();
+        assert_ne!(target_id, different_id);
+        assert_eq!(publication.intern_symbol("collision-target").unwrap(), target_id);
+        assert!(publication.insert_node("collision-target").unwrap());
+        assert!(!publication.insert_node("collision-target").unwrap());
+        assert_eq!(publication.scratch.query_row("SELECT count(*) FROM graph_symbols WHERE value_hash=?1", [hash], |row| row.get::<_, usize>(0)).unwrap(), 2);
+    }
+
+    #[test]
+    fn publication_digest_index_avoids_duplicate_long_symbol_strings() {
+        let root = tempdir().unwrap();
+        let publication = SemanticGraphPublication::new(&root.path().join("index.sqlite"), "left", "right").unwrap();
+        let original = rusqlite::Connection::open_in_memory().unwrap();
+        original.execute_batch("PRAGMA temp_store=FILE; CREATE TEMP TABLE graph_symbols(id INTEGER PRIMARY KEY,value TEXT NOT NULL UNIQUE);").unwrap();
+        for i in 0..512 {
+            let value = format!("{}:{i}", "owner/path/".repeat(100));
+            publication.intern_symbol(&value).unwrap();
+            original.execute("INSERT INTO graph_symbols(value) VALUES (?1)", [value]).unwrap();
+        }
+        let after: u64 = publication.scratch.query_row("PRAGMA temp.page_count", [], |row| row.get(0)).unwrap();
+        let before: u64 = original.query_row("PRAGMA temp.page_count", [], |row| row.get(0)).unwrap();
+        assert!(after * 3 < before * 2, "digest={after}, lexical={before}");
+        eprintln!("dictionary scratch pages: digest={after} lexical={before}");
+    }
+
+    #[test]
+    fn publication_compressed_symbols_preserve_exact_lookup_keys() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("index.sqlite");
+        let publication = SemanticGraphPublication::new(&path, "left", "right").unwrap();
+        let first = format!("{}:one", "nested/owner/path/".repeat(100));
+        let second = format!("{}:two", "nested/owner/path/".repeat(100));
+        for key in [&first, &second] {
+            assert!(publication.insert_node(key).unwrap());
+            assert!(!publication.insert_node(key).unwrap());
+            let encoded = publication_symbol_value(key).unwrap();
+            assert!(matches!(&encoded, rusqlite::types::Value::Blob(bytes) if bytes.len() < key.len()));
+            assert_eq!(publication_symbol_text(encoded).unwrap(), *key);
+        }
+        publication.record_chunk(0, 0, 32, &BTreeSet::from([first.clone(), second.clone()])).unwrap();
+        publication.finish().unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        let keys = connection.prepare("SELECT node_id FROM node_chunks ORDER BY node_id").unwrap()
+            .query_map([], |row| row.get::<_, String>(0)).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(keys, vec![first, second]);
+    }
+
+    #[test]
+    fn publication_reclaims_membership_pages_before_building_lookup() {
+        let root = tempdir().unwrap();
+        let publication = SemanticGraphPublication::new(&root.path().join("index.sqlite"), "left", "right").unwrap();
+        for source in 0..256 {
+            let id = format!("node:{source}");
+            assert!(publication.insert_node(&id).unwrap());
+            for target in 0..64 {
+                assert!(publication.insert_edge(&GraphEdge {
+                    source: id.clone().into(), target: format!("node:{target}").into(),
+                    kind: "Calls".into(), dynamic: false, label: None,
+                }).unwrap());
+            }
+        }
+        publication.record_chunk(0, 0, 32, &BTreeSet::from(["node:0".into(), "node:255".into()])).unwrap();
+        let before: u64 = publication.scratch.query_row("PRAGMA temp.page_count", [], |row| row.get(0)).unwrap();
+        publication.release_membership().unwrap();
+        let after: u64 = publication.scratch.query_row("PRAGMA temp.page_count", [], |row| row.get(0)).unwrap();
+        assert!(after * 3 < before, "before={before}, after={after}");
+        let refs: Vec<(String, usize)> = publication.scratch.prepare(
+            "SELECT value,chunk_id FROM chunk_refs JOIN graph_symbols ON graph_symbols.id=chunk_refs.node_id ORDER BY value"
+        ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap()
+            .collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(refs, vec![("node:0".into(), 0), ("node:255".into(), 0)]);
+        assert_eq!(publication.connection.query_row("SELECT count(*) FROM node_chunks", [], |row| row.get::<_, usize>(0)).unwrap(), 0);
+        eprintln!("membership release scratch pages: before={before} after={after}");
+    }
+
+    #[test]
+    fn disk_graph_publication_preserves_exact_membership_and_lookup_index() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("streamed.sqlite");
+        let publication = SemanticGraphPublication::new(&path, "left", "right").unwrap();
+        assert!(publication.insert_node("same").unwrap());
+        assert!(!publication.insert_node("same").unwrap());
+        assert!(publication.insert_node("same\0suffix").unwrap());
+        let base = GraphEdge {
+            source: "a".to_string().into(),
+            target: "b".to_string().into(),
+            kind: "Calls".into(),
+            dynamic: false,
+            label: None,
+        };
+        let mut variants = vec![base.clone()];
+        let mut edge = base.clone();
+        edge.source = "other".to_string().into();
+        variants.push(edge);
+        let mut edge = base.clone();
+        edge.target = "other".to_string().into();
+        variants.push(edge);
+        let mut edge = base.clone();
+        edge.kind = "References".into();
+        variants.push(edge);
+        let mut edge = base.clone();
+        edge.dynamic = true;
+        variants.push(edge);
+        let mut edge = base.clone();
+        edge.label = Some(String::new());
+        variants.push(edge);
+        let mut edge = base;
+        edge.label = Some("quoted\"\0label".into());
+        variants.push(edge);
+        let mut expected_edges = BTreeSet::new();
+        for edge in variants.iter().chain(variants.iter().rev()) {
+            assert_eq!(
+                publication.insert_edge(edge).unwrap(),
+                expected_edges.insert(edge.clone())
+            );
+        }
+        let chunks = vec![
+            serde_json::json!({"offset": 0, "length": 32}),
+            serde_json::json!({"offset": 32, "length": 64}),
+            serde_json::json!({"offset": 96, "length": 16}),
+        ];
+        let mut expected_nodes = BTreeMap::<String, Vec<usize>>::new();
+        for (chunk_id, ids) in [["a", "b"], ["b", "c"], ["a", "b"]].iter().enumerate() {
+            let ids: BTreeSet<String> = ids.iter().map(|id| id.to_string()).collect();
+            publication
+                .record_chunk(
+                    chunk_id,
+                    chunks[chunk_id]["offset"].as_u64().unwrap(),
+                    chunks[chunk_id]["length"].as_u64().unwrap() as usize,
+                    &ids,
+                )
+                .unwrap();
+            for id in ids {
+                expected_nodes.entry(id).or_default().push(chunk_id);
+            }
+        }
+        publication.finish().unwrap();
+        let expected_path = root.path().join("legacy.sqlite");
+        write_semantic_graph_lookup_index(
+            &expected_path,
+            "left",
+            "right",
+            &chunks,
+            &expected_nodes,
+        )
+        .unwrap();
+        let snapshot = |path: &Path| {
+            let connection = rusqlite::Connection::open(path).unwrap();
+            let mut statement = connection
+                .prepare("SELECT node_id,hex(chunk_ids) FROM node_chunks ORDER BY node_id")
+                .unwrap();
+            let nodes = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let mut statement = connection
+                .prepare("SELECT id,offset,length FROM chunks ORDER BY id")
+                .unwrap();
+            let chunks = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            (nodes, chunks)
+        };
+        assert_eq!(snapshot(&path), snapshot(&expected_path));
+        let connection = rusqlite::Connection::open(path).unwrap();
+        assert_eq!(connection.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('emitted_nodes','emitted_edges','chunk_refs')", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+
     fn unit(id: &str, tokens: &[&str]) -> Unit {
         let mut features = FeatureChannels::default();
         for token in tokens {
@@ -8623,7 +10142,7 @@ mod tests {
             nodes_approx: tokens.len(),
             strict_sha256: id.to_string(),
             linked_sha256: id.to_string(),
-            tokens: tokens.iter().map(|token| (*token).to_string()).collect(),
+            tokens: tokens.iter().map(|token| Arc::from(*token)).collect(),
             features,
         }
     }
@@ -8704,7 +10223,7 @@ mod tests {
             line: 1,
             scope: None,
             linked_sha256: id.to_string(),
-            tokens: [format!("literal:{literal}:1")].into_iter().collect(),
+            tokens: [Arc::from(format!("literal:{literal}:1"))].into_iter().collect(),
         };
         let decimal = node("decimal", "45");
         let hex = node("hex", "0x2d");
@@ -8798,6 +10317,231 @@ mod tests {
 
         assert_eq!(typed[0].linked_sha256, javascript[0].linked_sha256);
         assert_eq!(similarity(&typed[0], &javascript[0]).0, 1.0);
+    }
+
+    #[test]
+    fn semantic_graph_erases_types_and_transparent_wrappers_before_feature_ordering() {
+        let typed_source = "function owner<T>(value: T) { const result = (value! as T satisfies T); return (result as T); }";
+        let javascript_source = "function owner(value) { const result = value; return result; }";
+        let (_, _, typed) = canonicalize(typed_source, SourceType::ts(), "owner.ts", "left").unwrap();
+        let (_, _, javascript) = canonicalize(javascript_source, SourceType::mjs(), "chunk.js", "right").unwrap();
+        let statements = |graph: &SemanticGraph| graph.nodes.iter()
+            .filter(|node| node.kind == "Statement" && node.start > 0)
+            .map(|node| (node.start, node.linked_sha256.clone()))
+            .collect::<BTreeMap<_, _>>().into_values().collect::<Vec<_>>();
+        assert_eq!(statements(&typed), statements(&javascript));
+        assert!(!typed.nodes.iter().any(|node| node.kind == "ReferenceSite" && node.label == "T"));
+    }
+
+    fn source_offset(source: &str, unique_fragment: &str) -> u64 {
+        source
+            .find(unique_fragment)
+            .unwrap_or_else(|| panic!("fixture fragment is missing: {unique_fragment}")) as u64
+    }
+
+    #[test]
+    fn semantic_graph_options_hooks_do_not_cross_pair_frontiers() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let local = include_str!("../fixtures/options-hook-correspondence/local.tsx");
+        let upstream = include_str!("../fixtures/options-hook-correspondence/upstream.jsx");
+        fs::write(left.path().join("owner.tsx"), local).unwrap();
+        fs::write(right.path().join("chunk.jsx"), upstream).unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let frontiers = read_json_lines(&output.path().join("divergence-frontiers.jsonl")).unwrap();
+        let relations = read_json_lines(&output.path().join("graph-relations.jsonl")).unwrap();
+        let local_runner = source_offset(local, "actionRunner = useActionRunner()");
+        let upstream_runner = source_offset(upstream, "actionRunner = (0, H.useActionRunner)()");
+        assert!(relations.iter().any(|item| item["left"]["kind"] == "Statement"
+            && item["left"]["start"] == local_runner && item["right"]["start"] == upstream_runner)
+            || frontiers.iter().any(|item| item["classification"] == "ambiguous-correspondence"
+                && ((item["sourceLeft"]["start"] == local_runner && item["sourceRight"]["start"] == upstream_runner)
+                    || (item["leftEdge"]["target"]["start"] == local_runner
+                        && item["rightEdge"]["target"]["start"] == upstream_runner))),
+            "correct runner route must remain matched or reviewable");
+        for item in &frontiers {
+            let a = &item["leftEdge"]["target"];
+            let b = &item["rightEdge"]["target"];
+            if let (Some(start), Some(end), Some(rstart), Some(rend)) =
+                (a["start"].as_u64(), a["end"].as_u64(), b["start"].as_u64(), b["end"].as_u64()) {
+                let lsource = &local[start as usize..end as usize];
+                let rsource = &upstream[rstart as usize..rend as usize];
+                assert!(!(lsource == "actionRunner = useActionRunner()"
+                    && rsource.contains("H.useRef")), "crossed hook frontier: {item}");
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_graph_binding_owners_precede_fuzzy_hook_initializers() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let local = include_str!("../fixtures/options-hook-correspondence/local.tsx");
+        let upstream = include_str!("../fixtures/options-hook-correspondence/upstream.jsx");
+        fs::write(left.path().join("owner.tsx"), local).unwrap();
+        fs::write(right.path().join("chunk.jsx"), upstream).unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let relations = read_json_lines(&output.path().join("graph-relations.jsonl")).unwrap();
+        let local_ref = source_offset(local, "anchorRef = useRef<HTMLDivElement>(null)");
+        let upstream_ref = source_offset(upstream, "anchorRef = (0, H.useRef)(null)");
+        let upstream_runner = source_offset(upstream, "actionRunner = (0, H.useActionRunner)()");
+        assert!(relations.iter().any(|item| item["left"]["kind"] == "Statement"
+            && item["left"]["start"] == local_ref && item["right"]["start"] == upstream_ref
+            && item["basis"] == "neighbor-binding-owner"),
+            "paired ref symbols must bind their own declarations");
+        assert!(!relations.iter().any(|item| item["left"]["kind"] == "Statement"
+            && item["left"]["start"] == local_ref && item["right"]["start"] == upstream_runner),
+            "ref declaration was claimed by the unrelated runner initializer");
+        let frontiers = read_json_lines(&output.path().join("divergence-frontiers.jsonl")).unwrap();
+        assert!(!frontiers.iter().any(|item| item["classification"] == "missing-local-branch"
+            && item["rightEdge"]["target"]["kind"] == "Statement"
+            && item["rightEdge"]["target"]["start"] == upstream_ref),
+            "native ref declaration already exists locally");
+        assert!(!frontiers.iter().any(|item| item["classification"] == "changed-branch"
+            && item["leftEdge"]["target"]["start"] == local_ref
+            && item["rightEdge"]["target"]["start"] == upstream_ref),
+            "equal ref initializer must not be relabeled as changed");
+    }
+
+    #[test]
+    fn semantic_graph_options_hooks_keep_real_initializer_drift() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let local = include_str!("../fixtures/options-hook-correspondence/local.tsx")
+            .replace("useRef<HTMLDivElement>(null)", "useRef<HTMLDivElement>(true)");
+        let upstream = include_str!("../fixtures/options-hook-correspondence/upstream.jsx");
+        fs::write(left.path().join("owner.tsx"), &local).unwrap();
+        fs::write(right.path().join("chunk.jsx"), upstream).unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        let local_ref = source_offset(&local, "anchorRef = useRef<HTMLDivElement>(true)");
+        let upstream_ref = source_offset(upstream, "anchorRef = (0, H.useRef)(null)");
+        assert!(!report["matches"].as_array().unwrap().iter().any(|item|
+            item["left"]["start"] == local_ref && item["right"]["start"] == upstream_ref
+                && item["confidence"] == "proven-structure"));
+        let frontiers = read_json_lines(&output.path().join("divergence-frontiers.jsonl")).unwrap();
+        assert!(frontiers.iter().any(|item| item["classification"] == "ambiguous-correspondence"
+            && item["leftEdge"]["target"]["start"] == local_ref
+            && item["rightEdge"]["target"]["start"] == upstream_ref),
+            "binding identity must not hide initializer differences");
+        let work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(work.iter().any(|item| item["upstream"].as_array().is_some_and(|owners|
+            owners.iter().any(|owner| owner["start"] == upstream_ref))),
+            "changed ref initializer has no exact upstream locator in the queue");
+    }
+
+    #[test]
+    fn semantic_graph_cleanup_siblings_do_not_cross_match_after_ts_erasure() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let local = "export function cleanup(seek: Controller, audio: Controller) { seek!.destroy(); audio.destroy(); }";
+        let upstream = "export function cleanup(a, b) { a.destroy(); b.destroy(); }";
+        fs::write(left.path().join("owner.ts"), local).unwrap();
+        fs::write(right.path().join("chunk.js"), upstream).unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let relations = read_json_lines(&output.path().join("graph-relations.jsonl")).unwrap();
+        for relation in &relations {
+            let a = &relation["left"];
+            let b = &relation["right"];
+            if a["kind"] == "Statement" && b["kind"] == "Statement" {
+                let local_statement = &local[a["start"].as_u64().unwrap() as usize..a["end"].as_u64().unwrap() as usize];
+                let upstream_statement = &upstream[b["start"].as_u64().unwrap() as usize..b["end"].as_u64().unwrap() as usize];
+                assert!(!(local_statement == "seek!.destroy();" && upstream_statement == "b.destroy();")
+                    && !(local_statement == "audio.destroy();" && upstream_statement == "a.destroy();"),
+                    "sibling cleanup calls crossed: {local_statement} -> {upstream_statement}");
+            }
+        }
+        let frontiers = read_json_lines(&output.path().join("divergence-frontiers.jsonl")).unwrap();
+        assert!(!frontiers.iter().any(|item| item["classification"] == "changed-branch"
+            && item["leftEdge"]["target"]["kind"] == "Statement"
+            && item["rightEdge"]["target"]["kind"] == "Statement"));
+    }
+
+    #[test]
+    fn semantic_graph_does_not_promote_nested_callbacks_across_unpaired_owners() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let local = include_str!("../fixtures/owner-context-gate/local.js");
+        let upstream = include_str!("../fixtures/owner-context-gate/upstream.js");
+        fs::write(left.path().join("owner.js"), local).unwrap();
+        fs::write(right.path().join("chunk.js"), upstream).unwrap();
+
+        run(left.path(), right.path(), output.path()).unwrap();
+
+        let relations = read_json_lines(&output.path().join("graph-relations.jsonl")).unwrap();
+        let local_callback = source_offset(local, "(sum, word) => sum + word.length");
+        let upstream_callback = source_offset(upstream, "(sum, item) => sum + item.length");
+        assert!(!relations.iter().any(|relation| {
+            relation["left"]["kind"] == "Function"
+                && relation["left"]["start"] == local_callback
+                && relation["right"]["kind"] == "Function"
+                && relation["right"]["start"] == upstream_callback
+        }), "an identical inner callback must not seed a relation across unrelated owners");
+    }
+
+    #[test]
+    fn semantic_graph_keeps_nested_callbacks_when_their_owners_are_proven() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let local = "export function totalSize(words) { return words.reduce((sum, word) => sum + word.length, 0) }";
+        let upstream = "export function totalSize(items) { return items.reduce((total, item) => total + item.length, 0) }";
+        fs::write(left.path().join("owner.js"), local).unwrap();
+        fs::write(right.path().join("chunk.js"), upstream).unwrap();
+
+        run(left.path(), right.path(), output.path()).unwrap();
+
+        let relations = read_json_lines(&output.path().join("graph-relations.jsonl")).unwrap();
+        let local_callback = source_offset(local, "(sum, word) => sum + word.length");
+        let upstream_callback = source_offset(upstream, "(total, item) => total + item.length");
+        assert!(relations.iter().any(|relation| {
+            relation["basis"] == "seed-unit"
+                && relation["left"]["kind"] == "Function"
+                && relation["left"]["start"] == local_callback
+                && relation["right"]["kind"] == "Function"
+                && relation["right"]["start"] == upstream_callback
+        }), "an equivalent owner should preserve the nested callback correspondence");
+    }
+
+    #[test]
+    fn semantic_graph_equal_neighbor_scores_remain_ambiguous_at_one() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let local = "export function cleanup(a, b) { a.destroy(); b.destroy(); }";
+        let upstream = "export function cleanup(x, y) { x.destroy(); y.destroy(); }";
+        fs::write(left.path().join("owner.js"), local).unwrap();
+        fs::write(right.path().join("chunk.js"), upstream).unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let relations = read_json_lines(&output.path().join("graph-relations.jsonl")).unwrap();
+        assert!(!relations.iter().any(|item| item["left"]["kind"] == "Statement"
+            && item["right"]["kind"] == "Statement"
+            && item["left"]["start"].as_u64().unwrap() as usize >= local.find("a.destroy").unwrap()), "{relations:?}");
+        let frontiers = read_json_lines(&output.path().join("divergence-frontiers.jsonl")).unwrap();
+        assert!(frontiers.iter().any(|item| item["classification"] == "ambiguous-correspondence"
+            && item["leftEdge"]["target"]["kind"] == "Statement"
+            && item["rightEdge"]["target"]["kind"] == "Statement"));
+        assert!(!frontiers.iter().any(|item| item["classification"] == "changed-branch"));
+    }
+
+    #[test]
+    fn semantic_graph_cleanup_keeps_real_call_drift_actionable() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::write(left.path().join("owner.ts"), "export function cleanup(seek: Controller, audio: Controller) { seek!.destroy(); audio.destroy(); }").unwrap();
+        fs::write(right.path().join("chunk.js"), "export function cleanup(a, b) { a.reset(); b.destroy(); }").unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(!report["matches"].as_array().unwrap().iter().any(|item| item["confidence"] == "proven-structure"));
+        let work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(work.iter().any(|item| item["upstream"].as_array().is_some_and(|owners| owners.iter().any(|owner| owner["kind"] == "Function"))));
     }
 
     #[test]
@@ -8974,9 +10718,156 @@ mod tests {
     }
 
     #[test]
+    fn grouped_variable_declarations_do_not_manufacture_missing_initializers() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::write(left.path().join("local.js"), "export function inspect(node,time){const shape=read(()=>node.getDrawShape(time)),output=node.frameOutputTexture;return {vertex:shape.value?.vertexCount??null,output};}").unwrap();
+        let native = "export function inspect(n,t){let shape=read(()=>n.getDrawShape(t));let output=n.frameOutputTexture;return {vertex:shape.value?.vertexCount??null,output:output};}";
+        fs::write(right.path().join("native.js"), native).unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let frontiers = fs::read_to_string(output.path().join("divergence-frontiers.jsonl")).unwrap();
+        for line in frontiers.lines() {
+            let frontier: serde_json::Value = serde_json::from_str(line).unwrap();
+            if frontier["classification"] != "missing-local-branch" { continue; }
+            let Some(target) = frontier.get("rightEdge").and_then(|edge| edge.get("target")) else { continue; };
+            let (Some(start), Some(end)) = (target["start"].as_u64(), target["end"].as_u64()) else { continue; };
+            assert!(!native[start as usize..end as usize].contains("getDrawShape"), "an existing initializer is not a missing local branch: {frontier}");
+        }
+    }
+
+    #[test]
+    fn sibling_behavior_does_not_promote_an_unused_structural_frontier() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let local = include_str!("../fixtures/structural-sibling-behavior/local.js");
+        let upstream = include_str!("../fixtures/structural-sibling-behavior/upstream.js");
+        fs::write(left.path().join("local.js"), local).unwrap();
+        fs::write(right.path().join("upstream.js"), upstream).unwrap();
+
+        run(left.path(), right.path(), output.path()).unwrap();
+
+        let work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
+        let dormant = source_offset(upstream, "dormant = 1");
+        assert!(work.iter().any(|item| {
+            item["action"] == "inspect-unverified-missing-branch"
+                && item["priority"] == "P2"
+                && item["confidence"] == "weak-candidate"
+                && item["evidencePath"].as_array().is_some_and(|path| {
+                    path.iter().any(|relation| {
+                        relation["viaEdge"].as_str().is_some_and(|edge| edge.ends_with("Calls"))
+                    })
+                })
+                && item["upstream"].as_array().is_some_and(|owners| {
+                    owners.iter().any(|owner| {
+                        owner["file"] == "upstream.js"
+                            && owner["start"].as_u64().is_some_and(|start| start <= dormant)
+                            && owner["end"].as_u64().is_some_and(|end| end > dormant)
+                    })
+                })
+        }), "an unused structural declarator was promoted by its sibling call: {work:?}");
+    }
+
+    #[test]
+    fn conditional_expression_equivalence_is_not_a_repair_and_real_branch_drift_stays_visible() {
+        let local = include_str!("../fixtures/conditional-expression-equivalence/local.js");
+        let equivalent = include_str!("../fixtures/conditional-expression-equivalence/upstream.js");
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::write(left.path().join("local.js"), local).unwrap();
+        fs::write(right.path().join("upstream.js"), equivalent).unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let equivalent_work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(!equivalent_work.iter().any(|item| {
+            item["priority"] == "P0"
+                && matches!(item["action"].as_str(), Some("port-missing-upstream-branch" | "reconcile-changed-branch"))
+        }), "equivalent if/else and conditional-expression syntax was promoted to repair: {equivalent_work:?}");
+
+        let changed = include_str!("../fixtures/conditional-expression-equivalence/changed-upstream.js");
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::write(left.path().join("local.js"), local).unwrap();
+        fs::write(right.path().join("upstream.js"), changed).unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let changed_work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(changed_work.iter().any(|item| {
+            item["priority"] != "P0"
+                && item["upstream"].as_array().is_some_and(|owners| {
+                    owners.iter().any(|owner| owner["file"] == "upstream.js" && owner["name"] == "choose")
+                })
+        }), "a real conditional branch change was silently suppressed: {changed_work:?}");
+    }
+
+    #[test]
+    fn grouped_declarators_keep_order_and_exact_symbol_definitions() {
+        let source = "function read(){const first=one(),second=two();return first+second;}";
+        let (_, _, graph) = canonicalize(source, SourceType::mjs(), "fixture.js", "left").unwrap();
+        let first = graph.nodes.iter().find(|node| node.label == "VariableDeclarator" && &source[node.start as usize..node.end as usize] == "first=one()").unwrap();
+        let second = graph.nodes.iter().find(|node| node.label == "VariableDeclarator" && &source[node.start as usize..node.end as usize] == "second=two()").unwrap();
+        assert!(graph.edges.iter().any(|edge| edge.kind == "NextStatement" && edge.source.as_str() == first.id && edge.target.as_str() == second.id));
+        for declaration in [first, second] {
+            assert!(graph.edges.iter().any(|edge| edge.kind == "Defines" && edge.target.as_str() == declaration.id));
+        }
+    }
+
+    #[test]
+    fn exported_grouped_declarators_keep_exact_symbol_definitions() {
+        let source = "export const first=1,second=2;";
+        let (_, _, graph) = canonicalize(source, SourceType::mjs(), "fixture.js", "left").unwrap();
+        for text in ["first=1", "second=2"] {
+            let declaration = graph.nodes.iter().find(|node| {
+                node.label == "VariableDeclarator"
+                    && &source[node.start as usize..node.end as usize] == text
+            });
+            assert!(declaration.is_some(), "missing exported declarator owner for {text}");
+            let declaration = declaration.unwrap();
+            assert!(graph.edges.iter().any(|edge| {
+                edge.kind == "Defines" && edge.target.as_str() == declaration.id
+            }), "missing exact symbol definition edge for {text}");
+        }
+    }
+
+    #[test]
+    fn loop_header_declarators_keep_exact_symbol_definitions() {
+        let source = "for (const first=1,second=2; test; step) run(first,second);";
+        let (_, _, graph) = canonicalize(source, SourceType::mjs(), "fixture.js", "left").unwrap();
+        for text in ["first=1", "second=2"] {
+            let declaration = graph.nodes.iter().find(|node| {
+                node.label == "VariableDeclarator"
+                    && &source[node.start as usize..node.end as usize] == text
+            });
+            assert!(declaration.is_some(), "missing loop-header declarator owner for {text}");
+            let declaration = declaration.unwrap();
+            assert!(graph.edges.iter().any(|edge| {
+                edge.kind == "Defines" && edge.target.as_str() == declaration.id
+            }), "missing exact symbol definition edge for {text}");
+        }
+    }
+
+    #[test]
+    fn declarator_normalization_keeps_changed_initializer_actionable() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::write(left.path().join("local.js"), "export function calculate(input){const first=input.value+1,second=input.other;return first+second;}").unwrap();
+        fs::write(right.path().join("native.js"), "export function calculate(input){let first=input.value+2;let second=input.other;return first+second;}").unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(!report["matches"].as_array().unwrap().iter().any(|matched| matched["status"] == "alpha-equal" && matched["right"]["name"] == "calculate"));
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(work.lines().any(|line| {
+            let item: serde_json::Value = serde_json::from_str(line).unwrap();
+            item["upstream"].as_array().is_some_and(|owners| owners.iter().any(|owner| owner["file"] == "native.js" && owner["name"] == "calculate"))
+        }), "unmatched changed owner must remain in the review queue: {work}");
+    }
+
+    #[test]
     fn semantic_graph_preserves_import_binding_provenance() {
         let source = r#"
-            import { debounce as wait } from 'lodash';
+            import { debounce as wait } from 'example-runtime';
             import type { Config } from 'types-package';
             import { type Shape } from 'types-package';
             import fallback from 'fallback-package';
@@ -9002,7 +10893,7 @@ mod tests {
         assert!(graph
             .nodes
             .iter()
-            .any(|node| node.kind == "External" && node.label == "module:lodash"));
+            .any(|node| node.kind == "External" && node.label == "module:example-runtime"));
     }
 
     #[test]
@@ -9666,15 +11557,15 @@ mod tests {
         let left = tempdir().unwrap();
         let right = tempdir().unwrap();
         let output = tempdir().unwrap();
-        fs::create_dir_all(left.path().join("node_modules/lodash")).unwrap();
+        fs::create_dir_all(left.path().join("node_modules/example-runtime")).unwrap();
         fs::create_dir_all(left.path().join("src")).unwrap();
         fs::write(
-            left.path().join("node_modules/lodash/package.json"),
-            r#"{"name":"lodash","version":"4.17.21"}"#,
+            left.path().join("node_modules/example-runtime/package.json"),
+            r#"{"name":"example-runtime","version":"1.0.0"}"#,
         )
         .unwrap();
         fs::write(
-            left.path().join("node_modules/lodash/index.js"),
+            left.path().join("node_modules/example-runtime/index.js"),
             "export const debounce = value => value;",
         )
         .unwrap();
@@ -9695,7 +11586,7 @@ mod tests {
         .unwrap();
         fs::write(
             left.path().join("src/main.ts"),
-            "import { debounce as wait } from 'lodash'; import legacyPackage = require('lodash'); import { helper } from './helper'; import { api } from './barrel'; const { helper: legacyHelper } = require('./helper'); const { foo: legacyFoo } = require('./cjs-helper'); const directDebounce = require('lodash').debounce; const dynamicPackage = import('lodash'); wait(helper); legacyPackage; directDebounce; dynamicPackage; api;",
+            "import { debounce as wait } from 'example-runtime'; import legacyPackage = require('example-runtime'); import { helper } from './helper'; import { api } from './barrel'; const { helper: legacyHelper } = require('./helper'); const { foo: legacyFoo } = require('./cjs-helper'); const directDebounce = require('example-runtime').debounce; const dynamicPackage = import('example-runtime'); wait(helper); legacyPackage; directDebounce; dynamicPackage; api;",
         )
         .unwrap();
         fs::write(right.path().join("main.js"), "export const ready = true;").unwrap();
@@ -9709,11 +11600,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(rows.iter().any(|row| {
             row["side"] == "left"
-                && row["specifier"] == "lodash"
+                && row["specifier"] == "example-runtime"
                 && row["importedExport"] == "debounce"
                 && row["resolution"] == "resolved-installed-package"
-                && row["package"] == "lodash"
-                && row["version"] == "4.17.21"
+                && row["package"] == "example-runtime"
+                && row["version"] == "1.0.0"
                 && row["packageRuntimeSha256"].as_str().is_some()
                 && row["entryResolution"] == "legacy-package-main"
                 && row["entryPath"] == "index.js"
@@ -9721,23 +11612,23 @@ mod tests {
         }));
         assert!(rows.iter().any(|row| {
             row["side"] == "left"
-                && row["specifier"] == "lodash"
+                && row["specifier"] == "example-runtime"
                 && row["edgeKind"] == "RequiresBinding"
                 && row["importedExport"] == "*"
                 && row["resolution"] == "resolved-installed-package"
-                && row["package"] == "lodash"
-                && row["version"] == "4.17.21"
+                && row["package"] == "example-runtime"
+                && row["version"] == "1.0.0"
         }));
         assert!(rows.iter().any(|row| {
             row["side"] == "left"
-                && row["specifier"] == "lodash"
+                && row["specifier"] == "example-runtime"
                 && row["edgeKind"] == "RequiresBinding"
                 && row["importedExport"] == "debounce"
                 && row["resolution"] == "resolved-installed-package"
         }));
         assert!(rows.iter().any(|row| {
             row["side"] == "left"
-                && row["specifier"] == "lodash"
+                && row["specifier"] == "example-runtime"
                 && row["edgeKind"] == "DynamicImportsBinding"
                 && row["importedExport"] == "*"
                 && row["bindingSymbolId"].is_string()
@@ -9801,11 +11692,40 @@ mod tests {
             edge.kind == "ReExportsBinding" && edge.label.as_deref() == Some("api <- helper")
         }));
         assert!(indexed.graph_nodes.iter().any(|node| {
-            node.kind == "PackageEntry" && node.label == "lodash@4.17.21:index.js"
+            node.kind == "PackageEntry" && node.label == "example-runtime@1.0.0:index.js"
         }));
         assert!(indexed.graph_edges.iter().any(|edge| {
-            edge.kind == "ResolvesToPackage" && edge.label.as_deref() == Some("lodash")
+            edge.kind == "ResolvesToPackage" && edge.label.as_deref() == Some("example-runtime")
         }));
+    }
+
+    #[test]
+    fn installed_package_entries_preserve_distinct_roots_and_read_hashes() {
+        let project = tempdir().unwrap();
+        for relative in ["node_modules/pkg", "src/nested/node_modules/pkg"] {
+            let package = project.path().join(relative);
+            fs::create_dir_all(&package).unwrap();
+            fs::write(package.join("package.json"),
+                r#"{"name":"pkg","version":"1.0.0","main":"index.js"}"#).unwrap();
+            fs::write(package.join("index.js"), "exports.value = 1;").unwrap();
+        }
+        fs::write(project.path().join("src/use.js"), "import { value } from 'pkg'; value();").unwrap();
+        fs::write(project.path().join("src/nested/use.js"), "import { value } from 'pkg'; value();").unwrap();
+        let indexed = index_project(project.path(), "left").unwrap();
+        let entries = indexed.graph_nodes.iter()
+            .filter(|node| node.kind == "PackageEntry" && node.label == "pkg@1.0.0:index.js")
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2, "same version/path at two roots must not collapse");
+        assert_ne!(entries[0].id, entries[1].id);
+        for entry in &entries {
+            assert_eq!(entry.linked_sha256, sha256("exports.value = 1;"));
+            assert!(entry.tokens.contains(format!("EntrySourceSha256:{}", entry.linked_sha256).as_str()));
+            assert_eq!(entry.tokens.iter().filter(|token| token.starts_with("EntryPackageRoot:")).count(), 1);
+        }
+        let roots = entries.iter().flat_map(|entry| entry.tokens.iter())
+            .filter(|token| token.starts_with("EntryPackageRoot:"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(roots.len(), 2);
     }
 
     #[test]
@@ -9854,7 +11774,7 @@ mod tests {
         assert!(indexed.graph_edges.iter().any(|edge| {
             edge.kind == "BindsTo"
                 && edge.label.as_deref() == Some("publicApi")
-                && edge.target == implementation
+                && edge.target.as_str() == implementation
         }));
         assert_eq!(
             indexed
@@ -9903,7 +11823,7 @@ mod tests {
             .map(|edge| edge.source.as_str())
             .expect("named owner");
         assert!(indexed.graph_edges.iter().any(|edge| {
-            edge.kind == "BindsTo" && edge.label.as_deref() == Some("named") && edge.target == owner
+            edge.kind == "BindsTo" && edge.label.as_deref() == Some("named") && edge.target.as_str() == owner
         }));
         assert!(!indexed
             .graph_edges
@@ -10020,6 +11940,122 @@ mod tests {
     }
 
     #[test]
+    fn native_only_build_directory_does_not_hide_package_javascript() {
+        let project = tempdir().unwrap();
+        let package = project.path().join("node_modules/native-package");
+        fs::create_dir_all(package.join("build/Release")).unwrap();
+        fs::write(package.join("package.json"),
+            r#"{"name":"native-package","version":"1.0.0","main":"index.js"}"#).unwrap();
+        fs::write(package.join("index.js"), r#"module.exports = require("./build/Release/native.node");"#).unwrap();
+        fs::write(package.join("build/Release/native.node"), b"native fixture").unwrap();
+        fs::write(project.path().join("main.js"), r#"require("native-package");"#).unwrap();
+        let indexed = index_project(project.path(), "left").unwrap();
+        let discovery = discover_dependencies(project.path(), Some(&indexed)).unwrap().unwrap();
+        assert!(discovery.files.iter().any(|(_, relative)| relative.ends_with("/index.js")),
+            "native build output must not displace the package JS entry");
+    }
+
+    #[test]
+    fn native_distribution_does_not_hide_root_scripts_and_real_dist_code_stays_visible() {
+        let project = tempdir().unwrap();
+        let package = project.path().join("node_modules/distribution-package");
+        fs::create_dir_all(package.join("dist/App.app/Contents/MacOS")).unwrap();
+        fs::write(package.join("package.json"),
+            r#"{"name":"distribution-package","version":"1.0.0","main":"index.js"}"#).unwrap();
+        fs::write(project.path().join("main.js"), r#"require("distribution-package");"#).unwrap();
+        for file in ["index.js", "cli.js", "install.js"] {
+            fs::write(package.join(file), "module.exports = () => 1;").unwrap();
+        }
+        fs::write(package.join("dist/App.app/Contents/MacOS/App"), b"native fixture").unwrap();
+        let indexed = index_project(project.path(), "left").unwrap();
+        let discovery = discover_dependencies(project.path(), Some(&indexed)).unwrap().unwrap();
+        assert_eq!(discovery.files.len(), 3);
+        for file in ["index.js", "cli.js", "install.js"] {
+            assert!(discovery.files.iter().any(|(_, relative)| relative.ends_with(file)));
+        }
+        fs::write(package.join("dist/runtime.js"), "module.exports = x => x >= 2;").unwrap();
+        let discovery = discover_dependencies(project.path(), Some(&indexed)).unwrap().unwrap();
+        assert!(discovery.files.iter().any(|(_, relative)| relative.ends_with("/dist/runtime.js")));
+    }
+
+    #[test]
+    fn dependency_bulk_discovery_ignores_readme_code_docs_but_keeps_declared_entries() {
+        let project = tempdir().unwrap();
+        fs::write(
+            project.path().join("package.json"),
+            r#"{"name":"fixture","dependencies":{"bulk-doc-package":"1.0.0","declared-readme-package":"1.0.0","valid-readme-package":"1.0.0"}}"#,
+        )
+        .unwrap();
+        let bulk_package = project.path().join("node_modules/bulk-doc-package");
+        fs::create_dir_all(&bulk_package).unwrap();
+        fs::create_dir_all(bulk_package.join("dist")).unwrap();
+        fs::write(
+            bulk_package.join("package.json"),
+            r#"{"name":"bulk-doc-package","version":"1.0.0","main":"runtime.js"}"#,
+        )
+        .unwrap();
+        fs::write(bulk_package.join("index.js"), "module.exports = () => 'index';").unwrap();
+        fs::write(bulk_package.join("runtime.js"), "module.exports = () => 'runtime';").unwrap();
+        fs::write(bulk_package.join("helper.js"), "module.exports = () => 'helper';").unwrap();
+        fs::write(bulk_package.join("README.js"), "**runtime** documentation, not JavaScript.").unwrap();
+        fs::write(bulk_package.join("dist/README.js"), "**distribution** documentation, not JavaScript.").unwrap();
+
+        let declared_package = project.path().join("node_modules/declared-readme-package");
+        fs::create_dir_all(&declared_package).unwrap();
+        fs::write(
+            declared_package.join("package.json"),
+            r#"{"name":"declared-readme-package","version":"1.0.0","main":"runtime.js","module":"README.js","bin":{"declared-readme":"README.js"}}"#,
+        )
+        .unwrap();
+        fs::write(declared_package.join("runtime.js"), "module.exports = () => 'runtime';").unwrap();
+        fs::write(declared_package.join("README.js"), "module.exports = () => 'declared runtime';").unwrap();
+
+        let valid_readme_package = project.path().join("node_modules/valid-readme-package");
+        fs::create_dir_all(&valid_readme_package).unwrap();
+        fs::write(
+            valid_readme_package.join("package.json"),
+            r#"{"name":"valid-readme-package","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        fs::write(valid_readme_package.join("index.js"), "module.exports = () => 'index';").unwrap();
+        fs::write(valid_readme_package.join("README.js"), "module.exports = () => 'runtime README';").unwrap();
+        fs::write(
+            project.path().join("main.js"),
+            "import 'bulk-doc-package'; import 'bulk-doc-package/helper'; import 'declared-readme-package';",
+        )
+        .unwrap();
+
+        let discovery = discover_dependencies(project.path(), None).unwrap().unwrap();
+        let bulk_package = bulk_package.canonicalize().unwrap();
+        let declared_package = declared_package.canonicalize().unwrap();
+        let valid_readme_package = valid_readme_package.canonicalize().unwrap();
+        assert!(discovery.files.iter().any(|(path, _)| path == &bulk_package.join("index.js")));
+        assert!(discovery.files.iter().any(|(path, _)| path == &bulk_package.join("runtime.js")));
+        assert!(discovery.files.iter().any(|(path, _)| path == &bulk_package.join("helper.js")));
+        assert!(!discovery.files.iter().any(|(path, _)| path == &bulk_package.join("README.js")));
+        assert!(!discovery.files.iter().any(|(path, _)| path == &bulk_package.join("dist/README.js")));
+        assert!(discovery.files.iter().any(|(path, _)| path == &declared_package.join("README.js")));
+        assert!(discovery.files.iter().any(|(path, _)| path == &valid_readme_package.join("README.js")));
+
+        let dependencies = index_discovery(discovery, "dependency").unwrap();
+        assert!(dependencies.failures.is_empty(), "unexpected dependency failures: {:?}", dependencies.failures);
+    }
+
+    #[test]
+    fn dependency_readme_filter_requires_markdown_and_parse_failure() {
+        let directory = tempdir().unwrap();
+        let readme = directory.path().join("README.js");
+        fs::write(&readme, "**documentation** with a code extension").unwrap();
+        assert!(is_dependency_readme_documentation(&readme));
+
+        fs::write(&readme, "module.exports = () => 'runtime';").unwrap();
+        assert!(!is_dependency_readme_documentation(&readme));
+
+        fs::write(&readme, "function (").unwrap();
+        assert!(!is_dependency_readme_documentation(&readme));
+    }
+
+    #[test]
     fn conditional_package_exports_remain_graph_candidates() {
         let project = tempdir().unwrap();
         let right = tempdir().unwrap();
@@ -10113,14 +12149,14 @@ mod tests {
             side: side.to_string(),
             edge_kind: "ImportsBinding".to_string(),
             importer_file: "src/main.js".to_string(),
-            specifier: "lodash".to_string(),
+            specifier: "example-runtime".to_string(),
             imported_export: "debounce".to_string(),
             binding_symbol_id: Some(binding.to_string()),
             module_node_id: format!("{side}-module"),
             resolution: "resolved-installed-package",
-            resolved_path: Some(format!("/{side}/node_modules/lodash")),
-            package: Some("lodash".to_string()),
-            version: Some("4.17.21".to_string()),
+            resolved_path: Some(format!("/{side}/node_modules/example-runtime")),
+            package: Some("example-runtime".to_string()),
+            version: Some("1.0.0".to_string()),
             package_runtime_sha256: Some(fingerprint.to_string()),
             entry_resolution: Some("legacy-package-main"),
             entry_path: Some("index.js".to_string()),
@@ -10232,6 +12268,50 @@ mod tests {
                     && record["confidence"] == "proven-structure"
             })
         }));
+    }
+
+    #[test]
+    fn semantic_graph_closed_arrow_excludes_following_jsx_and_method_tokens() {
+        let local = "export function render(tokens) { return <main>{tokens.some(token => token.kind === 'word' && token.isHidden) && <ToggleWithLabel title=\"Show hidden words\" />}</main> }";
+        let upstream = "export class Model { get hasHiddenWords() { return this.tokens.some(token => token.kind === \"word\" && token.isHidden); } get canCutTargetFromVideo() { return this.targetTokens.some(token => this.getIsTokenPresent(token)); } }";
+        let (_, _, left) = canonicalize(local, SourceType::jsx(), "owner.jsx", "left").unwrap();
+        let (_, _, right) = canonicalize(upstream, SourceType::mjs(), "chunk.js", "right").unwrap();
+        let body = |source: &str, graph: &SemanticGraph| graph.nodes.iter().find(|node| node.kind == "Statement" && &source[node.start as usize..node.end as usize] == "token.kind === 'word' && token.isHidden").cloned();
+        let a = body(local, &left).unwrap();
+        let b = right.nodes.iter().find(|node| node.kind == "Statement" && &upstream[node.start as usize..node.end as usize] == "token.kind === \"word\" && token.isHidden").unwrap();
+        eprintln!("BOUNDARY SCORE {}\nLEFT {:?}\nRIGHT {:?}", graph_similarity(&a,b), a.tokens,b.tokens);
+        assert!(!a.tokens.iter().any(|token| token.contains("Show hidden words") || token.contains("JSX") || token.contains("ToggleWithLabel")), "closed arrow body contains following JSX tokens");
+        assert!(!b.tokens.iter().any(|token| token.contains("canCutTargetFromVideo") || token.contains("MethodDefinition")), "closed arrow body contains following method tokens");
+        assert_eq!(graph_similarity(&a,b), 1.0);
+    }
+
+    #[test]
+    fn semantic_graph_closed_arrow_keeps_real_body_drift_actionable() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let local = "export const owner = token => token.kind === 'word' && token.isHidden;";
+        fs::write(left.path().join("owner.js"), local).unwrap();
+        for expression in [
+            "token.kind === \"word\" && token.isDeleted",
+            "token.kind === \"gap\" && token.isHidden",
+            "token.kind === \"word\" || token.isHidden",
+        ] {
+            let output = tempdir().unwrap();
+            let source = format!("export const owner = token => {expression};");
+            fs::write(right.path().join("chunk.js"), &source).unwrap();
+            let (_,_,a_graph) = canonicalize(local, SourceType::mjs(), "owner.js", "left").unwrap();
+            let (_,_,b_graph) = canonicalize(&source, SourceType::mjs(), "chunk.js", "right").unwrap();
+            let a = a_graph.nodes.iter().find(|n| n.kind == "Statement" && n.start == 30).unwrap();
+            let b = b_graph.nodes.iter().find(|n| n.kind == "Statement" && n.start == 30).unwrap();
+            assert_ne!(a.linked_sha256,b.linked_sha256);
+            assert!(graph_similarity(a,b) < 1.0, "real expression drift must survive: {expression}");
+            run(left.path(), right.path(), output.path()).unwrap();
+            let work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
+            eprintln!("DRIFT {expression} ACTIONS {:?}", work.iter().map(|item| &item["action"]).collect::<Vec<_>>());
+            assert!(work.iter().any(|item| item["upstream"].as_array().is_some_and(|owners| owners.iter().any(|owner| owner["kind"] == "Function" && owner["start"] == 21))), "changed arrow owner must remain actionable: {expression}");
+            let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+            assert!(!report["matches"].as_array().unwrap().iter().any(|item| item["confidence"] == "proven-structure"), "real body drift cannot be proven: {expression}");
+        }
     }
 
     #[test]
@@ -10359,6 +12439,23 @@ mod tests {
         assert_eq!(summary.left_failures, 0);
         assert_eq!(summary.right_failures, 0);
         assert_eq!(summary.alpha_equal, 1);
+    }
+
+    #[test]
+    fn semantic_graph_scratch_tables_use_memory_temp_store() {
+        let output = tempdir().unwrap();
+        let publication = SemanticGraphPublication::new(
+            &output.path().join("semantic-graph.index.sqlite"),
+            "left",
+            "right",
+        )
+        .unwrap();
+
+        let temp_store: i64 = publication
+            .scratch
+            .query_row("PRAGMA temp_store", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(temp_store, 2);
     }
 
     #[test]
@@ -10606,6 +12703,140 @@ mod tests {
     }
 
     #[test]
+    fn dependency_unit_scratch_release_preserves_complete_llm_artifacts() {
+        let left_dir = tempdir().unwrap();
+        let right_dir = tempdir().unwrap();
+        let before = tempdir().unwrap();
+        let after = tempdir().unwrap();
+        fs::create_dir_all(left_dir.path().join("node_modules/example-runtime")).unwrap();
+        fs::write(left_dir.path().join("package.json"), r#"{"name":"fixture","dependencies":{"example-runtime":"1.0.0"}}"#).unwrap();
+        fs::write(left_dir.path().join("node_modules/example-runtime/package.json"), r#"{"name":"example-runtime","version":"1.0.0"}"#).unwrap();
+        fs::write(left_dir.path().join("node_modules/example-runtime/index.js"), "export function runtimeHelper(value){if(value==null){return 'missing'}return value.map(item=>item+1).join(',')}").unwrap();
+        fs::write(left_dir.path().join("app.js"), "import { runtimeHelper } from 'example-runtime'; export const app=()=>runtimeHelper([1]);").unwrap();
+        fs::write(right_dir.path().join("bundle.js"), "export function a(x){if(x==null){return 'missing'}return x.map(y=>y+1).join(',')}").unwrap();
+        let left = index_project(left_dir.path(), "left").unwrap();
+        let right = index_project(right_dir.path(), "right").unwrap();
+        let discovery = discover_dependencies(left_dir.path(), Some(&left)).unwrap().unwrap();
+        let paths = discovery.files.clone();
+        let mut dependencies = index_discovery(discovery, "dependency").unwrap();
+        // Restore original cached Unit scratch to compare the complete pre-
+        // change routing evidence against the reduced retained representation.
+        dependencies.units = paths.iter().flat_map(|(path, relative)| index_file(path, relative, "dependency", &cache_root()).unwrap().0.units).collect();
+        assert!(dependencies.units.iter().any(|unit| !unit.tokens.is_empty() && !unit.features.shape.is_empty()));
+        let identities = dependencies.units.iter().map(|unit| (serde_json::to_value(location(unit)).unwrap(), unit.strict_sha256.clone(), unit.linked_sha256.clone())).collect::<Vec<_>>();
+        let render = |out: &Path, dep: &ProjectIndex| llm_context::write_llm_context(out, &left, &right, &[], &[], &[], &[], &[], &[], &[], Some(dep)).unwrap();
+        render(before.path(), &dependencies);
+        release_dependency_unit_features(&mut dependencies.units);
+        assert!(dependencies.units.iter().all(|unit| unit.tokens.is_empty() && unit.features.shape.is_empty()));
+        assert_eq!(identities, dependencies.units.iter().map(|unit| (serde_json::to_value(location(unit)).unwrap(), unit.strict_sha256.clone(), unit.linked_sha256.clone())).collect::<Vec<_>>());
+        render(after.path(), &dependencies);
+        let before_files = fs::read_dir(before.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect::<BTreeSet<_>>();
+        let after_files = fs::read_dir(after.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect::<BTreeSet<_>>();
+        assert_eq!(before_files, after_files);
+        for file in before_files {
+            assert_eq!(fs::read(before.path().join(&file)).unwrap(), fs::read(after.path().join(&file)).unwrap(), "artifact {:?}", file);
+        }
+        let ledger = read_json_lines(&after.path().join("upstream-executable-ledger.jsonl")).unwrap();
+        assert!(ledger.iter().any(|row| row["disposition"] == "dependency-structurally-equal"));
+    }
+
+    #[test]
+    fn dependency_child_does_not_certify_application_parent_or_sibling() {
+        let left_dir = tempdir().unwrap();
+        let right_dir = tempdir().unwrap();
+        fs::create_dir_all(left_dir.path().join("node_modules/example-runtime")).unwrap();
+        fs::write(left_dir.path().join("package.json"), r#"{"name":"fixture","dependencies":{"example-runtime":"1.0.0"}}"#).unwrap();
+        fs::write(left_dir.path().join("node_modules/example-runtime/package.json"), r#"{"name":"example-runtime","version":"1.0.0"}"#).unwrap();
+        let helper = "function runtimeHelper(value){if(value==null){return 'missing'}return value.map(item=>item+1).join(',')}";
+        fs::write(left_dir.path().join("node_modules/example-runtime/index.js"), format!("export {helper}")).unwrap();
+        fs::write(left_dir.path().join("app.js"), "import {runtimeHelper} from 'example-runtime';export const app=()=>runtimeHelper([1]);").unwrap();
+        let left = index_project(left_dir.path(), "left").unwrap();
+        let discovery = discover_dependencies(left_dir.path(), Some(&left)).unwrap().unwrap();
+        let mut dependencies = index_discovery(discovery, "dependency").unwrap();
+        // Exercise the real dependency-unit route even when the production
+        // projection has discarded graph edges/nodes. Keep the parsed units.
+        dependencies.graph_nodes.clear();
+        dependencies.graph_edges.clear();
+        for audit in ["first application effect", "changed application effect"] {
+            let sibling = format!("function sibling(input){{globalThis.applicationOnly.push({audit:?},input);return fetch('/application-endpoint',{{method:'POST',body:JSON.stringify(input)}})}}");
+            let source = format!("export function application(input){{{helper}\n{sibling}\nglobalThis.applicationOnly.push({audit:?});return sibling(input)}}");
+            fs::write(right_dir.path().join("bundle.js"), &source).unwrap();
+            let right = index_project(right_dir.path(), "right").unwrap();
+            let output = tempdir().unwrap();
+            llm_context::write_llm_context(output.path(), &left, &right, &[], &[], &[], &[], &[], &[], &[], Some(&dependencies)).unwrap();
+            let ledger = read_json_lines(&output.path().join("upstream-executable-ledger.jsonl")).unwrap();
+            let at = |text: &str| source.find(text).unwrap();
+            let child = ledger.iter().find(|row| row["upstream"]["kind"] == "Function" && row["upstream"]["start"] == at(helper)).unwrap();
+            assert_eq!(child["disposition"], "dependency-structurally-equal", "real complete helper lost direct evidence: {child}");
+            for text in ["function application", sibling.as_str()] {
+                let row = ledger.iter().find(|row| row["upstream"]["kind"] == "Function" && row["upstream"]["start"] == at(text)).unwrap();
+                assert_ne!(row["disposition"], "dependency-structurally-equal", "child containment hid application behavior: {row}");
+                assert!(row["workItemId"].is_string(), "application behavior must remain actionable: {row}");
+            }
+            let work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
+            assert!(!work.is_empty());
+        }
+    }
+
+    #[test]
+    fn dependency_graph_score_one_keeps_application_behavior_actionable() {
+        let left_dir = tempdir().unwrap();
+        let right_dir = tempdir().unwrap();
+        fs::create_dir_all(left_dir.path().join("node_modules/example-runtime")).unwrap();
+        fs::write(left_dir.path().join("package.json"), r#"{"name":"fixture","dependencies":{"example-runtime":"1.0.0"}}"#).unwrap();
+        fs::write(left_dir.path().join("node_modules/example-runtime/package.json"), r#"{"name":"example-runtime","version":"1.0.0"}"#).unwrap();
+        let helper = "function runtimeHelper(value){if(value==null){return 'missing'}return value.map(item=>item+1).join(',')}";
+        fs::write(left_dir.path().join("node_modules/example-runtime/index.js"), format!("export {helper}")).unwrap();
+        fs::write(left_dir.path().join("app.js"), "import {runtimeHelper} from 'example-runtime';export const app=()=>runtimeHelper([1]);").unwrap();
+        let left = index_project(left_dir.path(), "left").unwrap();
+        let discovery = discover_dependencies(left_dir.path(), Some(&left)).unwrap().unwrap();
+        let dependencies = index_discovery(discovery, "dependency").unwrap();
+        assert!(!dependencies.graph_nodes.is_empty());
+        for audit in ["first application effect", "changed application effect"] {
+            let sibling = format!("function sibling(input){{globalThis.applicationOnly.push({audit:?},input);return fetch('/application-endpoint',{{method:'POST',body:JSON.stringify(input)}})}}");
+            let source = format!("export function application(input){{{helper}\n{sibling}\nglobalThis.applicationOnly.push({audit:?});return sibling(input)}}");
+            fs::write(right_dir.path().join("bundle.js"), &source).unwrap();
+            let right = index_project(right_dir.path(), "right").unwrap();
+            let output = tempdir().unwrap();
+            llm_context::write_llm_context(output.path(), &left, &right, &[], &[], &[], &[], &[], &[], &[], Some(&dependencies)).unwrap();
+            let ledger = read_json_lines(&output.path().join("upstream-executable-ledger.jsonl")).unwrap();
+            let at = |text: &str| source.find(text).unwrap();
+            let child = ledger.iter().find(|row| row["upstream"]["kind"] == "Function" && row["upstream"]["start"] == at(helper)).unwrap();
+            assert_eq!(child["disposition"], "dependency-structurally-equal", "direct complete-helper evidence lost: {child}");
+            assert_eq!(child["dependencyEvidence"]["basis"], "exact-linked-unit");
+            assert!(child["dependencyCandidateEvidence"].is_null());
+            let work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
+            for text in ["function application", sibling.as_str()] {
+                let row = ledger.iter().find(|row| row["upstream"]["kind"] == "Function" && row["upstream"]["start"] == at(text)).unwrap();
+                assert_ne!(row["disposition"], "dependency-structurally-equal", "graph locator hid application behavior: {row}");
+                assert!(row["workItemId"].is_string());
+                assert!(work.iter().any(|item| item["id"] == row["workItemId"] && item["action"].is_string()), "candidate lost its actionable work record: {row}");
+                assert!(row["dependencyEvidence"].is_null());
+                let hint = &row["dependencyCandidateEvidence"];
+                assert_eq!(hint["confidence"], "candidate");
+                assert_eq!(hint["evidence"]["basis"], "unique-normalized-tiny-package");
+                assert_eq!(hint["evidence"]["score"], 1.0);
+                assert!(hint["evidence"]["source"]["id"].is_string());
+                let semantic = zstd::stream::decode_all(fs::File::open(output.path().join("upstream-semantic-ledger.jsonl.zst")).unwrap()).unwrap();
+                let semantic = std::str::from_utf8(&semantic).unwrap().lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()).collect::<Vec<_>>();
+                let same = semantic.iter().find(|item| item["id"] == row["upstream"]["id"]).unwrap();
+                assert_eq!(same["dependencyCandidateEvidence"], *hint);
+                assert_eq!(same["workItemId"], row["workItemId"]);
+            }
+        }
+        // A known dependency inventory with only graph candidates must not
+        // manufacture a non-zero covered-node count from its file count.
+        fs::write(right_dir.path().join("bundle.js"), "export function application(input){globalThis.applicationOnly.push('unmatched',input);return fetch('/application-endpoint',{method:'POST',body:JSON.stringify(input)})}").unwrap();
+        let right = index_project(right_dir.path(), "right").unwrap();
+        let output = tempdir().unwrap();
+        let summary = llm_context::write_llm_context(output.path(), &left, &right, &[], &[], &[], &[], &[], &[], &[], Some(&dependencies)).unwrap();
+        assert!(summary.dependency_files > 0);
+        assert_eq!(summary.dependency_covered_nodes, 0);
+        let ledger = read_json_lines(&output.path().join("upstream-executable-ledger.jsonl")).unwrap();
+        assert!(ledger.iter().any(|row| row["dependencyCandidateEvidence"].is_object() && row["workItemId"].is_string()));
+    }
+
+    #[test]
     fn installed_dependency_code_is_covered_by_exact_evidence() {
         let left = tempdir().unwrap();
         let right = tempdir().unwrap();
@@ -10673,6 +12904,50 @@ mod tests {
             .unwrap()
             .lines()
             .any(|line| line.contains("ResolvesToDependencySource")));
+    }
+
+    #[test]
+    fn cjs_adjacency_does_not_prove_unmatched_behavior() {
+        let mut results = Vec::new();
+        for (name, app, extra, target_file, target) in [
+            ("wrapper", "function wrap(value){return {default:value}}\nlet runtime=require('example-runtime');\nruntime=wrap(runtime);", None, "bundle.js", "runtime=wrap(runtime);"),
+            ("changed-wrapper", "function wrap(value){globalThis.audit=999;return {default:value}}\nlet runtime=require('example-runtime');\nruntime=wrap(runtime);", None, "bundle.js", "runtime=wrap(runtime);"),
+            ("same-file-effect", "let runtime=require('example-runtime');\nglobalThis.audit=999;", None, "bundle.js", "globalThis.audit=999;"),
+            ("other-file-effect", "let runtime=require('example-runtime');", Some("                                                                                                    globalThis.audit=999;"), "other.js", "globalThis.audit=999;"),
+        ] {
+            let left = tempdir().unwrap();
+            let right = tempdir().unwrap();
+            let output = tempdir().unwrap();
+            fs::create_dir_all(left.path().join("node_modules/example-runtime")).unwrap();
+            fs::write(left.path().join("package.json"), r#"{"name":"fixture","dependencies":{"example-runtime":"1.0.0"}}"#).unwrap();
+            fs::write(left.path().join("node_modules/example-runtime/package.json"), r#"{"name":"example-runtime","version":"1.0.0"}"#).unwrap();
+            fs::write(left.path().join("node_modules/example-runtime/index.js"), "module.exports={answer:42};").unwrap();
+            fs::write(left.path().join("app.js"), "import runtime from 'example-runtime'; export const answer=runtime.answer;").unwrap();
+            fs::write(right.path().join("bundle.js"), app).unwrap();
+            if let Some(source) = extra { fs::write(right.path().join("other.js"), source).unwrap(); }
+            run(left.path(), right.path(), output.path()).unwrap();
+            let start = extra.unwrap_or(app).find(target).unwrap();
+            let ledger = read_json_lines(&output.path().join("upstream-executable-ledger.jsonl")).unwrap();
+            let row = ledger.iter().find(|row| row["upstream"]["file"] == target_file
+                && row["upstream"]["start"] == start && row["upstream"]["kind"] == "Statement").unwrap();
+            results.push((name, row.clone()));
+            if name == "wrapper" {
+                // Actual matching source, rather than a nearby import, still
+                // proves the wrapper through the normal structural pipeline.
+                fs::remove_file(left.path().join("app.js")).unwrap();
+                fs::write(left.path().join("bundle.js"), app).unwrap();
+                run(left.path(), right.path(), output.path()).unwrap();
+                let proved = read_json_lines(&output.path().join("upstream-executable-ledger.jsonl")).unwrap();
+                let row = proved.iter().find(|row| row["upstream"]["file"] == target_file
+                    && row["upstream"]["start"] == start && row["upstream"]["kind"] == "Statement").unwrap();
+                assert_eq!(row["confidence"], "proven-structure", "matching wrapper lost real evidence: {row}");
+                assert!(row["workItemId"].is_null());
+            }
+        }
+        for (name, row) in results {
+            assert_ne!(row["disposition"], "dependency-structurally-equal", "{name}: adjacency/import presence cannot prove behavior: {row}");
+            assert!(row["workItemId"].is_string(), "{name}: unmatched behavior must remain in the repair queue: {row}");
+        }
     }
 
     #[test]
@@ -10764,15 +13039,18 @@ mod tests {
     }
 
     #[test]
-    fn bundled_oracle_fixture_has_perfect_labeled_precision_and_recall() {
+    fn bundled_oracle_fixture_has_full_recall_and_abstains_on_protocol_change() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/oracle-basic");
         let output = tempdir().unwrap();
         run(&fixture.join("left"), &fixture.join("right"), output.path()).unwrap();
         let metrics = evaluate_oracle(output.path(), &fixture.join("oracle.json")).unwrap();
         assert_eq!(metrics.promoted_precision, 1.0);
         assert_eq!(metrics.top_k_recall, 1.0);
-        assert_eq!(metrics.abstained_expected, 0);
+        assert_eq!(metrics.abstained_expected, 1);
         assert_eq!(metrics.false_promotions, 0);
+        let unmatched = read_json_lines(&output.path().join("unmatched-right.jsonl")).unwrap();
+        let wrapped = unmatched.iter().find(|item| item["location"]["name"] == "b").unwrap();
+        assert!(wrapped["candidates"].as_array().unwrap().iter().any(|candidate| candidate["location"]["name"] == "wrappedOwner"), "sync-to-async change stays a ranked candidate without becoming a graph seed");
     }
 
     #[test]
@@ -10915,6 +13193,29 @@ mod tests {
     }
 
     #[test]
+    fn derivative_projection_is_skipped_when_deobfuscated_bundle_exists() {
+        let root = tempdir().unwrap();
+        let projection = root.path().join("dist-electron-unpacked");
+        let deobfuscated = root.path().join("dist-electron-deobfuscated");
+        fs::create_dir_all(&projection).unwrap();
+        fs::create_dir_all(&deobfuscated).unwrap();
+        fs::write(deobfuscated.join("index.js"), "export {};").unwrap();
+        let module = projection.join("23.js");
+        fs::write(&module, "module.exports = 23;").unwrap();
+
+        assert!(is_derivative_duplicate(&module));
+        let discovery = discover(root.path()).unwrap();
+        assert!(discovery
+            .files
+            .iter()
+            .all(|(_, file)| file != "dist-electron-unpacked/23.js"));
+        assert_eq!(
+            discovery.corpus.excluded_derivative_roots,
+            vec!["dist-electron-unpacked"]
+        );
+    }
+
+    #[test]
     fn generated_directories_are_not_discovered_from_project_root() {
         let root = tempdir().unwrap();
         fs::create_dir_all(root.path().join("src")).unwrap();
@@ -10937,6 +13238,522 @@ mod tests {
             ["src/a.js", "src/contracts.d.ts"]
         );
         assert_eq!(discovery.corpus.mode, "recursive-source-project");
+    }
+
+    #[test]
+    fn node_test_named_modules_are_discovered_from_project_root() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        for file in [
+            "capture.node-test.mjs",
+            "device.node-test.mjs",
+            "filter.node-test.mjs",
+            "editor.node-test.mjs",
+            "owner.test.mjs",
+            "owner.spec.ts",
+            "owner.stories.tsx",
+            "capture.ts",
+            "device.mjs",
+            "node-test-runner.mjs",
+        ] {
+            fs::write(root.path().join("src").join(file), "export const value=1;").unwrap();
+        }
+        let discovery = discover(root.path()).unwrap();
+        assert_eq!(
+            discovery.files.iter().map(|(_, file)| file.as_str()).collect::<Vec<_>>(),
+            [
+                "src/capture.node-test.mjs",
+                "src/capture.ts",
+                "src/device.mjs",
+                "src/device.node-test.mjs",
+                "src/editor.node-test.mjs",
+                "src/filter.node-test.mjs",
+                "src/node-test-runner.mjs",
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_imports_rescue_conventionally_named_modules_without_indexing_orphans() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::write(
+            root.path().join("src/app.js"),
+            "import { runtime } from './runtime.test.js'; export const result = runtime();",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("src/runtime.test.js"),
+            "import { bridge } from './bridge.spec.js'; export const runtime = () => bridge();",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("src/bridge.spec.js"),
+            "export const bridge = () => 1;",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("src/orphan.stories.js"),
+            "export const story = () => 1;",
+        )
+        .unwrap();
+
+        let index = index_project(root.path(), "left").unwrap();
+        let files = index.files.iter().map(|file| file.file.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            files,
+            ["src/app.js", "src/bridge.spec.js", "src/runtime.test.js"]
+        );
+        assert!(index.graph_nodes.iter().any(|node| node.file == "src/runtime.test.js"));
+        assert!(index.graph_nodes.iter().any(|node| node.file == "src/bridge.spec.js"));
+        assert!(!index.graph_nodes.iter().any(|node| node.file == "src/orphan.stories.js"));
+    }
+
+    #[test]
+    fn node_test_named_modules_are_discovered_from_dependencies() {
+        let project = tempdir().unwrap();
+        let package = project.path().join("node_modules/source-oracle-package");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("package.json"),
+            r#"{"name":"source-oracle-package","version":"1.0.0","main":"index.js"}"#).unwrap();
+        fs::write(project.path().join("main.js"), r#"require("source-oracle-package");"#).unwrap();
+        for file in [
+            "index.js", "runtime.mjs", "node-test-runner.mjs",
+            "capture.node-test.mjs",
+            "device.node-test.mjs",
+            "filter.node-test.mjs",
+            "editor.node-test.mjs",
+        ] {
+            fs::write(package.join(file), "module.exports = () => 1;").unwrap();
+        }
+        let indexed = index_project(project.path(), "left").unwrap();
+        let discovery = discover_dependencies(project.path(), Some(&indexed)).unwrap().unwrap();
+        assert_eq!(discovery.files.len(), 7);
+        for file in [
+            "index.js",
+            "runtime.mjs",
+            "node-test-runner.mjs",
+            "capture.node-test.mjs",
+            "device.node-test.mjs",
+            "filter.node-test.mjs",
+            "editor.node-test.mjs",
+        ] {
+            assert!(discovery.files.iter().any(|(_, relative)| relative.ends_with(&format!("/{file}"))));
+        }
+    }
+
+    #[test]
+    fn dependency_runtime_imports_rescue_filtered_helpers_without_selecting_test_only_dist() {
+        let project = tempdir().unwrap();
+        let package = project.path().join("node_modules/runtime-package");
+        fs::create_dir_all(package.join("dist")).unwrap();
+        fs::create_dir_all(package.join("lib")).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"name":"runtime-package","version":"1.0.0","main":"lib/index.js"}"#,
+        )
+        .unwrap();
+        fs::write(project.path().join("main.js"), "require('runtime-package');").unwrap();
+        fs::write(package.join("dist/fixture.test.js"), "module.exports = 0;").unwrap();
+        fs::write(
+            package.join("lib/index.js"),
+            "module.exports = require('./helper.test.js');",
+        )
+        .unwrap();
+        fs::write(package.join("lib/helper.test.js"), "module.exports = 1;").unwrap();
+        fs::write(package.join("lib/orphan.stories.js"), "module.exports = 2;").unwrap();
+
+        let indexed = index_project(project.path(), "left").unwrap();
+        let discovery = discover_dependencies(project.path(), Some(&indexed))
+            .unwrap()
+            .unwrap();
+        let files = discovery.files.iter().map(|(_, relative)| relative.as_str()).collect::<Vec<_>>();
+        assert!(files.iter().any(|relative| relative.ends_with("/lib/index.js")));
+        assert!(files.iter().any(|relative| relative.ends_with("/lib/helper.test.js")));
+        assert!(!files.iter().any(|relative| relative.ends_with("/lib/orphan.stories.js")));
+        assert!(!files.iter().any(|relative| relative.ends_with("/dist/fixture.test.js")));
+    }
+
+    #[test]
+    fn dependency_manifest_entry_outside_selected_root_keeps_relative_closure() {
+        let project = tempdir().unwrap();
+        let package = project.path().join("node_modules/manifest-closure-package");
+        fs::create_dir_all(package.join("dist")).unwrap();
+        fs::create_dir_all(package.join("src")).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"name":"manifest-closure-package","version":"1.0.0","main":"src/index.js"}"#,
+        )
+        .unwrap();
+        fs::write(project.path().join("main.js"), "require('manifest-closure-package');").unwrap();
+        fs::write(package.join("dist/runtime.js"), "module.exports = 1;").unwrap();
+        fs::write(
+            package.join("src/index.js"),
+            "module.exports = require('./helper.js');",
+        )
+        .unwrap();
+        fs::write(package.join("src/helper.js"), "module.exports = 2;").unwrap();
+        fs::write(package.join("src/orphan.js"), "module.exports = 3;").unwrap();
+
+        let indexed = index_project(project.path(), "left").unwrap();
+        let discovery = discover_dependencies(project.path(), Some(&indexed))
+            .unwrap()
+            .unwrap();
+        let files = discovery.files.iter().map(|(_, relative)| relative.as_str()).collect::<Vec<_>>();
+        assert!(files.iter().any(|relative| relative.ends_with("/src/index.js")));
+        assert!(files.iter().any(|relative| relative.ends_with("/src/helper.js")));
+        assert!(!files.iter().any(|relative| relative.ends_with("/src/orphan.js")));
+    }
+
+    #[test]
+    fn dependency_reachable_test_directory_helpers_are_rescued_without_orphans() {
+        let project = tempdir().unwrap();
+        let package = project.path().join("node_modules/test-directory-package");
+        fs::create_dir_all(package.join("lib/tests/nested")).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"name":"test-directory-package","version":"1.0.0","main":"lib/index.js"}"#,
+        )
+        .unwrap();
+        fs::write(project.path().join("main.js"), "require('test-directory-package');").unwrap();
+        fs::write(
+            package.join("lib/index.js"),
+            "module.exports = require('./tests/helper.test.js');",
+        )
+        .unwrap();
+        fs::write(
+            package.join("lib/tests/helper.test.js"),
+            "module.exports = require('./nested/bridge.spec.js');",
+        )
+        .unwrap();
+        fs::write(package.join("lib/tests/nested/bridge.spec.js"), "module.exports = 2;").unwrap();
+        fs::write(package.join("lib/tests/orphan.stories.js"), "module.exports = 3;").unwrap();
+
+        let indexed = index_project(project.path(), "left").unwrap();
+        let discovery = discover_dependencies(project.path(), Some(&indexed))
+            .unwrap()
+            .unwrap();
+        let files = discovery.files.iter().map(|(_, relative)| relative.as_str()).collect::<Vec<_>>();
+        assert!(files.iter().any(|relative| relative.ends_with("/lib/index.js")));
+        assert!(files.iter().any(|relative| relative.ends_with("/lib/tests/helper.test.js")));
+        assert!(files.iter().any(|relative| relative.ends_with("/lib/tests/nested/bridge.spec.js")));
+        assert!(!files.iter().any(|relative| relative.ends_with("/lib/tests/orphan.stories.js")));
+    }
+
+    #[test]
+    fn manifest_declared_entries_under_pruned_tests_are_retained_and_linked() {
+        let project = tempdir().unwrap();
+        let package = project.path().join("node_modules/source-oracle-package");
+        fs::create_dir_all(package.join("dist/tests/nested")).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{
+                "name": "source-oracle-package",
+                "version": "1.0.0",
+                "main": "dist/tests/legacy.spec.mjs",
+                "exports": {
+                    "./runtime": "./dist/tests/nested/entry.node-test.mjs",
+                    "./checker": "./dist/tests/checker.test.mjs"
+                }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            project.path().join("main.js"),
+            r#"import "source-oracle-package/runtime"; import "source-oracle-package/checker";"#,
+        )
+        .unwrap();
+        for file in [
+            "dist/runtime.mjs",
+            "dist/tests/legacy.spec.mjs",
+            "dist/tests/nested/entry.node-test.mjs",
+            "dist/tests/checker.test.mjs",
+            "dist/tests/fixture.node-test.mjs",
+        ] {
+            fs::write(package.join(file), "export const runtime = 1;").unwrap();
+        }
+
+        let mut indexed = index_project(project.path(), "left").unwrap();
+        let discovery = discover_dependencies(project.path(), Some(&indexed)).unwrap().unwrap();
+        for file in [
+            "dist/runtime.mjs",
+            "dist/tests/legacy.spec.mjs",
+            "dist/tests/nested/entry.node-test.mjs",
+            "dist/tests/checker.test.mjs",
+        ] {
+            assert!(
+                discovery.files.iter().any(|(_, relative)| relative.ends_with(&format!("/{file}"))),
+                "missing declared runtime file {file}"
+            );
+        }
+        assert!(
+            !discovery.files.iter().any(|(_, relative)| relative.ends_with("/dist/tests/fixture.node-test.mjs")),
+            "undeclared fixture must stay excluded"
+        );
+
+        let dependencies = index_discovery(discovery, "dependency").unwrap();
+        link_dependency_entry_sources(&mut indexed, &dependencies);
+        let labels_by_id = indexed
+            .graph_nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node.label.as_str()))
+            .collect::<HashMap<_, _>>();
+        let linked_entries = indexed
+            .graph_edges
+            .iter()
+            .filter(|edge| edge.kind == "ResolvesToDependencySource")
+            .filter_map(|edge| labels_by_id.get(edge.source.as_str()).copied())
+            .collect::<BTreeSet<_>>();
+        assert!(linked_entries.contains("source-oracle-package@1.0.0:dist/tests/nested/entry.node-test.mjs"));
+        assert!(linked_entries.contains("source-oracle-package@1.0.0:dist/tests/checker.test.mjs"));
+    }
+
+    #[test]
+    fn node_test_named_modules_participate_in_mjs_divergence() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::create_dir_all(left.path().join("src")).unwrap();
+        let oracle = "export function stable(x){return x+1}export function x(value){base();if(value){extra()}return 1}";
+        fs::write(left.path().join("src/owner.mjs"),
+            "export function anchor(v){return v+1}export function render(flag){base();return 1}").unwrap();
+        fs::write(left.path().join("src/node-test-runner.mjs"),
+            "export function runtimeNeighbor(){return 17}").unwrap();
+        for file in [
+            "capture.node-test.mjs",
+            "device.node-test.mjs",
+            "filter.node-test.mjs",
+            "editor.node-test.mjs",
+        ] {
+            fs::write(left.path().join("src").join(file), oracle).unwrap();
+        }
+        fs::write(right.path().join("chunk.mjs"), oracle).unwrap();
+        let discovery = discover(left.path()).unwrap();
+        assert_eq!(
+            discovery.files.iter().map(|(_, file)| file.as_str()).collect::<Vec<_>>(),
+            [
+                "src/capture.node-test.mjs",
+                "src/device.node-test.mjs",
+                "src/editor.node-test.mjs",
+                "src/filter.node-test.mjs",
+                "src/node-test-runner.mjs",
+                "src/owner.mjs",
+            ]
+        );
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert_eq!(report["left"]["failures"], serde_json::json!([]));
+        assert_eq!(report["left"]["files"].as_array().unwrap().len(), 6);
+        let graph = zstd::stream::decode_all(fs::File::open(output.path().join("semantic-graph.jsonl.zst")).unwrap()).unwrap();
+        assert!(String::from_utf8(graph).unwrap().contains(".node-test.mjs"));
+    }
+
+    #[test]
+    fn parity_artifacts_do_not_mask_real_source_divergence() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::create_dir_all(left.path().join("src")).unwrap();
+        fs::create_dir_all(left.path().join(".parity/runtime/mock-server/_scraped")).unwrap();
+        fs::write(left.path().join(".parity/runtime/mock-server/_scraped/script.js"),
+            "No Content: https://example.test/insights/script.js").unwrap();
+        fs::write(left.path().join(".parity/generated.js"),
+            "export function generatedOnly(){ return 42; }").unwrap();
+        fs::write(left.path().join("src/owner.js"),
+            "export function anchor(v){return v+1}export function render(flag){base();return 1}").unwrap();
+        fs::write(right.path().join("chunk.js"),
+            "export function stable(x){return x+1}export function x(value){base();if(value){extra()}return 1}").unwrap();
+        let discovery = discover(left.path()).unwrap();
+        assert_eq!(discovery.files.iter().map(|(_, relative)| relative.as_str()).collect::<Vec<_>>(), ["src/owner.js"]);
+        assert!(discovery.skipped.iter().any(|path| path == ".parity"));
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert_eq!(report["left"]["failures"], serde_json::json!([]));
+        let frontiers = read_json_lines(&output.path().join("divergence-frontiers.jsonl")).unwrap();
+        assert!(frontiers.iter().any(|item| item["classification"] == "missing-local-branch" || item["classification"] == "changed-branch"));
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(!work.contains("generatedOnly") && !work.contains(".parity/runtime"));
+        assert!(
+            work.contains("port-missing-upstream-branch")
+                || work.contains("reconcile-changed-branch")
+                || work.contains("inspect-unverified-missing-branch")
+                || work.contains("inspect-unverified-changed-branch")
+                || work.contains("inspect-weak-missing-branch")
+                || work.contains("inspect-weak-changed-branch")
+        );
+    }
+
+    #[test]
+    fn syntax_only_frontier_is_review_only_in_the_published_queue() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::create_dir_all(left.path().join("src")).unwrap();
+        fs::write(
+            left.path().join("src/owner.js"),
+            "export function render(value) { return value; }",
+        )
+        .unwrap();
+        fs::write(
+            right.path().join("chunk.js"),
+            "export function render(value) { const unused = 1; return value; }",
+        )
+        .unwrap();
+
+        run(left.path(), right.path(), output.path()).unwrap();
+        let frontiers = read_json_lines(&output.path().join("divergence-frontiers.jsonl")).unwrap();
+        assert!(frontiers.iter().any(|frontier| {
+            frontier["classification"] == "missing-local-branch"
+                && frontier["rightEdge"]["kind"] == "Contains"
+        }));
+        let work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(work
+            .iter()
+            .any(|item| item["action"] == "inspect-unverified-missing-branch"
+                && item["reason"] == "The frontier has no behavioral-edge corroboration; inspect its semantics before proposing a code change."));
+        assert!(!work
+            .iter()
+            .any(|item| item["action"] == "port-missing-upstream-branch"));
+    }
+
+    #[test]
+    fn module_boundary_frontiers_route_to_context_review() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::write(
+            left.path().join("owner.js"),
+            "export function render() { return 1; }",
+        )
+        .unwrap();
+        fs::write(
+            right.path().join("chunk.js"),
+            "function render() { return 1; } export { render as publicRender };",
+        )
+        .unwrap();
+
+        run(left.path(), right.path(), output.path()).unwrap();
+        let frontiers = read_json_lines(&output.path().join("divergence-frontiers.jsonl")).unwrap();
+        assert!(frontiers.iter().any(|frontier| {
+            frontier["classification"] == "missing-local-branch"
+                && frontier["rightEdge"]["target"]["kind"] == "External"
+                && frontier["rightEdge"]["target"]["label"] == "module:<current>"
+        }), "the lossless graph should retain the export-to-module frontier");
+
+        let work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(work.iter().any(|item| {
+            item["action"] == "inspect-unresolved-upstream-graph-context"
+                && item["priority"] == "P2"
+                && item["confidence"] == "unknown"
+                && item["upstream"].as_array().is_some_and(|owners| {
+                    owners.iter().any(|owner| {
+                        owner["kind"] == "External" && owner["label"] == "module:<current>"
+                    })
+                })
+        }), "module-boundary export changes should stay reviewable without claiming a code branch is missing");
+        assert!(!work.iter().any(|item| {
+            item["action"] == "inspect-unverified-missing-branch"
+                && item["upstream"].as_array().is_some_and(|owners| {
+                    owners.iter().any(|owner| {
+                        owner["kind"] == "External" && owner["label"] == "module:<current>"
+                    })
+                })
+        }), "a module boundary is not an executable missing-code owner");
+    }
+
+    #[test]
+    fn behavior_bearing_contains_frontier_stays_visible_for_review() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::create_dir_all(left.path().join("src")).unwrap();
+        fs::create_dir_all(right.path().join("src")).unwrap();
+        fs::write(
+            left.path().join("src/owner.js"),
+            "export function render() { return false; }",
+        )
+        .unwrap();
+        fs::write(
+            right.path().join("src/owner.js"),
+            "export function render() { return true; }",
+        )
+        .unwrap();
+
+        run(left.path(), right.path(), output.path()).unwrap();
+        let frontiers = read_json_lines(&output.path().join("divergence-frontiers.jsonl")).unwrap();
+        assert!(frontiers.iter().any(|frontier| {
+            frontier["classification"] == "changed-branch"
+                && frontier["leftEdge"]["kind"] == "Contains"
+                && frontier["rightEdge"]["kind"] == "Contains"
+        }));
+        let work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(work.iter().any(|item| {
+            item["action"] == "inspect-unverified-changed-branch"
+                && item["priority"] == "P2"
+                && !item["local"].as_array().unwrap().is_empty()
+                && !item["upstream"].as_array().unwrap().is_empty()
+        }));
+    }
+
+    #[test]
+    fn sole_control_flow_block_does_not_hide_neighboring_changed_return() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::create_dir_all(left.path().join("src")).unwrap();
+        fs::create_dir_all(right.path().join("src")).unwrap();
+        fs::write(
+            left.path().join("src/owner.js"),
+            "export function probe(value) { if (value) return null; return false; }",
+        )
+        .unwrap();
+        fs::write(
+            right.path().join("src/owner.js"),
+            "export function probe(value) { if (value) { return null; } return true; }",
+        )
+        .unwrap();
+
+        run(left.path(), right.path(), output.path()).unwrap();
+        let frontiers = read_json_lines(&output.path().join("divergence-frontiers.jsonl")).unwrap();
+        assert!(frontiers.iter().all(|frontier| {
+            !matches!(
+                frontier["classification"].as_str(),
+                Some("missing-local-branch" | "extra-local-branch")
+            )
+        }));
+        assert!(frontiers.iter().any(|frontier| {
+            frontier["classification"] == "changed-branch"
+                && frontier["leftEdge"]["kind"] == "Contains"
+                && frontier["rightEdge"]["kind"] == "Contains"
+        }));
+    }
+
+    #[test]
+    fn sole_control_flow_block_matches_direct_terminal_consequent() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::create_dir_all(left.path().join("src")).unwrap();
+        fs::create_dir_all(right.path().join("src")).unwrap();
+        fs::write(
+            left.path().join("src/owner.js"),
+            "export function probe(value) { if (value) return null; }",
+        )
+        .unwrap();
+        fs::write(
+            right.path().join("src/owner.js"),
+            "export function probe(value) { if (value) { return null; } }",
+        )
+        .unwrap();
+
+        run(left.path(), right.path(), output.path()).unwrap();
+        let frontiers = read_json_lines(&output.path().join("divergence-frontiers.jsonl")).unwrap();
+        assert!(frontiers.iter().all(|frontier| {
+            !matches!(
+                frontier["classification"].as_str(),
+                Some("missing-local-branch" | "extra-local-branch" | "changed-branch")
+            )
+        }));
     }
 
     #[test]
@@ -11067,6 +13884,43 @@ mod tests {
     }
 
     #[test]
+    fn recovered_jsx_uses_js_family_filenames_and_keeps_ts_generics() {
+        let input = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        for extension in ["js", "mjs", "cjs"] {
+            let file = input.path().join(format!("component.{extension}"));
+            fs::write(&file, "function Component(props){return <span>{props.label}</span>}").unwrap();
+            let (indexed, _) = index_file(&file, "component", "right", cache.path()).unwrap();
+            assert_eq!(indexed.units.len(), 1);
+            let (_, cached) = index_file(&file, "component", "right", cache.path()).unwrap();
+            assert!(cached);
+        }
+        let file = input.path().join("generic.ts");
+        fs::write(&file, "export const identity = <T>(value: T): T => value;").unwrap();
+        assert!(index_file(&file, "generic.ts", "right", cache.path()).is_ok());
+    }
+
+    #[test]
+    fn recovered_jsx_keeps_malformed_and_nearby_true_divergence_visible() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::write(left.path().join("component.jsx"), "export function Component(props){return <span>{props.label}</span>}").unwrap();
+        fs::write(right.path().join("component.js"), "export function c(p){return <span>{p.label}</span>}").unwrap();
+        fs::write(left.path().join("changed.jsx"), "export function Changed(props){return <div>{props.first}</div>}").unwrap();
+        fs::write(right.path().join("changed.js"), "export function d(p){return <div>{p.second}</div>}").unwrap();
+        fs::write(right.path().join("broken.js"), "export const broken = <span>").unwrap();
+        let summary = run(left.path(), right.path(), output.path()).unwrap();
+        assert_eq!(summary.left_failures, 0);
+        assert_eq!(summary.right_failures, 1);
+        assert_eq!(summary.alpha_equal, 1);
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert_eq!(report["right"]["failures"][0]["file"], "broken.js");
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(work.contains("broken.js") && work.contains("changed.js"));
+    }
+
+    #[test]
     fn filename_source_types_cover_tsx_and_unicode_bindings() {
         let left = tempdir().unwrap();
         let right = tempdir().unwrap();
@@ -11087,6 +13941,101 @@ mod tests {
         assert_eq!(summary.left_failures, 0);
         assert_eq!(summary.right_failures, 0);
         assert_eq!(summary.alpha_equal, 1);
+    }
+
+    #[test]
+    fn borrowed_linked_owners_preserve_unique_ambiguous_and_unmatched_evidence() {
+        let mut left = vec![unit("unique-left", &["a"]), unit("duplicate-left", &["b"]), unit("missing-left", &["c"])];
+        let mut right = vec![unit("unique-right", &["a"]), unit("duplicate-right-one", &["b"]), unit("duplicate-right-two", &["b"]), unit("different-kind", &["c"])];
+        for item in left.iter_mut().chain(right.iter_mut()) {
+            item.linked_sha256 = item.tokens.iter().next().unwrap().to_string();
+        }
+        right[3].kind = "DifferentKind".to_string();
+        let borrowed_left = left.iter().collect::<Vec<_>>();
+        let borrowed_right = right.iter().collect::<Vec<_>>();
+        let cloned_left = left.clone();
+        let cloned_right = right.clone();
+        let borrowed = unique_matches(borrowed_left.iter().copied(), borrowed_right.iter().copied(), |item| &item.linked_sha256);
+        let cloned = unique_matches(&cloned_left, &cloned_right, |item| &item.linked_sha256);
+        let ids = |pairs: Vec<(&Unit, &Unit)>| pairs.into_iter().map(|(l, r)| (l.id.clone(), r.id.clone())).collect::<Vec<_>>();
+        assert_eq!(ids(borrowed.clone()), ids(cloned));
+        assert_eq!(borrowed.len(), 1);
+        assert!(std::ptr::eq(borrowed[0].0, &left[0]));
+        assert!(std::ptr::eq(borrowed[0].1, &right[0]));
+        let borrowed_ambiguous = ambiguous_groups(borrowed_left.iter().copied(), borrowed_right.iter().copied(), "linked", |item| &item.linked_sha256);
+        let cloned_ambiguous = ambiguous_groups(&cloned_left, &cloned_right, "linked", |item| &item.linked_sha256);
+        assert_eq!(serde_json::to_value(&borrowed_ambiguous).unwrap(), serde_json::to_value(&cloned_ambiguous).unwrap());
+        assert_eq!(borrowed_ambiguous.len(), 1);
+        assert_eq!(borrowed_ambiguous[0].left.len(), 1);
+        assert_eq!(borrowed_ambiguous[0].right.len(), 2);
+    }
+
+    #[test]
+    fn bounded_shortlist_cannot_resolve_full_index_owner_ambiguity() {
+        let mut target = unit("target", &["a", "b"]);
+        target.linked_sha256 = "same-callback".into();
+        let mut candidates = (0..20_001)
+            .map(|index| unit(&format!("m{index:05}"), &["a", "c"]))
+            .collect::<Vec<_>>();
+        for id in ["a-first-callback", "z-second-callback"] {
+            let mut duplicate = target.clone();
+            duplicate.id = id.into();
+            duplicate.file = format!("{id}.js");
+            candidates.push(duplicate);
+        }
+        let refs = candidates.iter().collect::<Vec<_>>();
+        let groups = ambiguous_groups([&target], refs.iter().copied(), "linked", |unit| &unit.linked_sha256);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].right.len(), 2);
+        let ranked = rank_candidates(&[&target], &refs);
+        assert_eq!(ranked[0].candidates[0].score, 1.0);
+        assert!(!ranked[0].candidates.iter().any(|candidate| candidate.location.id == "z-second-callback"));
+        let ambiguous_owners = groups.iter()
+            .flat_map(|group| group.left.iter().chain(&group.right))
+            .map(|owner| owner.id.clone()).collect();
+        assert!(!best_is_distinct(&ranked[0], &ambiguous_owners), "shortlisting cannot make two globally equal owners unique");
+    }
+
+    #[test]
+    fn async_probe_and_optional_notifier_cannot_seed_missing_behavior() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::write(left.path().join("owner.ts"), "function probe(x){return x}\nfunction parse(x){return x}\nasync function duration(path:string):Promise<number|null>{const stderr=await probe(path);return parse(stderr)}").unwrap();
+        fs::write(right.path().join("owner.js"), "function collect(){return 0}\nfunction notify(x,y){return x}\nfunction input(paste){let value=collect();notify?.(value,paste)}").unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(!report["matches"].as_array().unwrap().iter().any(|item| item["left"]["name"] == "duration" && item["right"]["name"] == "input"), "execution protocols cannot be erased by fuzzy ranking");
+        let work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
+        for (side, name) in [("local", "duration"), ("upstream", "input")] {
+            assert!(work.iter().any(|item| item[side].as_array().is_some_and(|owners| owners.iter().any(|owner| owner["kind"] == "Function" && owner["name"] == name))), "rejected function {name} must remain reviewable");
+        }
+    }
+
+    #[test]
+    fn execution_protocol_changes_remain_visible_and_ts_erasure_stays_equal() {
+        for (local, upstream, equivalent) in [
+            ("async function f(x:number):Promise<number>{return await x}", "async function f(x){return await x}", true),
+            ("async function f(x){return await x}", "async function f(x){return x}", false),
+            ("function f(cb,x){cb?.(x)}", "function f(cb,x){cb(x)}", false),
+            ("async function f(x){return x}", "function f(x){return x}", false),
+            ("const f=async x=>x", "const f=x=>x", false),
+            ("function* f(){return 1}", "function f(){return 1}", false),
+        ] {
+            let left = tempdir().unwrap();
+            let right = tempdir().unwrap();
+            let output = tempdir().unwrap();
+            fs::write(left.path().join("owner.ts"), local).unwrap();
+            fs::write(right.path().join("owner.js"), upstream).unwrap();
+            let summary = run(left.path(), right.path(), output.path()).unwrap();
+            assert_eq!(summary.alpha_equal, usize::from(equivalent), "{local} vs {upstream}");
+            if !equivalent {
+                let expected = contribution_fixture_units(upstream, "right").remove(0);
+                let work: Vec<serde_json::Value> = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+                assert!(work.iter().any(|item| item["upstream"].as_array().is_some_and(|owners| owners.iter().any(|owner| owner["file"] == "owner.js"
+                    && owner["kind"] == expected.kind && owner["start"] == expected.start && owner["end"] == expected.end))), "exact protocol owner must retain upstream work: {local} vs {upstream}");
+            }
+        }
     }
 
     #[test]
@@ -11113,10 +14062,168 @@ mod tests {
         let changed = unit("changed", &["a", "b", "c", "d", "e"]);
         let distractor = unit("distractor", &["a"]);
         let ranked = rank_candidates(&[&target], &[&changed, &distractor]);
-        assert!(best_is_distinct(&ranked[0]));
+        assert!(best_is_distinct(&ranked[0], &HashSet::new()));
         assert_eq!(ranked[0].candidates[0].location.id, "changed");
     }
 
+
+    fn contribution_fixture_units(source: &str, side: &str) -> Vec<Unit> {
+        let (canonical, original, _) = canonicalize(source, SourceType::mjs(), "fixture.js", side).unwrap();
+        collect_units(&canonical, source, SourceType::mjs(), "fixture.js", side, original, None).unwrap()
+    }
+
+    fn contribution_fixture_groups(target: &Unit, members: &[Unit], relation: &'static str) -> Vec<GroupCandidate> {
+        let member_refs = members.iter().collect::<Vec<_>>();
+        let ranked = rank_candidates(&[target], &member_refs);
+        let targets = [(target.id.clone(), target)].into_iter().collect();
+        let members = members.iter().map(|unit| (unit.id.clone(), unit)).collect();
+        group_candidates(&ranked, &targets, &members, relation)
+    }
+
+    #[test]
+    fn group_contribution_rejects_real_comparator_alternatives() {
+        let target = contribution_fixture_units("const compare=(a,b)=>a.index-b.index;", "right").remove(0);
+        for source in ["const first=(a,b)=>a.index-b.index; const second=(a,b)=>a.sourceStart-b.sourceStart;",
+            "const first=(a,b)=>a.index-b.index; const second=(a,b)=>a.length-b.length;"] {
+            let members = contribution_fixture_units(source, "left");
+            for relation in ["left-one-to-right-many", "left-many-to-right-one"] {
+                assert!(contribution_fixture_groups(&target, &members, relation).is_empty());
+            }
+            let records = rank_candidates(&[&target], &members.iter().collect::<Vec<_>>());
+            assert_eq!(records[0].candidates.len(), 2, "individual alternatives must remain visible");
+        }
+    }
+
+    #[test]
+    fn group_contribution_rejects_real_getter_and_collection_siblings() {
+        for (target_source, member_source) in [
+            ("function mouseups(o){return o.events.filter(e=>e.type===1).map(e=>e.time);}",
+             "function mouseups(o){return o.events.filter(e=>e.type===1).map(e=>e.time);} function keystrokes(o){return o.keys.filter(e=>e.type===1).map(e=>e.time);}"),
+            ("function clear(target,draft){for(const value of [...target].reverse()){draft.undo.push({op:'add',value});draft.redo.push({op:'remove',value});}target.clear();}",
+             "function clearSet(target,draft){for(const value of [...target].reverse()){draft.undo.push({op:'add',value});draft.redo.push({op:'remove',value});}target.clear();} function clearMap(target,draft){for(const [key,value] of target){draft.undo.push({op:'add',key,value});draft.redo.push({op:'remove',key});}target.clear();}")
+        ] {
+            let target = contribution_fixture_units(target_source, "right").remove(0);
+            let members = contribution_fixture_units(member_source, "left").into_iter().filter(|unit| unit.name.is_some()).collect::<Vec<_>>();
+            let groups = contribution_fixture_groups(&target, &members, "left-many-to-right-one");
+            assert!(groups.is_empty(), "unrelated sibling is not an extraction");
+            let changed = contribution_fixture_units(&target_source.replace("===1", "===2").replace("'remove'", "'replace'"), "left");
+            assert!(!rank_candidates(&[&target], &changed.iter().collect::<Vec<_>>())[0].candidates.is_empty(), "nearby true change must remain visible");
+        }
+    }
+
+    #[test]
+    fn group_contribution_rejects_class_getter_alternatives() {
+        let target_source = "class Recording { get mouseups(){return this.sessions.flatMap(s=>s.mouseups);} }";
+        let member_source = "class Recording { get mouseups(){return this.sessions.flatMap(s=>s.mouseups);} get keystrokes(){return this.sessions.flatMap(s=>s.keystrokes);} }";
+        let select_getters = |source: &str, side: &str| contribution_fixture_units(source, side).into_iter().filter(|unit| unit.kind == "Function" && source[unit.start as usize..unit.end as usize].contains("this.sessions.flatMap")).collect::<Vec<_>>();
+        let target = select_getters(target_source, "right").remove(0);
+        let members = select_getters(member_source, "left");
+        assert_eq!(members.len(), 2);
+        for relation in ["left-one-to-right-many", "left-many-to-right-one"] {
+            assert!(contribution_fixture_groups(&target, &members, relation).is_empty());
+        }
+        assert!(!group_members_contribute(&target, &members.iter().collect::<Vec<_>>()));
+        assert_eq!(rank_candidates(&[&target], &members.iter().collect::<Vec<_>>())[0].candidates.len(), 2);
+    }
+
+    #[test]
+    fn group_contribution_does_not_combine_independent_boolean_guards() {
+        let target = contribution_fixture_units("const preview=token=>this.getIsTokenPresent(token)&&(cut==='video'||token.kind==='word'&&!token.isHidden);", "right").remove(0);
+        let members = contribution_fixture_units("const canCut=t=>t.kind==='word'&&!t.isHidden&&this.getIsTokenPresent(t); const canRestore=t=>!this.getIsTokenPresent(t)||t.kind==='word'&&t.isHidden;", "left");
+        let references = members.iter().collect::<Vec<_>>();
+        eprintln!("guard group={:?}; singles={:?}", raw_group_metrics(&target, &references), members.iter().map(|member| raw_group_metrics(&target, &[member])).collect::<Vec<_>>());
+        assert!(group_members_contribute(&target, &references), "reproduces count-only incoherent contribution");
+        for relation in ["left-one-to-right-many", "left-many-to-right-one"] {
+            assert!(contribution_fixture_groups(&target, &members, relation).is_empty(), "independent guards are not a split preview predicate");
+        }
+        assert_eq!(rank_candidates(&[&target], &references)[0].candidates.len(), 2);
+    }
+
+    #[test]
+    fn group_contribution_keeps_operator_only_split_tail() {
+        let target = contribution_fixture_units("function owner(a,b){return (a+b)-(a-b);}", "right").remove(0);
+        let members = contribution_fixture_units("function first(a,b){return a+b;} function second(a,b){return a-b;}", "left");
+        assert!(target.features.properties.is_empty() && target.features.literals.is_empty());
+        assert!(group_members_contribute(&target, &members.iter().collect::<Vec<_>>()));
+        eprintln!("operator group={:?}; singles={:?}", raw_group_metrics(&target, &members.iter().collect::<Vec<_>>()), members.iter().map(|member| raw_group_metrics(&target, &[member])).collect::<Vec<_>>());
+        for relation in ["left-one-to-right-many", "left-many-to-right-one"] {
+            assert_eq!(contribution_fixture_groups(&target, &members, relation).len(), 1);
+        }
+    }
+
+    #[test]
+    fn group_contribution_keeps_real_change_in_generated_queue() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::write(left.path().join("feature.js"), "const indexOrder=(a,b)=>a.index-b.index; const startOrder=(a,b)=>a.sourceStart-b.sourceStart; function eligible(o){return o.duration>100 && o.enabled;}").unwrap();
+        fs::write(right.path().join("bundle.js"), "const a=(x,y)=>x.index-y.index; const b=(x,y)=>x.index-y.index; function eligible(o){return o.duration>=100 && o.enabled;}").unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&fs::read_to_string(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(report["groupCandidates"].as_array().unwrap().is_empty());
+        assert!(!report["ambiguousGroups"].as_array().unwrap().is_empty(), "exact comparator ambiguity stays visible");
+        let works = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        let rows = works.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()).collect::<Vec<_>>();
+        assert!(rows.iter().any(|row| row.to_string().contains("eligible")), "actual changed boundary must remain queued");
+        assert!(!rows.iter().any(|row| row["reason"].as_str().is_some_and(|reason| reason.contains("multiple upstream candidates sharing"))), "fingerprint ambiguity remains diagnostic, not a change work item");
+        let ambiguous_left_ids = report["ambiguousGroups"].as_array().unwrap().iter()
+            .flat_map(|group| group["left"].as_array().unwrap())
+            .filter_map(|owner| owner["id"].as_str().map(str::to_owned))
+            .collect::<std::collections::HashSet<_>>();
+        let ambiguous_right_ids = report["ambiguousGroups"].as_array().unwrap().iter()
+            .flat_map(|group| group["right"].as_array().unwrap())
+            .filter_map(|owner| owner["id"].as_str().map(str::to_owned))
+            .collect::<std::collections::HashSet<_>>();
+        assert!(!rows.iter().any(|row| {
+            row["action"] == "remove-or-justify-extra-local"
+                && row["local"].as_array().is_some_and(|owners| owners.iter().any(|owner| {
+                    owner["id"].as_str().is_some_and(|id| ambiguous_left_ids.contains(id))
+                }))
+        }), "ambiguous local owners must not reappear as extra-local work");
+        let executable = fs::read_to_string(output.path().join("upstream-executable-ledger.jsonl")).unwrap();
+        let dispositions = executable.lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|row| row["containingUnitId"].as_str().is_some_and(|id| ambiguous_right_ids.contains(id)))
+            .collect::<Vec<_>>();
+        assert!(!dispositions.is_empty(), "ambiguous upstream owners remain visible in the executable ledger");
+        assert!(dispositions.iter().all(|row| row["disposition"] == "ambiguous" && row["workItemId"].is_null()), "ambiguous upstream owners must not be relabeled unlinked or assigned change work");
+        assert!(!rows.iter().any(|row| row["reason"].as_str().is_some_and(|reason| reason.contains("Possible left-many-to-right-one") || reason.contains("Possible left-one-to-right-many"))));
+    }
+
+    #[test]
+    fn group_contribution_preserves_disjoint_split_and_merge_candidates() {
+        let target = unit("combined", &["shared1", "shared2", "shared3", "shared4", "shared5", "shared6", "a", "b", "c", "d"]);
+        let mut first = unit("first", &["shared1", "shared2", "shared3", "shared4", "shared5", "shared6", "a", "b"]);
+        let mut second = unit("second", &["shared1", "shared2", "shared3", "shared4", "shared5", "shared6", "c", "d"]);
+        first.file = "parts.js".to_string(); second.file = first.file.clone();
+        first.nodes_approx = 6; second.nodes_approx = 6;
+        let mut target = target; target.nodes_approx = 12;
+        // Give each real part matching material evidence as well as independent shape evidence.
+        FeatureChannels::increment(&mut target.features.properties, "first");
+        FeatureChannels::increment(&mut target.features.properties, "second");
+        FeatureChannels::increment(&mut first.features.properties, "first");
+        FeatureChannels::increment(&mut second.features.properties, "second");
+        for relation in ["left-one-to-right-many", "left-many-to-right-one"] {
+            assert_eq!(contribution_fixture_groups(&target, &[first.clone(), second.clone()], relation).len(), 1);
+        }
+        let actual_combined = contribution_fixture_units("function owner(o){o.alpha(1);o.beta(2);return o;}", "right").remove(0);
+        let actual_parts = contribution_fixture_units("function first(o){o.alpha(1);return o;} function second(o){o.beta(2);return o;}", "left");
+        for relation in ["left-one-to-right-many", "left-many-to-right-one"] {
+            assert_eq!(contribution_fixture_groups(&actual_combined, &actual_parts, relation).len(), 1, "real tokenized split/merge survives");
+        }
+        let repeated_external = contribution_fixture_units("function owner(a,b){emit(a);emit(b);}", "right").remove(0);
+        let external_parts = contribution_fixture_units("function first(a,b){emit(a);} function second(a,b){emit(b);}", "left");
+        assert!(group_members_contribute(&repeated_external, &external_parts.iter().collect::<Vec<_>>()), "structural frequencies preserve necessary repeated calls without material contracts");
+        for relation in ["left-one-to-right-many", "left-many-to-right-one"] {
+            assert_eq!(contribution_fixture_groups(&repeated_external, &external_parts, relation).len(), 1);
+        }
+        let repeated = contribution_fixture_units("function owner(o){o.send();o.send();}", "right").remove(0);
+        let parts = contribution_fixture_units("function first(o){o.send();} function second(o){o.send();}", "left");
+        assert!(group_members_contribute(&repeated, &parts.iter().collect::<Vec<_>>()), "both identical calls are necessary by frequency");
+        for relation in ["left-one-to-right-many", "left-many-to-right-one"] {
+            assert_eq!(contribution_fixture_groups(&repeated, &parts, relation).len(), 1, "actual repeated calls form a necessary group");
+        }
+    }
     #[test]
     fn candidate_generation_survives_feature_count_drift() {
         let mut target = unit("target", &["CallExpression", "ReturnStatement"]);

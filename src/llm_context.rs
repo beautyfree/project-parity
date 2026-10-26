@@ -61,121 +61,6 @@ struct UnitDisposition {
     work_item_id: Option<String>,
 }
 
-#[derive(Clone)]
-struct AnnotatedOwnerRange {
-    local_file: String,
-    upstream_file: String,
-    start_line: usize,
-    end_line: usize,
-}
-
-fn first_numeric_range(text: &str) -> Option<(usize, usize)> {
-    let bytes = text.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if !bytes[index].is_ascii_digit() {
-            index += 1;
-            continue;
-        }
-        let start = index;
-        while index < bytes.len() && bytes[index].is_ascii_digit() {
-            index += 1;
-        }
-        if index >= bytes.len() || bytes[index] != b'-' {
-            continue;
-        }
-        let hyphen = index;
-        index += 1;
-        let end_start = index;
-        while index < bytes.len() && bytes[index].is_ascii_digit() {
-            index += 1;
-        }
-        if end_start == index {
-            continue;
-        }
-        let left = text[start..hyphen].parse().ok()?;
-        let right = text[end_start..index].parse().ok()?;
-        return Some((left, right));
-    }
-    None
-}
-
-fn annotated_owner_ranges(left: &ProjectIndex) -> Vec<AnnotatedOwnerRange> {
-    let mut ranges = Vec::new();
-    for file in &left.files {
-        let path = Path::new(&left.root).join(&file.file);
-        let Ok(source) = fs::read_to_string(path) else {
-            continue;
-        };
-        for line in source.lines() {
-            if !(line.contains("@portedFrom") || line.contains("@v4Evidence"))
-                || !line.contains("4.0.1-4669-beta")
-            {
-                continue;
-            }
-            let Some(after_version) = line.split("4.0.1-4669-beta").nth(1) else {
-                continue;
-            };
-            let token = after_version
-                .split_whitespace()
-                .find(|token| token.contains(".js:"));
-            let Some(token) = token else { continue };
-            let token = token.trim_matches(|c: char| "`()[]{};,".contains(c));
-            let Some((upstream_file, suffix)) = token.rsplit_once(':') else {
-                continue;
-            };
-            let range = first_numeric_range(suffix)
-                .or_else(|| line.split("derived").nth(1).and_then(first_numeric_range));
-            let Some((start_line, end_line)) = range else {
-                continue;
-            };
-            let upstream_file = match upstream_file {
-                "dist-electron/index.js" => "dist-electron-deobfuscated/index.js",
-                "dist-electron/preload.js" => "dist-electron-deobfuscated/preload.js",
-                other => other,
-            };
-            ranges.push(AnnotatedOwnerRange {
-                local_file: file.file.clone(),
-                upstream_file: upstream_file.to_string(),
-                start_line,
-                end_line,
-            });
-        }
-    }
-    ranges
-}
-
-fn annotated_source_path_matches(local_file: &str, upstream_file: &str) -> bool {
-    if local_file == upstream_file {
-        return true;
-    }
-    let suffix = format!("/{upstream_file}");
-    local_file.ends_with(&suffix)
-}
-
-fn annotated_compiled_factory_match(source: &str, node: &GraphNode) -> bool {
-    // A transpiler can erase the imported factory identity while preserving
-    // the runtime literal passed to it.  Accept this only for an explicitly
-    // annotated local owner that is visibly a logger factory call; the
-    // literal and graph kind still have to agree.  This is deliberately
-    // narrower than filename or score-based propagation.
-    if node.kind != "Statement" {
-        return false;
-    }
-    if !source.contains("createLogger") {
-        return false;
-    }
-    node.tokens.iter().any(|token| {
-        let Some(value) = token.strip_prefix("literal:\"") else {
-            return false;
-        };
-        let Some(value) = value.split('"').next() else {
-            return false;
-        };
-        !value.is_empty() && source.contains(value)
-    })
-}
-
 struct WorkItemDraft {
     action: &'static str,
     priority: &'static str,
@@ -185,6 +70,23 @@ struct WorkItemDraft {
     upstream: Vec<Value>,
     evidence_path: Vec<Value>,
     identities: Vec<String>,
+}
+
+fn same_file_identity(left: &crate::FileRecord, right: &crate::FileRecord) -> bool {
+    left.file == right.file
+        && left.source_sha256 == right.source_sha256
+        && left.source_map_sha256 == right.source_map_sha256
+}
+
+fn candidate_owner_triage(record: &MatchRecord) -> (&'static str, &'static str) {
+    // Reciprocal feature ranking narrows the review locator, but does not
+    // establish owner identity or behavior. Keep it visible behind evidence
+    // that can actually corroborate a change.
+    if record.basis == "mutual-best-fuzzy" {
+        ("P2", "weak-candidate")
+    } else {
+        ("P1", record.confidence)
+    }
 }
 
 fn write_json_lines(path: &Path, values: &[Value]) -> Result<()> {
@@ -252,6 +154,133 @@ fn write_json_lines(path: &Path, values: &[Value]) -> Result<()> {
     index
         .flush()
         .with_context(|| format!("write {}", index_path.display()))
+}
+
+/// Intern only the repeated, large candidate arrays. This is a storage
+/// representation; all consumers expand it before interpreting evidence or
+/// comparing reviewed payloads. IDs and ordering remain unchanged.
+fn intern_work_evidence(item: &mut Value, shared: &mut HashMap<String, Value>) -> Result<()> {
+    if let Some(id) = item.get("upstreamEvidenceRef") {
+        anyhow::ensure!(item.get("upstream").is_none(), "inline and referenced upstream evidence");
+        anyhow::ensure!(id.as_str().is_some_and(|id| shared.contains_key(id)), "missing interned upstream evidence");
+        return Ok(());
+    }
+    if item["action"] != "resolve-ambiguous-owners" {
+        return Ok(());
+    }
+    let serialized = serde_json::to_vec(&item["upstream"])?;
+    if serialized.len() < 1024 {
+        return Ok(());
+    }
+    let id = sha256(&serialized);
+    // The normal draft's inspect list is precisely local IDs followed by
+    // upstream IDs. Elide it only when that equality is exact; coalesced
+    // variants can have a different ordering and keep their explicit list.
+    let inspect_ids = owner_inspect_ids(item);
+    if item.get("inspectNodeIds") == Some(&inspect_ids) {
+        item.as_object_mut()
+            .context("work item is not an object")?
+            .remove("inspectNodeIds");
+        item["inspectNodeIdsFromOwners"] = json!(true);
+    }
+    let upstream = item
+        .as_object_mut()
+        .context("work item is not an object")?
+        .remove("upstream")
+        .context("work item has no upstream evidence")?;
+    shared.entry(id.clone()).or_insert(upstream);
+    item["upstreamEvidenceRef"] = json!(id);
+    Ok(())
+}
+
+pub(crate) fn compact_work_evidence(output: &Path, items: &mut [Value], mut shared: HashMap<String, Value>) -> Result<()> {
+    for item in items { intern_work_evidence(item, &mut shared)?; }
+    let records = shared.into_iter().collect::<BTreeMap<_, _>>().into_iter()
+        .map(|(id, upstream)| Ok(json!({"id":id,"upstream":upstream})));
+    write_streaming_json_lines_fallible(&output.join("llm-shared-evidence.jsonl"), records)
+}
+
+fn owner_inspect_ids(item: &Value) -> Value {
+    json!(item["local"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(item["upstream"].as_array().into_iter().flatten())
+        .filter_map(|owner| owner["id"].as_str())
+        .collect::<Vec<_>>())
+}
+
+pub(crate) fn read_shared_work_evidence(output: &Path) -> Result<HashMap<String, Value>> {
+    let path = output.join("llm-shared-evidence.jsonl");
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let mut shared = HashMap::new();
+    for line in BufReader::new(fs::File::open(&path)?).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut record: Value = serde_json::from_str(&line)?;
+        let id = record["id"]
+            .as_str()
+            .context("shared evidence has no id")?
+            .to_owned();
+        let upstream = record
+            .as_object_mut()
+            .context("shared evidence is not an object")?
+            .remove("upstream")
+            .context("shared evidence has no upstream")?;
+        anyhow::ensure!(
+            sha256(serde_json::to_vec(&upstream)?) == id,
+            "shared evidence hash mismatch: {id}"
+        );
+        anyhow::ensure!(
+            shared.insert(id.clone(), upstream).is_none(),
+            "duplicate shared evidence: {id}"
+        );
+    }
+    Ok(shared)
+}
+
+pub(crate) fn expand_work_evidence(
+    mut item: Value,
+    shared: &HashMap<String, Value>,
+) -> Result<Value> {
+    if let Some(reference) = item.get("upstreamEvidenceRef") {
+        let id = reference
+            .as_str()
+            .context("upstream evidence reference is not a string")?;
+        let upstream = shared
+            .get(id)
+            .with_context(|| format!("missing shared upstream evidence: {id}"))?;
+        anyhow::ensure!(
+            item.get("upstream").is_none(),
+            "work item has both inline and referenced upstream evidence"
+        );
+        let upstream = upstream.clone();
+        item.as_object_mut()
+            .context("work item is not an object")?
+            .remove("upstreamEvidenceRef");
+        item["upstream"] = upstream;
+    }
+    if let Some(flag) = item.get("inspectNodeIdsFromOwners") {
+        anyhow::ensure!(flag == &json!(true), "invalid derived inspect-node flag");
+        anyhow::ensure!(
+            item.get("inspectNodeIds").is_none(),
+            "work item has both explicit and derived inspect-node IDs"
+        );
+        anyhow::ensure!(
+            item["local"].is_array() && item["upstream"].is_array(),
+            "derived inspect-node IDs require owner arrays"
+        );
+        let ids = owner_inspect_ids(&item);
+        item.as_object_mut()
+            .context("work item is not an object")?
+            .remove("inspectNodeIdsFromOwners");
+        item["inspectNodeIds"] = ids;
+    }
+    Ok(item)
 }
 
 fn write_streaming_json_lines_fallible<I>(path: &Path, values: I) -> Result<()>
@@ -437,7 +466,14 @@ fn work_item_id(action: &str, identities: impl IntoIterator<Item = String>) -> S
     // Those alternatives belong in the payload, not in the durable queue key.
     // The first identity is the local owner for local-only work; the first two
     // are the matched source-owner pair for a branch frontier.
-    let identities = match action {
+    let identity_action = match action {
+        "inspect-unverified-missing-branch" => "port-missing-upstream-branch",
+        "inspect-unverified-changed-branch" => "reconcile-changed-branch",
+        "inspect-weak-missing-branch" => "port-missing-upstream-branch",
+        "inspect-weak-changed-branch" => "reconcile-changed-branch",
+        _ => action,
+    };
+    let identities = match identity_action {
         "remove-or-justify-extra-local" => identities.into_iter().take(1).collect(),
         "port-missing-upstream-branch" | "reconcile-changed-branch" => {
             identities.into_iter().take(2).collect()
@@ -445,7 +481,7 @@ fn work_item_id(action: &str, identities: impl IntoIterator<Item = String>) -> S
         _ => identities,
     };
     let identities = identities.into_iter().collect::<BTreeSet<_>>();
-    let material = std::iter::once(action.to_string())
+    let material = std::iter::once(identity_action.to_string())
         .chain(identities)
         .collect::<Vec<_>>()
         .join("\0");
@@ -485,36 +521,13 @@ fn relation_path(
 /// routing them behind owner-anchored findings; semantic edge chains retain
 /// their normal triage.
 fn frontier_triage(
-    evidence_path: &[Value],
+    frontier_edge_kinds: &[&str],
     priority: &str,
     confidence: &str,
 ) -> (&'static str, &'static str) {
-    let global_behavior_seed = evidence_path
-        .first()
-        .and_then(|relation| relation["basis"].as_str())
-        == Some("global-behavior");
-    let neighbor_shape_route = evidence_path.iter().any(|relation| {
-        relation["basis"]
-            .as_str()
-            .is_some_and(|basis| basis.starts_with("neighbor-"))
-    });
-    let uncertain_owner = matches!(confidence, "candidate" | "weak-candidate");
-    // Ownership and syntax edges (`Defines`, `Scope`, imports/exports, etc.)
-    // explain where a candidate came from, but do not corroborate equivalent
-    // runtime behavior across differently packaged/bundled source. Require a
-    // route the graph extractor identifies as an actual behavior use.
-    let has_behavior_edge_chain = evidence_path.iter().any(|relation| {
-        relation["viaEdge"].as_str().is_some_and(|edge| {
-            let edge_kind = edge.rsplit_once(':').map_or(edge, |(_, kind)| kind);
-            matches!(
-                edge_kind,
-                "References" | "Calls" | "Instantiates" | "Renders"
-            )
-        })
-    });
-    if !has_behavior_edge_chain
-        && (global_behavior_seed || (neighbor_shape_route && uncertain_owner))
-    {
+    // The correspondence path can cross an unrelated sibling use. Only the
+    // edge at this divergence can corroborate this frontier's behavior.
+    if !frontier_edge_kinds.iter().any(|edge| is_behavior_edge(edge)) {
         ("P2", "weak-candidate")
     } else {
         (
@@ -530,6 +543,35 @@ fn frontier_triage(
                 _ => "weak-candidate",
             },
         )
+    }
+}
+
+fn is_behavior_edge(edge: &str) -> bool {
+    let edge_kind = edge.rsplit_once(':').map_or(edge, |(_, kind)| kind);
+    // A reference records lexical use, including constants and configuration.
+    // It is a useful locator but does not by itself prove executable behavior.
+    matches!(edge_kind, "Calls" | "Instantiates" | "Renders")
+}
+
+fn frontier_work_action(
+    action: &'static str,
+    edge_kinds: &[&str],
+) -> (&'static str, &'static str) {
+    // As in frontier triage, behavior in the correspondence path is context,
+    // not evidence about the edge that is actually missing or changed.
+    if edge_kinds.iter().any(|edge| is_behavior_edge(edge)) {
+        return (action, "");
+    }
+    match action {
+        "port-missing-upstream-branch" => (
+            "inspect-unverified-missing-branch",
+            "The frontier has no behavioral-edge corroboration; inspect its semantics before proposing a code change.",
+        ),
+        "reconcile-changed-branch" => (
+            "inspect-unverified-changed-branch",
+            "The frontier has no behavioral-edge corroboration; inspect its semantics before proposing a code change.",
+        ),
+        _ => (action, ""),
     }
 }
 
@@ -565,24 +607,37 @@ fn push_work_item(items: &mut Vec<Value>, draft: WorkItemDraft) -> String {
 /// the same owner pair. Keep the decision unit singular, but preserve every
 /// distinct edge payload so indexed `show-work` and state sync cannot silently
 /// select only the last occurrence.
-fn coalesce_work_items(items: Vec<Value>) -> Vec<Value> {
-    let mut by_id = BTreeMap::<String, BTreeMap<String, Value>>::new();
+fn coalesce_work_items(items: Vec<Value>, shared: &HashMap<String, Value>) -> Result<Vec<Value>> {
+    // Group by the compact identity first. Full serialized keys are needed
+    // only while deduplicating one identity's variants, not for the entire
+    // queue at once (those keys alone can exceed a GB on bundled projects).
+    let mut by_id = BTreeMap::<String, Vec<Value>>::new();
     let mut unkeyed = 0usize;
     for item in items {
-        let key = serde_json::to_string(&item).expect("work item serializes");
         let id = item["id"].as_str().map(str::to_string).unwrap_or_else(|| {
             unkeyed += 1;
             format!("__unkeyed-{unkeyed}")
         });
-        by_id.entry(id).or_default().entry(key).or_insert(item);
+        by_id.entry(id).or_default().push(item);
     }
 
     by_id
         .into_values()
-        .map(|unique| {
+        .map(|mut items| {
+            if items.len() == 1 { return Ok(items.pop().expect("one work item")); }
+            let items = items.into_iter().map(|item| expand_work_evidence(item, shared)).collect::<Result<Vec<_>>>()?;
+            let unique = items
+                .into_iter()
+                .map(|item| {
+                    (
+                        serde_json::to_string(&item).expect("work item serializes"),
+                        item,
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
             let variants = unique.into_values().collect::<Vec<_>>();
             if variants.len() == 1 {
-                return variants.into_iter().next().expect("one work item");
+                return Ok(variants.into_iter().next().expect("one work item"));
             }
 
             let mut merged = variants[0].clone();
@@ -613,36 +668,78 @@ fn coalesce_work_items(items: Vec<Value>) -> Vec<Value> {
                     })
                     .collect(),
             );
-            merged
+            Ok(merged)
         })
         .collect()
 }
 
+// Exact source-range owner lookup. Project units are ID-ordered, not start-
+// ordered. Keep that order for equal-width ties; index starts and maximum ends
+// separately so queries prune unrelated earlier ranges without cloning units.
+struct UnitIntervals<'a> {
+    units: Vec<&'a Unit>,
+    by_start: Vec<usize>,
+    max_end: Vec<u32>,
+}
+
+impl<'a> UnitIntervals<'a> {
+    fn new(units: Vec<&'a Unit>) -> Self {
+        let mut by_start = (0..units.len()).collect::<Vec<_>>();
+        by_start.sort_by_key(|&index| units[index].start);
+        let base = units.len().next_power_of_two();
+        let mut max_end = vec![0; base * 2];
+        for (position, &index) in by_start.iter().enumerate() {
+            max_end[base + position] = units[index].end;
+        }
+        for index in (1..base).rev() {
+            max_end[index] = max_end[index * 2].max(max_end[index * 2 + 1]);
+        }
+        Self { units, by_start, max_end }
+    }
+
+    fn containing(&self, node: &GraphNode) -> Option<&'a Unit> {
+        let limit = self.by_start.partition_point(|&index| self.units[index].start <= node.start);
+        let mut best = None;
+        self.visit(1, 0, self.max_end.len() / 2, limit, node.end, &mut best);
+        best.map(|index| self.units[index])
+    }
+
+    fn visit(&self, tree: usize, start: usize, end: usize, limit: usize, node_end: u32, best: &mut Option<usize>) {
+        if start >= limit || self.max_end[tree] < node_end {
+            return;
+        }
+        if end - start == 1 {
+            let index = self.by_start[start];
+            let width = self.units[index].end - self.units[index].start;
+            if best.is_none_or(|previous| {
+                let previous_width = self.units[previous].end - self.units[previous].start;
+                width < previous_width || (width == previous_width && index > previous)
+            }) {
+                *best = Some(index);
+            }
+            return;
+        }
+        let middle = (start + end) / 2;
+        self.visit(tree * 2 + 1, middle, end, limit, node_end, best);
+        self.visit(tree * 2, start, middle, limit, node_end, best);
+    }
+}
+
 fn containing_unit<'a>(
     node: &GraphNode,
-    units_by_file: &'a HashMap<&str, Vec<&'a Unit>>,
+    units_by_file: &HashMap<&str, UnitIntervals<'a>>,
 ) -> Option<&'a Unit> {
-    units_by_file
-        .get(node.file.as_str())?
-        .get(
-            ..units_by_file
-                .get(node.file.as_str())?
-                .partition_point(|unit| unit.start <= node.start),
-        )?
-        .iter()
-        .rev()
-        .copied()
-        .filter(|unit| unit.start <= node.start && unit.end >= node.end)
-        .min_by_key(|unit| unit.end - unit.start)
+    units_by_file.get(node.file.as_str())?.containing(node)
 }
 
 fn unit_for_node<'a>(
     node: &GraphNode,
-    units_by_file: &'a HashMap<&str, Vec<&'a Unit>>,
+    units_by_file: &HashMap<&str, UnitIntervals<'a>>,
 ) -> Option<&'a Unit> {
     containing_unit(node, units_by_file).or_else(|| {
         units_by_file
             .get(node.file.as_str())?
+            .units
             .iter()
             .copied()
             .find(|unit| unit.start == node.start && unit.end == node.end)
@@ -651,13 +748,14 @@ fn unit_for_node<'a>(
 
 fn semantic_owner(
     item: &Value,
+    shared: &HashMap<String, Value>,
     units_by_id: &HashMap<&str, &Unit>,
-    units_by_file: &HashMap<&str, Vec<&Unit>>,
+    units_by_file: &HashMap<&str, UnitIntervals<'_>>,
     node_by_id: &HashMap<&str, &GraphNode>,
     parent_by_child: &HashMap<&str, &str>,
 ) -> (String, Value) {
-    let upstream_value = item["upstream"]
-        .as_array()
+    let upstream_value = item.get("upstream").or_else(|| item["upstreamEvidenceRef"].as_str().and_then(|id| shared.get(id)))
+        .and_then(Value::as_array)
         .and_then(|locations| locations.first());
     if let Some(upstream_value) = upstream_value {
         if let Some(id) = upstream_value["id"].as_str() {
@@ -797,31 +895,18 @@ pub(crate) fn write_llm_context(
     dependencies: Option<&ProjectIndex>,
 ) -> Result<LlmSummary> {
     let mut work_items = Vec::<Value>::new();
+    let shared_work_evidence = HashMap::new();
     let mut unit_dispositions = HashMap::<String, UnitDisposition>::new();
     let mut upstream_work_by_node = HashMap::<String, String>::new();
+    let mut ambiguous_left_ids = HashSet::<String>::new();
+    let mut ambiguous_right_confidence = HashMap::<String, &'static str>::new();
     let identical_files = right
         .files
         .iter()
         .filter_map(|right_file| {
             left.files
                 .iter()
-                .find(|left_file| {
-                    (left_file.file == right_file.file
-                        && left_file.source_sha256 == right_file.source_sha256
-                        && left_file.source_map_sha256 == right_file.source_map_sha256)
-                        // The authoritative asset projection is kept under
-                        // `assets/`, while LOCAL keeps the same source owner
-                        // under the desktop app's packaged asset root. The
-                        // full owner was audited: aliases/comments differ,
-                        // but path construction, categories, keys, and all
-                        // 16 shipped tracks are identical.
-                        || (right_file.file == "assets/background-audio/index.ts"
-                            && left_file.file == "apps/desktop/assets/background-audio/index.ts"
-                            && right_file.source_sha256
-                                == "7345b1d387f1fc5daa4a44f57ad5d5ae75ef924e47df8e7aad0e7699c9a588ff"
-                            && left_file.source_sha256
-                                == "6a4410ab017350905829a8f0142610d7958fc0857f3587f67d99efc99d234814")
-                })
+                .find(|left_file| same_file_identity(left_file, right_file))
                 .map(|_| right_file.file.as_str())
         })
         .collect::<HashSet<_>>();
@@ -889,12 +974,13 @@ pub(crate) fn write_llm_context(
         }
         let local = vec![location_value(&record.left)];
         let upstream = vec![location_value(&record.right)];
+        let (priority, confidence) = candidate_owner_triage(record);
         let id = push_work_item(
             &mut work_items,
             WorkItemDraft {
                 action: "reconcile-changed-owner",
-                priority: "P1",
-                confidence: record.confidence,
+                priority,
+                confidence,
                 reason: format!(
                     "The best owner correspondence is {}, but normalized structure is not proven equal (basis {}, score {:.4}).",
                     record.status, record.basis, record.score
@@ -909,7 +995,7 @@ pub(crate) fn write_llm_context(
             record.right.id.clone(),
             UnitDisposition {
                 status: "changed-candidate",
-                confidence: record.confidence,
+                confidence,
                 work_item_id: Some(id),
             },
         );
@@ -919,42 +1005,13 @@ pub(crate) fn write_llm_context(
         if group.right.iter().all(identical_location) {
             continue;
         }
-        // Keep ambiguity actionable per local owner.  A single work item for
-        // an N×M correspondence group can be incorrectly marked complete by
-        // reviewing only one owner, while the other local owners remain
-        // un-audited.  Each item still carries every upstream candidate, so
-        // show-work retains the full competing owner chain.
-        let upstream = group.right.iter().map(location_value).collect::<Vec<_>>();
-        for local_location in &group.left {
-            let local = vec![location_value(local_location)];
-            let identities = std::iter::once(local_location.id.clone())
-                .chain(group.right.iter().map(|location| location.id.clone()))
-                .collect::<Vec<_>>();
-            let id = push_work_item(
-                &mut work_items,
-                WorkItemDraft {
-                    action: "resolve-ambiguous-owners",
-                    priority: "P1",
-                    confidence: group.confidence,
-                    reason: format!(
-                        "Local owner {} has multiple upstream candidates sharing the {} fingerprint; audit this owner chain before resolving.",
-                        local_location.id, group.basis
-                    ),
-                    local,
-                    upstream: upstream.clone(),
-                    evidence_path: Vec::new(),
-                    identities,
-                },
-            );
-            for location in &group.right {
-                unit_dispositions
-                    .entry(location.id.clone())
-                    .or_insert_with(|| UnitDisposition {
-                        status: "ambiguous",
-                        confidence: group.confidence,
-                        work_item_id: Some(id.clone()),
-                    });
-            }
+        // Preserve fingerprint ambiguity in the report, but do not present a
+        // duplicate-shape candidate as change work without an owner chain.
+        ambiguous_left_ids.extend(group.left.iter().map(|location| location.id.clone()));
+        for location in &group.right {
+            ambiguous_right_confidence
+                .entry(location.id.clone())
+                .or_insert(group.confidence);
         }
     }
 
@@ -997,6 +1054,16 @@ pub(crate) fn write_llm_context(
         }
     }
 
+    // Stronger split/merge evidence above takes precedence over a repeated
+    // fingerprint; remaining ambiguous owners stay diagnostic-only.
+    for (id, confidence) in ambiguous_right_confidence {
+        unit_dispositions.entry(id).or_insert(UnitDisposition {
+            status: "ambiguous",
+            confidence,
+            work_item_id: None,
+        });
+    }
+
     for record in unmatched_right {
         if identical_location(&record.location) {
             unit_dispositions.insert(
@@ -1009,18 +1076,17 @@ pub(crate) fn write_llm_context(
             );
             continue;
         }
-        unit_dispositions.insert(
-            record.location.id.clone(),
-            UnitDisposition {
+        unit_dispositions
+            .entry(record.location.id.clone())
+            .or_insert(UnitDisposition {
                 status: "unmatched-upstream",
                 confidence: "unknown",
                 work_item_id: None,
-            },
-        );
+            });
     }
 
     for record in unmatched_left {
-        if identical_location(&record.location) {
+        if identical_location(&record.location) || ambiguous_left_ids.contains(&record.location.id) {
             continue;
         }
         let local = vec![location_value(&record.location)];
@@ -1066,7 +1132,10 @@ pub(crate) fn write_llm_context(
             .fold(HashMap::<&str, Vec<&Unit>>::new(), |mut by_file, unit| {
                 by_file.entry(unit.file.as_str()).or_default().push(unit);
                 by_file
-            });
+            })
+            .into_iter()
+            .map(|(file, units)| (file, UnitIntervals::new(units)))
+            .collect::<HashMap<_, _>>();
     let frontier_by_right = frontiers
         .iter()
         .filter_map(|frontier| Some((frontier.right_edge.as_ref()?.target.id.as_str(), frontier)))
@@ -1113,40 +1182,6 @@ pub(crate) fn write_llm_context(
         .filter(|edge| edge.kind == "Contains")
         .map(|edge| (edge.target.as_str(), edge.source.as_str()))
         .collect::<HashMap<_, _>>();
-    let children_by_parent = right
-        .graph_edges
-        .iter()
-        .filter(|edge| edge.kind == "Contains")
-        .fold(HashMap::<&str, Vec<&str>>::new(), |mut children, edge| {
-            children
-                .entry(edge.source.as_str())
-                .or_default()
-                .push(edge.target.as_str());
-            children
-        });
-    let local_external_modules = left
-        .graph_nodes
-        .iter()
-        .filter(|node| node.kind == "External")
-        .filter_map(|node| node.label.strip_prefix("module:"))
-        .collect::<HashSet<_>>();
-    let right_requires_by_callsite = right
-        .graph_edges
-        .iter()
-        .filter(|edge| edge.kind == "Requires")
-        .filter_map(|edge| {
-            let external = node_by_id.get(edge.target.as_str())?;
-            let module = external.label.strip_prefix("module:")?;
-            Some((edge.source.as_str(), module))
-        })
-        .collect::<HashMap<_, _>>();
-    let previous_statement_by_next_target = right
-        .graph_edges
-        .iter()
-        .filter(|edge| edge.kind == "NextStatement")
-        .map(|edge| (edge.target.as_str(), edge.source.as_str()))
-        .collect::<HashMap<_, _>>();
-
     let mut node_status = HashMap::<String, (&'static str, &'static str, Option<String>)>::new();
     for node in &right_nodes {
         let status = if let Some(frontier) = frontier_by_right.get(node.id.as_str()) {
@@ -1224,486 +1259,7 @@ pub(crate) fn write_llm_context(
     }
 
     let mut dependency_evidence_by_node = HashMap::<String, Value>::new();
-    // LOCAL already records many reviewed upstream owners in source
-    // annotations. Promote only annotations for the active 4669 target, only
-    // when the referenced upstream line contains the node, and only when a
-    // same-file local graph node has a non-trivial structural shape match.
-    // This keeps the annotation as locator/provenance evidence rather than a
-    // filename-only escape hatch, while avoiding one hard-coded certificate
-    // per source-file boundary.
-    let annotated_ranges = annotated_owner_ranges(left);
-    let mut annotated_sources = HashMap::new();
-    for annotation in &annotated_ranges {
-        annotated_sources
-            .entry(annotation.local_file.as_str())
-            .or_insert_with(|| {
-                fs::read_to_string(Path::new(&left.root).join(&annotation.local_file)).ok()
-            });
-    }
-    // Multiple annotations can cover the same owner and therefore revisit
-    // the same local/upstream node pair. Shape comparison normalizes and
-    // allocates token sets, so cache its threshold result by node identity.
-    let mut shape_match_cache = HashMap::<(&str, &str), bool>::new();
-    for annotation in &annotated_ranges {
-        // Avoid rescanning the entire executable graph for every annotation:
-        // a distribution bundle can contain tens of thousands of nodes while
-        // LOCAL can carry thousands of independent evidence ranges. Keep the
-        // same exact-file / source-path predicates, but visit only nodes from
-        // matching files and compare shape only against nodes in the local
-        // owner's file and node kind.
-        let candidate_nodes = right_nodes_by_file
-            .iter()
-            .filter(|(file, _)| {
-                **file == annotation.upstream_file
-                    || annotated_source_path_matches(&annotation.local_file, file)
-            })
-            .flat_map(|(_, nodes)| nodes.iter().copied());
-        for node in candidate_nodes {
-            let bundle_location = node.file == annotation.upstream_file;
-            let source_like_location =
-                annotated_source_path_matches(&annotation.local_file, &node.file);
-            if (!bundle_location && !source_like_location)
-                || (bundle_location
-                    && (node.line < annotation.start_line || node.line > annotation.end_line))
-                || !matches!(
-                    node_status.get(&node.id).map(|status| status.0),
-                    Some("unlinked-upstream" | "missing-local" | "changed-branch")
-                )
-            {
-                continue;
-            }
-            let shape_match = left_nodes_by_file_kind
-                .get(&(annotation.local_file.as_str(), node.kind.as_str()))
-                .is_some_and(|candidates| {
-                    candidates.iter().any(|candidate| {
-                        let pair = (candidate.id.as_str(), node.id.as_str());
-                        if let Some(matched) = shape_match_cache.get(&pair) {
-                            return *matched;
-                        }
-                        let matched = graph_similarity(candidate, node) >= 0.35;
-                        shape_match_cache.insert(pair, matched);
-                        matched
-                    })
-                });
-            let factory_match = annotated_sources
-                .get(annotation.local_file.as_str())
-                .and_then(Option::as_deref)
-                .is_some_and(|source| annotated_compiled_factory_match(source, node));
-            if !shape_match && !factory_match {
-                continue;
-            }
-            node_status.insert(
-                node.id.clone(),
-                ("structurally-equal", "proven-structure", None),
-            );
-            dependency_evidence_by_node.insert(
-                node.id.clone(),
-                json!({
-                    "basis": if source_like_location && !bundle_location {
-                        "annotated-owner-source-path-shape-match"
-                    } else {
-                        "annotated-owner-shape-match"
-                    },
-                    "localFile": annotation.local_file,
-                    "upstreamFile": annotation.upstream_file,
-                    "upstreamLineRange": [annotation.start_line, annotation.end_line],
-                }),
-            );
-        }
-    }
-    // The 4669 bundle emits LOCAL's shared `groupBy` owner as a top-level
-    // function statement with a same-span child. Keep this certificate exact
-    // to the audited range; broad annotation propagation is intentionally not
-    // used because it changes frontier identities for unrelated descendants.
-    for node in &right_nodes {
-        if node.file == "dist-electron-deobfuscated/index.js"
-            && matches!(node.kind.as_str(), "Statement" | "Function")
-            && node.start == 5_765_513
-            && node.end == 5_765_833
-            && left.graph_nodes.iter().any(|candidate| {
-                candidate.file == "packages/shared/src/array/groupBy.ts"
-                    && candidate.kind == "Function"
-            })
-        {
-            node_status.insert(
-                node.id.clone(),
-                ("structurally-equal", "proven-structure", None),
-            );
-            dependency_evidence_by_node.insert(
-                node.id.clone(),
-                json!({
-                    "basis": "exact-reviewed-compiled-owner",
-                    "localFile": "packages/shared/src/array/groupBy.ts",
-                    "upstreamRange": [5765513, 5765833],
-                }),
-            );
-        }
-    }
-    // 4669 emits these three window-bounds helpers as top-level functions,
-    // while LOCAL keeps `calculateRelativePosition` inside the matched
-    // `adjustedBounds.ts` owner. The full `mle` owner is already mapped to
-    // that file; preserve the exact extracted helper as covered without
-    // forcing a source-layout change.
-    for node in &right_nodes {
-        if node.file == "dist-electron-deobfuscated/index.js"
-            && node.start == 1_126_019
-            && node.end == 1_126_198
-            && left.graph_nodes.iter().any(|candidate| {
-                candidate
-                    .file
-                    .ends_with("windowBoundsPersistance/adjustedBounds.ts")
-                    && candidate.kind == "Function"
-            })
-        {
-            node_status.insert(
-                node.id.clone(),
-                ("structurally-equal", "proven-structure", None),
-            );
-            dependency_evidence_by_node.insert(
-                node.id.clone(),
-                json!({
-                    "basis": "exact-window-bounds-helper-owner",
-                    "localFile": "apps/desktop/src/main/subsystems/windows/windowBoundsPersistance/adjustedBounds.ts",
-                    "upstreamRange": [1126019, 1126198],
-                }),
-            );
-        }
-    }
-    // 4669 bundles the hash utility as anonymous top-level statements, while
-    // LOCAL owns the same contract in the standalone HashMap package. Keep
-    // this certificate exact to the first WeakMap owner statement; its
-    // descendants are covered by the normal owner-chain propagation.
-    for node in &right_nodes {
-        if node.file == "dist-electron-deobfuscated/index.js"
-            && node.start == 578_827
-            && node.end == 578_850
-            && left.graph_nodes.iter().any(|candidate| {
-                candidate
-                    .file
-                    .ends_with("packages/mobx-primitives/src/maps/HashMap.ts")
-                    && candidate.kind == "Function"
-                    && candidate.label == "declaration"
-            })
-        {
-            node_status.insert(
-                node.id.clone(),
-                ("structurally-equal", "proven-structure", None),
-            );
-            dependency_evidence_by_node.insert(
-                node.id.clone(),
-                json!({
-                    "basis": "exact-bundled-hash-owner",
-                    "localFile": "packages/mobx-primitives/src/maps/HashMap.ts",
-                    "upstreamRange": [578827, 578850],
-                }),
-            );
-        }
-    }
-    // Zod's bundled `CS.create` owner is supplied by LOCAL's zod package
-    // import; it is not an application branch that should be copied into the
-    // reproduction. Scope the certificate to the exact 4669 statement and
-    // require the real local package boundary.
-    for node in &right_nodes {
-        if node.file == "dist-electron-deobfuscated/index.js"
-            && node.start == 999_600
-            && node.end == 999_679
-            && left
-                .graph_nodes
-                .iter()
-                .any(|candidate| candidate.kind == "External" && candidate.label == "module:zod")
-        {
-            node_status.insert(
-                node.id.clone(),
-                ("dependency-structurally-equal", "proven-structure", None),
-            );
-            dependency_evidence_by_node.insert(
-                node.id.clone(),
-                json!({
-                    "basis": "exact-zod-bundled-owner",
-                    "package": "zod",
-                    "upstreamRange": [999600, 999679],
-                }),
-            );
-        }
-    }
-    // The reporting flag mutation is already ported under the LOCAL router
-    // boundary; the bundle exposes it as an anonymous top-level statement.
-    // Bind only the authoritative 4669 owner range and the concrete local
-    // telemetry module, preserving the full caller chain in the graph.
-    for node in &right_nodes {
-        if node.file == "dist-electron-deobfuscated/index.js"
-            && node.start == 6_351_356
-            && node.end == 6_351_538
-            && left.graph_nodes.iter().any(|candidate| {
-                candidate
-                    .file
-                    .ends_with("apps/desktop/src/main/router/telemetry/index.ts")
-                    && candidate.kind == "Function"
-            })
-        {
-            node_status.insert(
-                node.id.clone(),
-                ("structurally-equal", "proven-structure", None),
-            );
-            dependency_evidence_by_node.insert(
-                node.id.clone(),
-                json!({
-                    "basis": "exact-telemetry-owner",
-                    "localFile": "apps/desktop/src/main/router/telemetry/index.ts",
-                    "upstreamRange": [6351356, 6351538],
-                }),
-            );
-        }
-    }
-    // The authoritative bundle inlines debug@4.4.3 as one module and erases
-    // the package boundary. Its complete owner range is independently
-    // identified by the installed dependency corpus; promote only nodes
-    // inside that exact range when that package is actually present.
-    for node in &right_nodes {
-        if node.file == "dist-electron-deobfuscated/index.js"
-            && node.start >= 1_373_607
-            && node.end <= 1_376_005
-            && dependencies.is_some_and(|index| {
-                index.files.iter().any(|file| {
-                    file.file.starts_with("npm/debug@4.4.3-")
-                        && file.file.contains("/src/common.js")
-                })
-            })
-        {
-            node_status.insert(
-                node.id.clone(),
-                ("dependency-structurally-equal", "proven-structure", None),
-            );
-            dependency_evidence_by_node.insert(
-                node.id.clone(),
-                json!({
-                    "basis": "exact-reviewed-transitive-package-owner",
-                    "package": "debug@4.4.3",
-                    "upstreamRange": [1373607, 1376005],
-                }),
-            );
-        }
-    }
-    // Zod's generated factory aliases are emitted as anonymous bundle
-    // statements. Bind this exact 4669 owner only when the matching installed
-    // zod package is present in the dependency corpus.
-    for node in &right_nodes {
-        if node.file == "dist-electron-deobfuscated/index.js"
-            && node.start == 1_048_591
-            && node.end == 1_048_610
-            && dependencies.is_some_and(|index| {
-                index.files.iter().any(|file| {
-                    file.file.starts_with("npm/zod@3.25.76-") && file.file.contains("/index.cjs")
-                })
-            })
-        {
-            node_status.insert(
-                node.id.clone(),
-                ("dependency-structurally-equal", "proven-structure", None),
-            );
-            dependency_evidence_by_node.insert(
-                node.id.clone(),
-                json!({
-                    "basis": "exact-reviewed-transitive-package-owner",
-                    "package": "zod@3.25.76",
-                    "upstreamRange": [1048591, 1048610],
-                }),
-            );
-        }
-    }
-    // TypeScript parameter-property lowering emits this constructor
-    // assignment as a separate bundle branch. The LOCAL DeepMap owner keeps
-    // the same invariant in the parameter declaration, so this exact branch
-    // is covered by the complete package owner rather than copied literally.
-    for node in &right_nodes {
-        if node.file == "dist-electron-deobfuscated/index.js"
-            && node.start == 1_055_001
-            && node.end == 1_055_027
-            && left.files.iter().any(|file| {
-                file.file
-                    .ends_with("packages/mobx-primitives/src/maps/DeepMap.ts")
-            })
-        {
-            node_status.insert(
-                node.id.clone(),
-                ("structurally-equal", "proven-structure", None),
-            );
-            dependency_evidence_by_node.insert(
-                node.id.clone(),
-                json!({
-                    "basis": "exact-typescript-lowered-owner",
-                    "localFile": "packages/mobx-primitives/src/maps/DeepMap.ts",
-                    "upstreamRange": [1055001, 1055027],
-                }),
-            );
-        }
-    }
-    // Camera config schema/defaults are owned by the LOCAL project package;
-    // the bundle emits them as one anonymous Zod statement. Bind the complete
-    // authoritative 4669 owner range to that package boundary.
-    for node in &right_nodes {
-        if node.file == "dist-electron-deobfuscated/index.js"
-            && node.start == 1_681_083
-            && node.end == 1_681_544
-            && left
-                .files
-                .iter()
-                .any(|file| file.file.ends_with("packages/project/src/config.ts"))
-        {
-            node_status.insert(
-                node.id.clone(),
-                ("structurally-equal", "proven-structure", None),
-            );
-            dependency_evidence_by_node.insert(
-                node.id.clone(),
-                json!({
-                    "basis": "exact-camera-config-owner",
-                    "localFile": "packages/project/src/config.ts",
-                    "upstreamRange": [1681083, 1681544],
-                }),
-            );
-        }
-    }
-    // Persisted mask style registry is split from the bundle's anonymous Zod
-    // schema object in LOCAL. The complete style contract lives in the mask
-    // registry module; bind this exact 4669 owner range to it.
-    for node in &right_nodes {
-        if node.file == "dist-electron-deobfuscated/index.js"
-            && node.start == 2_066_457
-            && node.end == 2_066_686
-            && left.files.iter().any(|file| {
-                file.file.ends_with(
-                    "apps/desktop/src/renderer/src/actions/editor/model/mask/maskStyleRegistry.ts",
-                )
-            })
-        {
-            node_status.insert(
-                node.id.clone(),
-                ("structurally-equal", "proven-structure", None),
-            );
-            dependency_evidence_by_node.insert(
-                node.id.clone(),
-                json!({
-                    "basis": "exact-mask-style-owner",
-                    "localFile": "apps/desktop/src/renderer/src/actions/editor/model/mask/maskStyleRegistry.ts",
-                    "upstreamRange": [2066457, 2066686],
-                }),
-            );
-        }
-    }
-    // Generated aliases of the bundled Zod namespace are dependency wrappers,
-    // not product owners. This exact 4669 alias is covered by LOCAL's zod
-    // package boundary.
-    for node in &right_nodes {
-        if node.file == "dist-electron-deobfuscated/index.js"
-            && node.start == 1_049_129
-            && node.end == 1_049_149
-            && left
-                .graph_nodes
-                .iter()
-                .any(|candidate| candidate.kind == "External" && candidate.label == "module:zod")
-        {
-            node_status.insert(
-                node.id.clone(),
-                ("dependency-structurally-equal", "proven-structure", None),
-            );
-            dependency_evidence_by_node.insert(
-                node.id.clone(),
-                json!({
-                    "basis": "exact-zod-namespace-alias",
-                    "package": "zod",
-                    "upstreamRange": [1049129, 1049149],
-                }),
-            );
-        }
-    }
-    // These 4669 ranges are complete Sentry bundled helper owners. LOCAL
-    // resolves Sentry through its package boundary; keep the ranges explicit
-    // so ordinary application code cannot be classified as dependency code by
-    // a name-only heuristic.
-    for (start, end) in [
-        (1_450_566_u32, 1_450_690_u32),
-        (1_454_762, 1_454_843),
-        (1_231_564, 1_231_615),
-        (1_285_660, 1_285_867),
-        (3_190_943, 3_191_053),
-        (2_708_114, 2_708_253),
-    ] {
-        for node in &right_nodes {
-            if node.file == "dist-electron-deobfuscated/index.js"
-                && node.start == start
-                && node.end == end
-                && left.graph_nodes.iter().any(|candidate| {
-                    candidate.kind == "External" && candidate.label.starts_with("module:@sentry")
-                })
-            {
-                node_status.insert(
-                    node.id.clone(),
-                    ("dependency-structurally-equal", "proven-structure", None),
-                );
-                dependency_evidence_by_node.insert(
-                    node.id.clone(),
-                    json!({
-                        "basis": "exact-sentry-bundled-owner",
-                        "package": "@sentry",
-                        "upstreamRange": [start, end],
-                    }),
-                );
-            }
-        }
-    }
-    // TypeScript decorator runtime emitted by the main bundle is supplied by
-    // LOCAL's MobX package boundary.
-    for (start, end) in [(1_731_602_u32, 1_731_618_u32), (1_731_750, 1_731_797)] {
-        for node in &right_nodes {
-            if node.file == "dist-electron-deobfuscated/index.js"
-                && node.start == start
-                && node.end == end
-                && left.graph_nodes.iter().any(|candidate| {
-                    candidate.kind == "External" && candidate.label == "module:mobx"
-                })
-            {
-                node_status.insert(
-                    node.id.clone(),
-                    ("dependency-structurally-equal", "proven-structure", None),
-                );
-                dependency_evidence_by_node.insert(
-                    node.id.clone(),
-                    json!({
-                        "basis": "exact-mobx-decorator-owner",
-                        "package": "mobx",
-                        "upstreamRange": [start, end],
-                    }),
-                );
-            }
-        }
-    }
-    // semver's range parser is likewise bundled in main but supplied by the
-    // LOCAL semver package boundary.
-    for (start, end) in [(4_473_272_u32, 4_473_357_u32)] {
-        for node in &right_nodes {
-            if node.file == "dist-electron-deobfuscated/index.js"
-                && node.start == start
-                && node.end == end
-                && left.graph_nodes.iter().any(|candidate| {
-                    candidate.kind == "External" && candidate.label == "module:semver"
-                })
-            {
-                node_status.insert(
-                    node.id.clone(),
-                    ("dependency-structurally-equal", "proven-structure", None),
-                );
-                dependency_evidence_by_node.insert(
-                    node.id.clone(),
-                    json!({
-                        "basis": "exact-semver-bundled-owner",
-                        "package": "semver",
-                        "upstreamRange": [start, end],
-                    }),
-                );
-            }
-        }
-    }
+    let mut dependency_candidates_by_node = HashMap::<String, Value>::new();
     if let Some(dependencies) = dependencies {
         let dependency_package_file_counts =
             dependencies
@@ -1753,8 +1309,8 @@ pub(crate) fn write_llm_context(
         // Normalized graph matching must not scan the entire dependency AST
         // for every unmatched upstream node.  Build an inverted index on
         // (kind, normalized-token) and start each lookup from its rarest
-        // shared token.  Exact hash/unit evidence above remains authoritative;
-        // this index only narrows the bounded fuzzy fallback.
+        // shared token. Complete-unit routes remain separate; graph tokens
+        // only narrow the bounded candidate fallback.
         let imported_dependency_packages = left
             .graph_nodes
             .iter()
@@ -1807,7 +1363,7 @@ pub(crate) fn write_llm_context(
             }
             (nodes_by_kind_token, token_frequency)
         } else {
-            // The exact unit/semantic-hash evidence above remains useful
+            // The unit routes and semantic-hash locators above remain useful
             // for dependency corpora without a local package import
             // boundary. Do not build a String-heavy inverted index for
             // millions of AST nodes when there is no safe package scope.
@@ -1836,9 +1392,9 @@ pub(crate) fn write_llm_context(
             // Graph-node linkedSha256 and unit linked_sha256 are different
             // projections: the former describes the graph node's structural
             // neighborhood, while the latter describes the complete owner
-            // unit. Prefer the containing unit hash for dependency ownership;
-            // retain the node-hash fallback for top-level statements without
-            // a collected Function/Class unit.
+            // unit. Keep the complete-unit route distinct from the graph-node
+            // locator: a top-level node without a collected owner does not gain
+            // a complete-owner certificate from this fallback.
             let linked_unit_evidence = unit_for_node(node, &units_by_file)
                 .and_then(|unit| {
                     unique_dependency_evidence(
@@ -1851,19 +1407,17 @@ pub(crate) fn write_llm_context(
                         |candidate| location_value(&location(candidate)),
                         "exact-linked-unit",
                     )
-                })
-                .or_else(|| {
-                    unique_dependency_evidence(
-                        dependency_units_by_linked_hash
-                            .get(node.linked_sha256.as_str())
-                            .into_iter()
-                            .flatten()
-                            .copied(),
-                        |candidate| candidate.file.as_str(),
-                        |candidate| location_value(&location(candidate)),
-                        "exact-linked-graph-node",
-                    )
                 });
+            let linked_graph_evidence = unique_dependency_evidence(
+                dependency_units_by_linked_hash
+                    .get(node.linked_sha256.as_str())
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+                |candidate| candidate.file.as_str(),
+                |candidate| location_value(&location(candidate)),
+                "exact-linked-graph-node",
+            );
             let graph_evidence = upstream_behavior.get(&node.id).and_then(|hash| {
                 unique_dependency_evidence(
                     dependency_nodes_by_hash
@@ -1876,116 +1430,6 @@ pub(crate) fn write_llm_context(
                     "exact-semantic-neighborhood",
                 )
             });
-            // Sentry's trace-parent regexp is emitted as one RegExp literal
-            // in the bundle, while the installed CJS helper builds the same
-            // expression by string concatenation.  Exact graph hashes cannot
-            // survive that wrapper transformation, but the complete owner is
-            // still uniquely identified by the RegExp contract and its
-            // trace-id literals.  Keep this exception scoped to the pinned
-            // package/file owner; it must not become a broad fuzzy fallback.
-            let sentry_trace_owner_evidence = if node.kind == "Statement"
-                && node
-                    .tokens
-                    .iter()
-                    .any(|token| token.contains("external:RegExp"))
-                && node.tokens.iter().any(|token| token.contains("0-9a-f"))
-            {
-                unique_dependency_evidence(
-                    dependencies.graph_nodes.iter().filter(|candidate| {
-                        candidate.kind == "Statement"
-                            && candidate.file.starts_with("npm/@sentry/utils@7.112.0-")
-                            && candidate.file.ends_with("/cjs/tracing.js")
-                            && candidate
-                                .tokens
-                                .iter()
-                                .any(|token| token.contains("external:RegExp"))
-                            && candidate
-                                .tokens
-                                .iter()
-                                .any(|token| token.contains("0-9a-f"))
-                    }),
-                    |candidate| candidate.file.as_str(),
-                    |candidate| graph_node_value(&graph_node_ref(candidate)),
-                    "exact-sentry-trace-regexp-owner",
-                )
-            } else {
-                None
-            };
-            // The bundled semver CJS module is emitted as a top-level wrapper
-            // with no synthetic Unit. Its full owner is identifiable from the
-            // range/intersection implementation and the pinned dependency
-            // package is present in LOCAL; keep this exception tied to the
-            // exact authoritative source range rather than a broad shape score.
-            let semver_bundle_owner_evidence = if node.file == "dist-electron-deobfuscated/index.js"
-                && node.start == 2_232_030
-                && node.end == 2_233_193
-                && imported_dependency_packages.contains("semver")
-            {
-                Some(json!({
-                    "basis": "exact-semver-bundled-owner",
-                    "package": "semver",
-                    "source": graph_node_value(&graph_node_ref(node)),
-                }))
-            } else {
-                None
-            };
-            let sentry_url_owner_evidence = if node.file == "dist-electron-deobfuscated/index.js"
-                && node.start == 1_222_243
-                && node.end == 1_222_374
-            {
-                Some(json!({
-                    "basis": "exact-sentry-utils-url-owner",
-                    "package": "@sentry/utils",
-                    "source": graph_node_value(&graph_node_ref(node)),
-                }))
-            } else {
-                None
-            };
-            let lodash_bundle_owner_evidence = if node.file == "dist-electron-deobfuscated/index.js"
-                && node.start == 6_309_564
-                && node.end == 6_309_920
-            {
-                Some(json!({
-                    "basis": "exact-lodash-bundled-owner",
-                    "package": "lodash",
-                    "source": graph_node_value(&graph_node_ref(node)),
-                }))
-            } else {
-                None
-            };
-            let ajv_bundle_owner_evidence = if node.file == "dist-electron-deobfuscated/index.js"
-                && node.start >= 4_735_288
-                && node.end <= 4_736_308
-            {
-                Some(json!({
-                    "basis": "exact-ajv-bundled-owner",
-                    "package": "ajv",
-                    "source": graph_node_value(&graph_node_ref(node)),
-                }))
-            } else {
-                None
-            };
-            // atomically@1.7.0 is bundled into the Electron main file.  Its
-            // attemptify helper is source-faithful in LOCAL's installed
-            // dependency closure, but the bundle erases the package/module
-            // boundary.  Pin this one owner by the complete upstream source
-            // range and the exact dependency file; do not turn the package
-            // name into a broad fuzzy matcher.
-            let atomically_attemptify_owner_evidence = if node.file
-                == "dist-electron-deobfuscated/index.js"
-                && node.start == 4_645_565
-                && node.end == 4_645_649
-            {
-                Some(json!({
-                    "basis": "exact-atomically-attemptify-owner",
-                    "package": "atomically@1.7.0",
-                    "sourceFile": "npm/atomically@1.7.0-c34508b091/dist/utils/attemptify.js",
-                    "sourceSha256": "f570e6c261b2c413992073e48023163b21afb5f4cf1ad7ee2d230566595ddf82",
-                    "upstreamSource": graph_node_value(&graph_node_ref(node)),
-                }))
-            } else {
-                None
-            };
             let normalized_graph_evidence = || {
                 let mut lookup_keys = node
                     .tokens
@@ -2003,13 +1447,13 @@ pub(crate) fn write_llm_context(
                     .copied()
                     .collect::<Vec<_>>();
                 // Do not materialize or repeatedly scan a broad first bucket.
-                // Exact hash/unit evidence above remains authoritative; fuzzy
-                // evidence is optional and must stay bounded on large
+                // Complete-unit routes remain separate; graph hints are
+                // optional and must stay bounded on large
                 // dependency graphs.
                 // Fuzzy dependency evidence is only a bounded fallback. A
                 // common token is not useful evidence and makes a large
                 // direct-package projection quadratic across the upstream
-                // bundle; exact unit/behavior hashes remain authoritative.
+                // bundle; none of these graph hints certifies ownership.
                 if first_candidates.len() > 512 {
                     return None;
                 }
@@ -2087,237 +1531,39 @@ pub(crate) fn write_llm_context(
             };
             if let Some(evidence) = unit_evidence
                 .or(linked_unit_evidence)
-                .or(graph_evidence)
-                .or(sentry_trace_owner_evidence)
-                .or(semver_bundle_owner_evidence)
-                .or(sentry_url_owner_evidence)
-                .or(lodash_bundle_owner_evidence)
-                .or(ajv_bundle_owner_evidence)
-                .or(atomically_attemptify_owner_evidence)
-                .or_else(normalized_graph_evidence)
             {
                 node_status.insert(
                     node.id.clone(),
                     ("dependency-structurally-equal", "proven-structure", None),
                 );
                 dependency_evidence_by_node.insert(node.id.clone(), evidence);
+            } else if let Some(evidence) = linked_graph_evidence
+                .or(graph_evidence)
+                .or_else(normalized_graph_evidence)
+            {
+                // Neighborhood hashes and graph scores locate possible package
+                // owners; they do not authenticate the complete body or its
+                // captured/imported bindings. Preserve the suggestion without
+                // changing disposition, confidence, or the normal repair route.
+                dependency_candidates_by_node.insert(node.id.clone(), json!({
+                    "confidence": "candidate",
+                    "reason": "graph-locator-without-complete-owner-binding-proof",
+                    "evidence": evidence,
+                }));
             }
         }
 
-        // Oxc's graph represents a top-level variable/branch owner as the
-        // `Contains` source and its function expression as the target.  A
-        // bundled dependency can therefore prove the executable child while
-        // leaving the owning statement falsely unlinked. Promote only proven
-        // dependency evidence along that concrete owner chain; never promote
-        // fuzzy candidates or change/frontier nodes.
-        let proven_dependency_children = node_status
-            .iter()
-            .filter_map(|(node_id, status)| {
-                (status.0 == "dependency-structurally-equal").then_some(node_id.clone())
-            })
-            .collect::<Vec<_>>();
-        for child_id in proven_dependency_children {
-            let Some(evidence) = dependency_evidence_by_node.get(&child_id).cloned() else {
-                continue;
-            };
-            let mut cursor = child_id.as_str();
-            let mut seen = HashSet::new();
-            while seen.insert(cursor.to_string()) {
-                let Some(parent_id) = parent_by_child.get(cursor).copied() else {
-                    break;
-                };
-                if matches!(
-                    node_status.get(parent_id).map(|status| status.0),
-                    Some("unlinked-upstream" | "missing-local")
-                ) {
-                    node_status.insert(
-                        parent_id.to_string(),
-                        ("dependency-structurally-equal", "proven-structure", None),
-                    );
-                    dependency_evidence_by_node.insert(
-                        parent_id.to_string(),
-                        json!({
-                            "basis": "dependency-owner-chain",
-                            "ownerNode": child_id,
-                            "source": evidence.clone(),
-                        }),
-                    );
-                }
-                cursor = parent_id;
-            }
+        // Contains identifies syntax ownership, not complete dependency behavior.
+        // A matching descendant does not certify its application parent or siblings;
+        // a parent locator likewise cannot certify a separately collected child.
+        // Keep each unresolved node in its normal queue until its own complete body
+        // and binding obligations are proved. Do not inherit dependency disposition
+        // from either direction of this graph, including after graph compaction.
 
-            let mut descendants = children_by_parent
-                .get(child_id.as_str())
-                .cloned()
-                .unwrap_or_default();
-            let mut seen_descendants = HashSet::new();
-            while let Some(descendant_id) = descendants.pop() {
-                if !seen_descendants.insert(descendant_id) {
-                    continue;
-                }
-                if matches!(
-                    node_status.get(descendant_id).map(|status| status.0),
-                    Some("unlinked-upstream" | "missing-local")
-                ) {
-                    node_status.insert(
-                        descendant_id.to_string(),
-                        ("dependency-structurally-equal", "proven-structure", None),
-                    );
-                    dependency_evidence_by_node.insert(
-                        descendant_id.to_string(),
-                        json!({
-                            "basis": "dependency-owner-chain",
-                            "ownerNode": child_id,
-                            "source": evidence.clone(),
-                        }),
-                    );
-                }
-                if let Some(children) = children_by_parent.get(descendant_id) {
-                    descendants.extend(children.iter().copied());
-                }
-            }
-        }
-
-        // The owner may be proven before its descendants are visited. Make
-        // the inheritance explicit from every unresolved node to its nearest
-        // proven Contains ancestor as well; this covers dependency functions
-        // whose body statements have no standalone dependency unit match.
-        for node in &right_nodes {
-            if node_status.get(&node.id).map(|status| status.0) != Some("unlinked-upstream") {
-                continue;
-            }
-            let mut cursor = node.id.as_str();
-            let mut seen = HashSet::new();
-            while seen.insert(cursor) {
-                let Some(parent_id) = parent_by_child.get(cursor).copied() else {
-                    break;
-                };
-                if node_status.get(parent_id).map(|status| status.0)
-                    == Some("dependency-structurally-equal")
-                {
-                    let source = dependency_evidence_by_node
-                        .get(parent_id)
-                        .cloned()
-                        .unwrap_or_else(|| json!({"basis": "dependency-owner-chain"}));
-                    node_status.insert(
-                        node.id.clone(),
-                        ("dependency-structurally-equal", "proven-structure", None),
-                    );
-                    dependency_evidence_by_node.insert(
-                        node.id.clone(),
-                        json!({
-                            "basis": "dependency-owner-chain",
-                            "ownerNode": parent_id,
-                            "source": source,
-                        }),
-                    );
-                    break;
-                }
-                cursor = parent_id;
-            }
-        }
     }
 
-    // Bundlers emit a separate top-level `binding = interop(binding)`
-    // statement immediately after a CJS require.  The reproduction keeps the
-    // real package import in its owning module instead of reproducing this
-    // generated wrapper.  Treat that wrapper as covered only when the
-    // adjacent require resolves to a package also imported locally.
-    for node in &right_nodes {
-        if node_status.get(&node.id).map(|status| status.0) != Some("unlinked-upstream") {
-            continue;
-        }
-        let Some(previous_id) = previous_statement_by_next_target.get(node.id.as_str()) else {
-            let Some(previous) = right_nodes
-                .iter()
-                .filter(|candidate| candidate.kind == "Statement" && candidate.end < node.start)
-                .max_by_key(|candidate| candidate.end)
-            else {
-                continue;
-            };
-            let previous_id = &previous.id;
-            let mut package = None;
-            if let Some(statement) = node_by_id.get(previous_id.as_str()) {
-                package = statement
-                    .tokens
-                    .iter()
-                    .filter_map(|token| {
-                        if !token.starts_with("literal:") {
-                            return None;
-                        }
-                        let start = token.find('"')? + 1;
-                        let rest = &token[start..];
-                        let end = rest.find('"')?;
-                        Some(&rest[..end])
-                    })
-                    .find(|module| local_external_modules.contains(module));
-            }
-            let Some(package) = package else { continue };
-            node_status.insert(
-                node.id.clone(),
-                ("dependency-structurally-equal", "proven-structure", None),
-            );
-            dependency_evidence_by_node.insert(
-                node.id.clone(),
-                json!({
-                    "basis": "cjs-interop-bootstrap",
-                    "package": package,
-                    "source": graph_node_value(&graph_node_ref(node)),
-                }),
-            );
-            continue;
-        };
-        let mut descendants = vec![*previous_id];
-        let mut seen = HashSet::new();
-        let mut package = None;
-        while let Some(cursor) = descendants.pop() {
-            if !seen.insert(cursor) {
-                continue;
-            }
-            if let Some(module) = right_requires_by_callsite.get(cursor) {
-                package = Some(*module);
-                break;
-            }
-            if let Some(children) = children_by_parent.get(cursor) {
-                descendants.extend(children.iter().copied());
-            }
-        }
-        if package.is_none() {
-            package = node_by_id
-                .get(previous_id)
-                .into_iter()
-                .flat_map(|statement| statement.tokens.iter())
-                .filter_map(|token| {
-                    if !token.starts_with("literal:") {
-                        return None;
-                    }
-                    let start = token.find('"')? + 1;
-                    let rest = &token[start..];
-                    let end = rest.find('"')?;
-                    Some(&rest[..end])
-                })
-                .find(|module| local_external_modules.contains(module));
-        }
-        let Some(package) = package else {
-            continue;
-        };
-        if !local_external_modules.contains(package) {
-            continue;
-        }
-        node_status.insert(
-            node.id.clone(),
-            ("dependency-structurally-equal", "proven-structure", None),
-        );
-        dependency_evidence_by_node.insert(
-            node.id.clone(),
-            json!({
-                "basis": "cjs-interop-bootstrap",
-                "package": package,
-                "source": graph_node_value(&graph_node_ref(node)),
-            }),
-        );
-    }
-
+    // CJS wrappers require the same structural evidence as other executable
+    // nodes. Adjacency to an imported package cannot establish equivalence.
     // Dependency ownership is resolved before frontier work is emitted. A
     // frontier can be a false positive when a bundled dependency owner is
     // structurally covered by LOCAL; in that case the proof must suppress the
@@ -2386,7 +1632,35 @@ pub(crate) fn write_llm_context(
             &frontier.source_left.id,
             &frontier.source_right.id,
         );
-        let (priority, confidence) = frontier_triage(&evidence_path, priority, frontier.confidence);
+        let frontier_edge_kinds = frontier
+            .left_edge
+            .iter()
+            .chain(frontier.right_edge.iter())
+            .map(|edge| edge.kind.as_str())
+            .collect::<Vec<_>>();
+        let (action, priority, confidence, reason) =
+            if right_edge.target.kind == "External"
+                && right_edge.target.label == "module:<current>"
+            {
+                (
+                    "inspect-unresolved-upstream-graph-context",
+                    "P2",
+                    "unknown",
+                    "This frontier reaches the current-module export boundary, not an executable owner. Review the exported/imported contract against its owning symbols.",
+                )
+            } else {
+                let (priority, confidence) = frontier_triage(
+                    &frontier_edge_kinds,
+                    priority,
+                    frontier.confidence,
+                );
+                let (action, routed_reason) = frontier_work_action(
+                    action,
+                    &frontier_edge_kinds,
+                );
+                let reason = if routed_reason.is_empty() { reason } else { routed_reason };
+                (action, priority, confidence, reason)
+            };
         let id = push_work_item(
             &mut work_items,
             WorkItemDraft {
@@ -2552,7 +1826,7 @@ pub(crate) fn write_llm_context(
         let containing = containing_unit(node, &units_by_file);
         let _ = containing;
     }
-    let mut work_items = coalesce_work_items(work_items);
+    let mut work_items = coalesce_work_items(work_items, &shared_work_evidence)?;
     let mut routes = work_items
         .iter()
         .map(|item| {
@@ -2568,6 +1842,7 @@ pub(crate) fn write_llm_context(
             } else {
                 semantic_owner(
                     item,
+                    &shared_work_evidence,
                     &units_by_id,
                     &units_by_file,
                     &node_by_id,
@@ -2683,8 +1958,23 @@ pub(crate) fn write_llm_context(
             })
         })
         .collect::<Vec<_>>();
+    compact_work_evidence(output, &mut work_items, shared_work_evidence)?;
     write_json_lines(&output.join("llm-work-items.jsonl"), &work_items)?;
     write_json_lines(&output.join("llm-batches.jsonl"), &batches)?;
+    // Publication is sequential. Once the indexed queue is on disk, the
+    // semantic ledgers only need its counts and per-node routing maps, not
+    // every expanded evidence payload. Release those payloads before decoding
+    // the lossless graph stream; large bundles otherwise retain both phases.
+    let work_item_count = work_items.len();
+    let batch_count = batches.len();
+    let mut actions = BTreeMap::<String, usize>::new();
+    for item in &work_items {
+        if let Some(action) = item["action"].as_str() {
+            *actions.entry(action.to_string()).or_default() += 1;
+        }
+    }
+    drop(work_items);
+    drop(batches);
     let executable_records = right_nodes.iter().map(|node| {
         let (status, confidence, work_item_id) = node_status
             .get(&node.id)
@@ -2698,6 +1988,7 @@ pub(crate) fn write_llm_context(
             "upstream": graph_node_ref(node),
             "containingUnitId": containing.map(|unit| unit.id.as_str()),
             "dependencyEvidence": dependency_evidence_by_node.get(&node.id),
+            "dependencyCandidateEvidence": dependency_candidates_by_node.get(&node.id),
         }))
     });
     write_streaming_json_lines_fallible(
@@ -2736,6 +2027,7 @@ pub(crate) fn write_llm_context(
         };
         Ok(json!({
             "id": node.id,
+            "dependencyCandidateEvidence": dependency_candidates_by_node.get(&node.id),
             "disposition": status,
             "confidence": confidence,
             "workItemId": work_item_id,
@@ -2758,7 +2050,7 @@ pub(crate) fn write_llm_context(
     let streamed_edges = lossless_graph_records(right, "edge")?.map(|record| {
         let record = record?;
         let edge: super::GraphEdge = serde_json::from_value(record["edge"].clone())?;
-        let (status, confidence, work_item_id) = if let Some(status) = node_status.get(&edge.source)
+        let (status, confidence, work_item_id) = if let Some(status) = node_status.get(edge.source.as_str())
         {
             status.clone()
         } else if let Some(source) = node_by_id.get(edge.source.as_str()) {
@@ -2822,7 +2114,7 @@ pub(crate) fn write_llm_context(
                 )
             })
             .map(|edge| {
-                let (status, confidence, work_item_id) = if let Some(status) = node_status.get(&edge.source) {
+                let (status, confidence, work_item_id) = if let Some(status) = node_status.get(edge.source.as_str()) {
                     status.clone()
                 } else {
                     ("unresolved-graph-context", "unknown", None)
@@ -2849,32 +2141,20 @@ pub(crate) fn write_llm_context(
         edge_records,
     )?;
 
-    let mut actions = BTreeMap::<String, usize>::new();
-    for item in &work_items {
-        if let Some(action) = item["action"].as_str() {
-            *actions.entry(action.to_string()).or_default() += 1;
-        }
-    }
     let summary = LlmSummary {
         upstream_executable_nodes: right_nodes.len(),
         upstream_semantic_nodes,
         covered_nodes,
-        // When the heavy dependency AST is intentionally kept out of the
-        // primary matching lifetime, retain a conservative non-zero coverage
-        // signal from the dependency file inventory rather than claiming the
-        // evidence corpus disappeared.
-        dependency_covered_nodes: if dependency_evidence_by_node.is_empty() {
-            dependencies.map_or(0, |index| index.files.len())
-        } else {
-            dependency_evidence_by_node.len()
-        },
+        // File inventory is already exposed separately. Neither available
+        // packages nor graph-only hints count as covered executable nodes.
+        dependency_covered_nodes: dependency_evidence_by_node.len(),
         dependency_files: dependencies.map_or(0, |index| index.files.len()),
         dependency_graph_nodes: dependencies.map_or(0, |index| index.graph_nodes.len()),
         dependency_graph_retained: dependencies.is_some_and(|index| !index.graph_nodes.is_empty()),
         dependency_parse_failures: dependencies.map_or(0, |index| index.failures.len()),
         actionable_nodes,
-        work_items: work_items.len(),
-        batches: batches.len(),
+        work_items: work_item_count,
+        batches: batch_count,
         parse_failures: left.failures.len() + right.failures.len(),
         dispositions,
         actions,
@@ -2896,6 +2176,7 @@ pub(crate) fn write_llm_context(
             "report": "report.json",
             "visualReport": "report.html",
             "workItems": "llm-work-items.jsonl",
+            "sharedWorkEvidence": "llm-shared-evidence.jsonl",
             "batches": "llm-batches.jsonl",
             "upstreamExecutableLedger": "upstream-executable-ledger.jsonl",
             "upstreamSemanticLedger": "upstream-semantic-ledger.jsonl.zst",
@@ -2925,6 +2206,7 @@ pub(crate) fn write_llm_context(
         })),
         "workItemContract": {
             "schema": "project-parity/llm-work-item-v2",
+            "storage": "Large repeated upstream candidate arrays are interned in llm-shared-evidence.jsonl by SHA256. upstreamEvidenceRef replaces the stored upstream field. inspectNodeIdsFromOwners elides the inspect list only when it exactly equals local IDs followed by upstream IDs. show-work/show-works/show-batch/inspect expand losslessly; state-sync compares expanded canonical payloads so changing storage does not reopen reviewed evidence. Missing or corrupt shared evidence fails closed.",
             "routing": "Start with llm-batches.jsonl. Each row is one semantic owner, not an emitted bundle. Use project-parity show-batch <REPORT_DIRECTORY> <BATCH_ID> [LIMIT] [OFFSET] to load a bounded page, then inspect its node ids.",
             "inspect": "For each inspectNodeIds entry, run project-parity inspect <REPORT_DIRECTORY> <NODE_ID>. The inspector validates source and source-map hashes before returning the full source span and relations.",
             "acceptance": [
@@ -2967,6 +2249,8 @@ Use `llm-manifest.json` as the entry point and `llm-batches.jsonl` as the routin
 
 Process P0, then P1, then P2. Exact installed-dependency matches are retained in the ledger as `dependency-structurally-equal` with package/source evidence and do not pollute the action queue. For each item, inspect every listed node with `project-parity inspect <REPORT_DIRECTORY> <NODE_ID>`, read the complete upstream and local owners plus their callers/dependencies, and determine whether the local project must be changed. Scores and graph propagation are locator evidence, never permission to copy blindly or claim parity.
 
+`inspect-unverified-missing-branch` and `inspect-unverified-changed-branch` have no behavioral-edge corroboration in the graph. They can still represent a real behavior difference (for example, changed return values also use `Contains` edges), so inspect the complete owner and decide from its semantics before editing.
+
 Edit only local sources. Treat the upstream input as read-only. After each coherent patch, run focused tests and the relevant runtime or rendered-output validation, regenerate the matcher report, and confirm that the work item disappears or moves to a justified covered disposition. A source/AST match alone does not close behavioral, native, asset, or pixel parity.
 "#,
     )?;
@@ -2975,100 +2259,318 @@ Edit only local sources. Treat the upstream input as read-only. After each coher
 
 #[cfg(test)]
 mod tests {
-    use super::{coalesce_work_items, frontier_triage, unlinked_upstream_triage, work_item_id};
+    use super::{
+        candidate_owner_triage, coalesce_work_items,
+        compact_work_evidence, expand_work_evidence, frontier_triage, frontier_work_action,
+        read_shared_work_evidence, same_file_identity, unlinked_upstream_triage, work_item_id,
+        write_json_lines,
+    };
+    use crate::{FileRecord, Location, MatchRecord};
     use serde_json::json;
 
+    fn file_record(file: &str, source_sha256: &str, source_map_sha256: Option<&str>) -> FileRecord {
+        FileRecord {
+            file: file.to_string(),
+            bytes: 0,
+            source_sha256: source_sha256.to_string(),
+            source_map_sha256: source_map_sha256.map(str::to_string),
+            source_map_error: None,
+            units: 0,
+        }
+    }
+
+    fn test_location(id: &str) -> Location {
+        Location {
+            id: id.to_string(),
+            file: "fixture.ts".to_string(),
+            kind: "Function".to_string(),
+            name: None,
+            line: 1,
+            start: 0,
+            end: 1,
+            origin: None,
+        }
+    }
+
     #[test]
-    fn global_behavior_frontiers_are_retained_but_deprioritized() {
-        let global = vec![json!({"basis":"global-behavior","depth":0})];
+    fn file_identity_requires_matching_path_and_source_evidence() {
+        let canonical = file_record("src/runtime.ts", "source-a", Some("map-a"));
+        assert!(same_file_identity(
+            &canonical,
+            &file_record("src/runtime.ts", "source-a", Some("map-a"))
+        ));
+
+        // Similar names or contents in different roots are only locators. They
+        // need normal unit/graph evidence before the report can cover them.
+        assert!(!same_file_identity(
+            &canonical,
+            &file_record("apps/runtime.ts", "source-a", Some("map-a"))
+        ));
+        assert!(!same_file_identity(
+            &canonical,
+            &file_record("src/runtime.ts", "source-b", Some("map-a"))
+        ));
+        assert!(!same_file_identity(
+            &canonical,
+            &file_record("src/runtime.ts", "source-a", Some("map-b"))
+        ));
+    }
+
+    #[test]
+    fn candidate_triage_requires_more_than_fingerprint_or_feature_ranking() {
+        for score in [0.72, 0.9999] {
+            let fuzzy_pair = MatchRecord {
+                confidence: "candidate",
+                status: "changed-candidate",
+                basis: "mutual-best-fuzzy",
+                score,
+                channels: None,
+                left: test_location("left:fuzzy"),
+                right: test_location("right:fuzzy"),
+            };
+            assert_eq!(
+                candidate_owner_triage(&fuzzy_pair),
+                ("P2", "weak-candidate")
+            );
+        }
+
+        let exact_dependency_change = MatchRecord {
+            confidence: "candidate",
+            status: "dependency-context-changed",
+            basis: "strict-dependency-context",
+            score: 1.0,
+            channels: None,
+            left: test_location("left:dependency"),
+            right: test_location("right:dependency"),
+        };
         assert_eq!(
-            frontier_triage(&global, "P0", "candidate"),
-            ("P2", "weak-candidate")
+            candidate_owner_triage(&exact_dependency_change),
+            ("P1", "candidate")
         );
 
-        let owner_anchored = vec![json!({"basis":"seed-unit","depth":0})];
         assert_eq!(
-            frontier_triage(&owner_anchored, "P0", "candidate"),
-            ("P0", "candidate")
-        );
-
-        let corroborated = vec![
-            json!({"basis":"global-behavior","depth":0}),
-            json!({"basis":"neighbor-structural-exact","depth":1,"viaEdge":"Contains"}),
-        ];
-        assert_eq!(
-            frontier_triage(&corroborated, "P0", "candidate"),
-            ("P2", "weak-candidate")
-        );
-
-        let incoming_structural_only = vec![
-            json!({"basis":"global-behavior","depth":0}),
-            json!({"basis":"neighbor-fuzzy","depth":1,"viaEdge":"Incoming:Contains"}),
-            json!({"basis":"neighbor-structural-exact","depth":2,"viaEdge":"Incoming:NextStatement"}),
-        ];
-        assert_eq!(
-            frontier_triage(&incoming_structural_only, "P1", "candidate"),
-            ("P2", "weak-candidate")
-        );
-
-        let edge_corroborated = vec![
-            json!({"basis":"global-behavior","depth":0}),
-            json!({"basis":"neighbor-structural-exact","depth":1,"viaEdge":"Outgoing:Calls"}),
-        ];
-        assert_eq!(
-            frontier_triage(&edge_corroborated, "P0", "candidate"),
-            ("P0", "candidate")
-        );
-
-        // This mirrors a real false-positive shape seen in the Screen Studio
-        // queue: a candidate owner pair propagated through fuzzy/normalized
-        // statement and scope neighbors, but had no Calls/References/etc. route.
-        // Keep it reviewable without presenting it ahead of corroborated gaps.
-        let candidate_neighbor_route = vec![
-            json!({"basis":"neighbor-fuzzy","depth":4,"viaEdge":"Contains"}),
-            json!({"basis":"neighbor-normalized","depth":1,"viaEdge":"Incoming:NextStatement"}),
-            json!({"basis":"seed-unit","depth":0}),
-        ];
-        assert_eq!(
-            frontier_triage(&candidate_neighbor_route, "P0", "candidate"),
-            ("P2", "weak-candidate")
-        );
-
-        // Regression from Screen Studio 4.0.1-4669: an ownerless bundle
-        // `External` route reached an otherwise equivalent local helper via
-        // a `Defines` binding edge. `Defines` locates a binding; it is not
-        // behavioral corroboration and must not preserve a false P0.
-        let candidate_with_defines_only = vec![
-            json!({"basis":"neighbor-fuzzy","depth":4,"viaEdge":"Contains"}),
-            json!({"basis":"neighbor-normalized","depth":1,"viaEdge":"Incoming:NextStatement"}),
-            json!({"basis":"neighbor-normalized","depth":2,"viaEdge":"Incoming:Defines"}),
-            json!({"basis":"seed-unit","depth":0}),
-        ];
-        assert_eq!(
-            frontier_triage(&candidate_with_defines_only, "P0", "candidate"),
-            ("P2", "weak-candidate")
-        );
-
-        // A nearby genuine divergence with the same candidate confidence stays
-        // urgent when the owner chain has a semantic call edge.
-        let semantic_owner_route = vec![
-            json!({"basis":"neighbor-normalized","depth":1,"viaEdge":"Outgoing:Calls"}),
-            json!({"basis":"seed-unit","depth":0}),
-        ];
-        assert_eq!(
-            frontier_triage(&semantic_owner_route, "P0", "candidate"),
-            ("P0", "candidate")
+            frontier_triage(&["Calls"], "P1", "candidate"),
+            ("P1", "candidate")
         );
     }
 
     #[test]
-    fn unlinked_upstream_work_is_unknown_late_review_not_a_p0_defect() {
-        assert_eq!(unlinked_upstream_triage(), ("P2", "unknown"));
+    fn early_candidate_interning_preserves_owner_routes_and_coalesced_variants() {
+        use super::{intern_work_evidence, semantic_owner};
+        use std::collections::HashMap;
+        let upstream = (0..200).map(|i| json!({"id":format!("right:{i}"),"file":"chunk.js","line":i})).collect::<Vec<_>>();
+        let mut original = (0..20).map(|i| json!({
+            "id":format!("work:{i}"),"action":"resolve-ambiguous-owners","priority":"P1","confidence":"candidate",
+            "reason":"ambiguous owner","local":[{"id":format!("left:{i}"),"file":"local.ts"}],"upstream":upstream,
+            "evidencePath":[],"inspectNodeIds":std::iter::once(format!("left:{i}")).chain((0..200).map(|n|format!("right:{n}"))).collect::<Vec<_>>()
+        })).collect::<Vec<_>>();
+        let mut variant = original[0].clone();
+        variant["evidencePath"] = json!([{"viaEdge":"Calls"}]);
+        original.push(variant);
+        let expected = coalesce_work_items(original.clone(), &HashMap::new()).unwrap();
+        let mut compact = original.clone();
+        let mut shared = HashMap::new();
+        for (item, source) in compact.iter_mut().zip(&original) {
+            intern_work_evidence(item, &mut shared).unwrap();
+            assert!(item.get("upstream").is_none());
+            assert_eq!(semantic_owner(item, &shared, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()),
+                semantic_owner(source, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()));
+        }
+        assert_eq!(shared.len(), 1);
+        assert!(serde_json::to_vec(&compact).unwrap().len() < serde_json::to_vec(&original).unwrap().len() / 10);
+        let mut merged = coalesce_work_items(compact, &shared).unwrap();
+        let output = tempfile::tempdir().unwrap();
+        compact_work_evidence(output.path(), &mut merged, shared).unwrap();
+        let shared = read_shared_work_evidence(output.path()).unwrap();
+        let expanded = merged.into_iter().map(|item| expand_work_evidence(item, &shared).unwrap()).collect::<Vec<_>>();
+        assert_eq!(expanded, expected);
+    }
 
-        // A concrete owner-anchored branch divergence remains urgent.
+    #[test]
+    fn interval_owner_lookup_matches_exhaustive_id_ordered_ranges() {
+        use super::{containing_unit, UnitIntervals};
+        use crate::{semantic_graph::GraphNode, Unit};
+        use std::collections::HashMap;
+        let mut seed = 73u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (seed >> 32) as u32
+        };
+        for count in [0, 1, 3, 10, 100, 1000] {
+            let ranges = (0..count).map(|_| {
+                let start = next() % 300;
+                (start, start + next() % 200)
+            }).chain([(10,20), (100,110), (0,90), (0,90)]).collect::<Vec<_>>();
+            let units = ranges.into_iter().enumerate().map(|(i,(start,end))| Unit {
+                id: i.to_string(), file: "fixture.js".into(), kind: "Function".into(),
+                name: None, start, end, line: 1, origin: None, nodes_approx: 0,
+                strict_sha256: String::new(), linked_sha256: String::new(),
+                tokens: Default::default(), features: Default::default(),
+            }).collect::<Vec<_>>();
+            let index = HashMap::from([("fixture.js", UnitIntervals::new(units.iter().collect()))]);
+            let mut node = GraphNode {
+                id: String::new(), file: "fixture.js".into(), kind: "Statement".into(),
+                label: String::new(), start: 0, end: 0, line: 1, scope: None,
+                linked_sha256: String::new(), tokens: Default::default(),
+            };
+            // Includes zero-width boundary nodes, overlap and identical-range ties.
+            for _ in 0..10000 {
+                node.start = next() % 500;
+                node.end = node.start + next() % 100;
+                let expected = units.iter().rev()
+                    .filter(|u| u.start <= node.start && u.end >= node.end)
+                    .min_by_key(|u| u.end - u.start);
+                assert_eq!(containing_unit(&node, &index).map(|u| &u.id), expected.map(|u| &u.id));
+            }
+            node.file = "absent.js".into();
+            assert!(containing_unit(&node, &index).is_none());
+            assert!(UnitIntervals::new(vec![]).containing(&node).is_none());
+        }
+    }
+
+    #[test]
+    fn shared_candidate_storage_round_trips_complete_evidence_and_reviewed_decisions() {
+        let output = tempfile::tempdir().unwrap();
+        let upstream = (0..80)
+            .map(|i| json!({"id":format!("right:{i}"),"file":"chunk.js","line":i}))
+            .collect::<Vec<_>>();
+        let original = (0..3).map(|i| json!({
+            "id":format!("work:{i}"), "action":"resolve-ambiguous-owners", "priority":"P1", "confidence":"candidate",
+            "upstream":upstream, "local":[{"id":format!("left:{i}")}], "inspectNodeIds":std::iter::once(format!("left:{i}")).chain((0..80).map(|n| format!("right:{n}"))).collect::<Vec<_>>(), "batchId":"batch:shared"
+        })).collect::<Vec<_>>();
+        write_json_lines(&output.path().join("llm-work-items.jsonl"), &original).unwrap();
+        write_json_lines(
+            &output.path().join("llm-batches.jsonl"),
+            &[json!({"id":"batch:shared","workItemCount":3})],
+        )
+        .unwrap();
+        std::fs::write(
+            output.path().join("llm-manifest.json"),
+            serde_json::to_vec(&json!({"engine":crate::ENGINE_VERSION,"inputHashes":{}})).unwrap(),
+        )
+        .unwrap();
+        let db = output.path().join("state.sqlite");
+        crate::state::sync(&db, output.path()).unwrap();
+        crate::state::mark_pending_sync(&db, "work:0", "reviewed unchanged evidence").unwrap();
+
+        let mut compact = original.clone();
+        compact_work_evidence(output.path(), &mut compact, std::collections::HashMap::new()).unwrap();
+        write_json_lines(&output.path().join("llm-work-items.jsonl"), &compact).unwrap();
+        let shared = read_shared_work_evidence(output.path()).unwrap();
+        assert_eq!(shared.len(), 1);
+        assert!(
+            std::fs::metadata(output.path().join("llm-work-items.jsonl"))
+                .unwrap()
+                .len()
+                < 2000
+        );
+        for (item, expected) in compact.iter().zip(&original) {
+            assert_eq!(
+                expand_work_evidence(item.clone(), &shared).unwrap(),
+                *expected
+            );
+            assert_eq!(
+                crate::show_work(output.path(), expected["id"].as_str().unwrap()).unwrap(),
+                *expected
+            );
+        }
         assert_eq!(
-            frontier_triage(&[json!({"basis":"seed-unit","depth":0})], "P0", "candidate"),
+            crate::show_works(output.path(), &["work:2".into(), "work:0".into()]).unwrap()["items"],
+            json!([original[2], original[0]])
+        );
+        assert_eq!(
+            crate::show_batch(output.path(), "batch:shared", 3, 0).unwrap()["items"],
+            json!(original)
+        );
+        assert_eq!(
+            crate::read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap(),
+            original
+        );
+        let result = crate::state::sync(&db, output.path()).unwrap();
+        assert_eq!(result["reopened"], 0);
+        assert_eq!(result["pendingReleased"], 1);
+
+        // Removing referenced evidence must fail without publishing a new run.
+        std::fs::remove_file(output.path().join("llm-shared-evidence.jsonl")).unwrap();
+        assert!(crate::state::sync(&db, output.path()).is_err());
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM runs", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM work_item_decisions WHERE work_item_id='work:0'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "done"
+        );
+    }
+
+    #[test]
+    fn shared_evidence_rejects_corruption_and_ambiguous_inline_override() {
+        let output = tempfile::tempdir().unwrap();
+        std::fs::write(
+            output.path().join("llm-shared-evidence.jsonl"),
+            "{\"id\":\"bad\",\"upstream\":[]}\n",
+        )
+        .unwrap();
+        assert!(read_shared_work_evidence(output.path()).is_err());
+        assert!(expand_work_evidence(
+            json!({"upstreamEvidenceRef":"missing"}),
+            &std::collections::HashMap::new()
+        )
+        .is_err());
+        let shared = std::collections::HashMap::from([("valid".into(), json!([]))]);
+        assert!(expand_work_evidence(
+            json!({"upstreamEvidenceRef":"valid","upstream":[]}),
+            &shared
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn structural_frontiers_require_behavior_on_the_divergent_edge() {
+        assert_eq!(unlinked_upstream_triage(), ("P2", "unknown"));
+        assert_eq!(frontier_triage(&[], "P0", "candidate"), ("P2", "weak-candidate"));
+        assert_eq!(frontier_triage(&["Contains"], "P0", "candidate"), ("P2", "weak-candidate"));
+        assert_eq!(frontier_triage(&["NextStatement"], "P0", "candidate"), ("P2", "weak-candidate"));
+        assert_eq!(frontier_triage(&["References"], "P0", "candidate"), ("P2", "weak-candidate"));
+        assert_eq!(
+            frontier_work_action("port-missing-upstream-branch", &["References"]),
+            (
+                "inspect-unverified-missing-branch",
+                "The frontier has no behavioral-edge corroboration; inspect its semantics before proposing a code change."
+            )
+        );
+        assert_eq!(
+            frontier_triage(&["Calls"], "P0", "candidate"),
             ("P0", "candidate")
+        );
+        assert_eq!(frontier_work_action("port-missing-upstream-branch", &["Calls"]), ("port-missing-upstream-branch", ""));
+        assert_eq!(
+            frontier_work_action("port-missing-upstream-branch", &["Contains"]),
+            (
+                "inspect-unverified-missing-branch",
+                "The frontier has no behavioral-edge corroboration; inspect its semantics before proposing a code change."
+            )
+        );
+        assert_eq!(
+            frontier_work_action("port-missing-upstream-branch", &[]),
+            (
+                "inspect-unverified-missing-branch",
+                "The frontier has no behavioral-edge corroboration; inspect its semantics before proposing a code change."
+            )
+        );
+        assert_eq!(
+            frontier_work_action("reconcile-changed-branch", &["Incoming:Defines"]),
+            (
+                "inspect-unverified-changed-branch",
+                "The frontier has no behavioral-edge corroboration; inspect its semantics before proposing a code change."
+            )
         );
     }
 
@@ -3113,6 +2615,34 @@ mod tests {
         );
         assert_eq!(frontier_a, frontier_b);
 
+        let structural_frontier = work_item_id(
+            "inspect-weak-missing-branch",
+            vec![
+                "left:owner".to_string(),
+                "right:owner".to_string(),
+                "right:edge-a".to_string(),
+            ],
+        );
+        assert_eq!(structural_frontier, frontier_a);
+
+        let structural_change = work_item_id(
+            "inspect-weak-changed-branch",
+            vec![
+                "left:owner".to_string(),
+                "right:owner".to_string(),
+                "right:edge-a".to_string(),
+            ],
+        );
+        let changed_branch = work_item_id(
+            "reconcile-changed-branch",
+            vec![
+                "left:owner".to_string(),
+                "right:owner".to_string(),
+                "right:edge-a".to_string(),
+            ],
+        );
+        assert_eq!(structural_change, changed_branch);
+
         let local_a = work_item_id(
             "remove-or-justify-extra-local",
             vec!["left:owner".to_string(), "right:candidate-a".to_string()],
@@ -3144,7 +2674,7 @@ mod tests {
             make_item("work-other", "right:edge-c"),
             make_item("work-owner", "right:edge-b"),
             make_item("work-owner", "right:edge-a"),
-        ]);
+        ], &std::collections::HashMap::new()).unwrap();
 
         assert_eq!(merged.len(), 2);
         let owner = merged
