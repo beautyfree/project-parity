@@ -2171,6 +2171,23 @@ pub(crate) fn write_llm_context(
             "upstream": right.project_sha256,
             "dependencies": dependencies.map(|index| index.project_sha256.as_str()),
         },
+        "inputFingerprints": {
+            "local": {
+                "sha256": left.input_fingerprint,
+                "inputFiles": left.input_files,
+            },
+            "upstream": {
+                "sha256": right.input_fingerprint,
+                "inputFiles": right.input_files,
+            },
+            "dependencies": dependencies.map(|index| json!({
+                "root": index.root,
+                "sha256": index.input_fingerprint,
+                "packageRoots": index.input_roots,
+                "inputFiles": index.input_files,
+                "resolutionQueries": index.dependency_queries,
+            })),
+        },
         "summary": summary,
         "artifacts": {
             "report": "report.json",
@@ -2231,6 +2248,7 @@ pub(crate) fn write_llm_context(
             "root": index.root,
             "corpus": index.corpus,
             "projectSha256": index.project_sha256,
+            "inputRoots": index.input_roots,
             "files": index.files,
             "failures": index.failures,
             "skipped": index.skipped,

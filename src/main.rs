@@ -45,7 +45,7 @@ mod visualize;
 use semantic_graph::{share_graph_edge_ids, GraphEdge, GraphNode, SemanticGraph};
 
 const CODE_EXTENSIONS: &[&str] = &["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"];
-const ENGINE_VERSION: &str = "rust-oxc-0.126.0/v72";
+const ENGINE_VERSION: &str = "rust-oxc-0.126.0/v73";
 // Graph extraction is cache material: change this whenever semantic nodes or
 // edges change, otherwise an old cache silently erases newly added ownership
 // links from a report.
@@ -82,6 +82,24 @@ struct Discovery {
     files: Vec<(PathBuf, String)>,
     skipped: Vec<String>,
     corpus: CorpusSelection,
+    input_roots: Vec<DependencyInputRoot>,
+    dependency_queries: Vec<DependencyResolutionQuery>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DependencyInputRoot {
+    pub(crate) package_root: PathBuf,
+    pub(crate) resolution_paths: Vec<PathBuf>,
+    pub(crate) name: String,
+    pub(crate) version: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DependencyResolutionQuery {
+    pub(crate) from: PathBuf,
+    pub(crate) name: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -183,6 +201,14 @@ struct ProjectIndex {
     root: String,
     corpus: CorpusSelection,
     project_sha256: String,
+    #[serde(skip_serializing)]
+    input_fingerprint: String,
+    #[serde(skip_serializing)]
+    input_roots: Vec<DependencyInputRoot>,
+    #[serde(skip_serializing)]
+    dependency_queries: Vec<DependencyResolutionQuery>,
+    #[serde(skip_serializing)]
+    input_files: Vec<(PathBuf, String)>,
     files: Vec<FileRecord>,
     #[serde(skip_serializing)]
     units: Vec<Unit>,
@@ -1288,6 +1314,8 @@ fn discover(input: &Path) -> Result<Discovery> {
         files,
         skipped,
         corpus,
+        input_roots: Vec::new(),
+        dependency_queries: Vec::new(),
     })
 }
 
@@ -1449,6 +1477,14 @@ fn nearest_tsconfig(importer: &Path, project_root: &Path) -> Option<PathBuf> {
 }
 
 fn resolve_installed_package(from: &Path, project_root: &Path, name: &str) -> Option<PathBuf> {
+    resolve_installed_package_with_path(from, project_root, name).map(|(resolved, _)| resolved)
+}
+
+fn resolve_installed_package_with_path(
+    from: &Path,
+    project_root: &Path,
+    name: &str,
+) -> Option<(PathBuf, PathBuf)> {
     let mut cursor = Some(from);
     while let Some(directory) = cursor {
         // Node package self-reference: a package may import its own public
@@ -1458,11 +1494,14 @@ fn resolve_installed_package(from: &Path, project_root: &Path, name: &str) -> Op
             .as_deref()
             == Some(name)
         {
-            return directory.canonicalize().ok();
+            return directory
+                .canonicalize()
+                .ok()
+                .map(|resolved| (resolved, directory.to_path_buf()));
         }
         let candidate = directory.join("node_modules").join(name);
         if let Ok(resolved) = candidate.canonicalize() {
-            return Some(resolved);
+            return Some((resolved, candidate));
         }
         if directory == project_root {
             break;
@@ -2612,6 +2651,132 @@ fn units_have_equivalent_dependency_context(
     )
 }
 
+fn discover_dependency_package_files(
+    package_root: &Path,
+    input_root: &DependencyInputRoot,
+) -> Result<(Vec<(PathBuf, String)>, Vec<String>)> {
+    let package_key = format!(
+        "{}@{}-{}",
+        input_root.name,
+        input_root.version,
+        &sha256(package_root.to_string_lossy().as_bytes())[..10]
+    );
+    let selected_root = ["dist", "lib", "cjs", "esm", "build"]
+        .into_iter()
+        .map(|relative| package_root.join(relative))
+        .find(|candidate| {
+            candidate.is_dir() && WalkDir::new(candidate).follow_links(false).into_iter()
+                .filter_map(|entry| entry.ok())
+                .any(|entry| entry.file_type().is_file()
+                    && !entry.file_name().to_string_lossy().ends_with(".d.ts")
+                    && entry.path().extension().and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| CODE_EXTENSIONS.contains(&ext))
+                    && !is_conventionally_filtered_source(
+                        &entry.path()
+                            .strip_prefix(package_root)
+                            .unwrap_or(entry.path())
+                            .to_string_lossy(),
+                    )
+                    && !is_dependency_readme_documentation(entry.path()))
+        })
+        .unwrap_or_else(|| package_root.to_path_buf());
+    // Generated/native output directories must not hide declared package entrypoints.
+    // A manifest is executable intent, so it overrides the source-oracle
+    // filename convention even when the entry lives in the selected root.
+    let declared_entries = read_package_manifest(&package_root.join("package.json"))
+        .map(|manifest| manifest_declared_runtime_entries(package_root, &manifest))
+        .unwrap_or_default();
+    let mut package_files = Vec::new();
+    let mut filtered = Vec::new();
+    let mut skipped = Vec::new();
+    for entry in &declared_entries {
+        let Ok(relative) = entry.strip_prefix(package_root) else { continue };
+        package_files.push((entry.clone(), format!("npm/{package_key}//{}", relative.display())));
+    }
+    for entry in WalkDir::new(&selected_root)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            let skip = entry.file_type().is_dir()
+                && entry.path() != selected_root
+                && matches!(
+                    entry.file_name().to_string_lossy().as_ref(),
+                    ".git"
+                        | ".history"
+                        | "bin"
+                        | "coverage"
+                        | "docs"
+                        | "examples"
+                        | "node_modules"
+                        | "test"
+                        | "tests"
+                );
+            if skip {
+                skipped.push(format!(
+                    "npm/{}/{}",
+                    package_key,
+                    entry
+                        .path()
+                        .strip_prefix(&selected_root)
+                        .unwrap_or(entry.path())
+                        .display()
+                ));
+            }
+            !skip
+        })
+    {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".d.ts"))
+        {
+            continue;
+        }
+        let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+            continue;
+        };
+        if !CODE_EXTENSIONS.contains(&extension) {
+            continue;
+        }
+        // Declared entries were injected above with their package-root
+        // locator, which is the one authenticated against PackageEntry.
+        // Do not add a second selected-root locator for the same file.
+        if declared_entries.contains(path) || is_dependency_readme_documentation(path) {
+            continue;
+        }
+        let package_relative = path.strip_prefix(&selected_root).unwrap_or(path);
+        let locator = format!(
+            "npm/{package_key}/{}/{}",
+            selected_root
+                .strip_prefix(package_root)
+                .unwrap_or(&selected_root)
+                .display(),
+            package_relative.display()
+        );
+        if is_conventionally_filtered_source(&package_relative.to_string_lossy()) {
+            filtered.push((path.to_path_buf(), locator));
+            continue;
+        }
+        package_files.push((path.to_path_buf(), locator));
+    }
+    let mut candidates = dependency_reachable_source_candidates(package_root, &package_key);
+    // Preserve the selected-root locator for its conventionally filtered
+    // files; candidates outside that root use the package-root locator.
+    candidates.extend(filtered);
+    rescue_reachable_source_candidates(package_root, &mut package_files, candidates);
+    package_files.sort_by(|left, right| left.1.cmp(&right.1));
+    package_files.dedup_by(|left, right| left.1 == right.1);
+    skipped.sort();
+    skipped.dedup();
+    Ok((package_files, skipped))
+}
+
 fn discover_dependencies(
     input: &Path,
     observed: Option<&ProjectIndex>,
@@ -2632,7 +2797,8 @@ fn discover_dependencies(
         }
     }
 
-    let mut queue = VecDeque::<(PathBuf, String)>::new();
+    let mut queue = VecDeque::<(PathBuf, String, PathBuf)>::new();
+    let mut dependency_queries = Vec::<DependencyResolutionQuery>::new();
     // The application import graph is the authoritative runtime boundary.
     // Scanning every manifest dependency first drags in dev/build tooling and
     // can materialize hundreds of thousands of irrelevant AST nodes.  Use the
@@ -2646,11 +2812,17 @@ fn discover_dependencies(
                 continue;
             };
             for name in manifest_dependency_names(&manifest) {
-                if let Some(package_root) = resolve_installed_package(parent, &root, &name) {
+                dependency_queries.push(DependencyResolutionQuery {
+                    from: parent.to_path_buf(),
+                    name: name.clone(),
+                });
+                if let Some((package_root, resolution_path)) =
+                    resolve_installed_package_with_path(parent, &root, &name)
+                {
                     if package_root.to_string_lossy().contains("/node_modules/")
                         || package_root.to_string_lossy().contains("/.pnpm/")
                     {
-                        queue.push_back((package_root, name));
+                        queue.push_back((package_root, name, resolution_path));
                     }
                 }
             }
@@ -2693,17 +2865,28 @@ fn discover_dependencies(
                 continue;
             };
             let importer = root.join(&module.file);
-            if let Some(package_root) =
-                resolve_installed_package(importer.parent().unwrap_or(&root), &root, package_name)
+            let from = importer.parent().unwrap_or(&root).to_path_buf();
+            dependency_queries.push(DependencyResolutionQuery {
+                from: from.clone(),
+                name: package_name.to_string(),
+            });
+            if let Some((package_root, resolution_path)) = resolve_installed_package_with_path(
+                &from,
+                &root,
+                package_name,
+            )
             {
-                queue.push_back((package_root, package_name.to_string()));
+                queue.push_back((package_root, package_name.to_string(), resolution_path));
             }
         }
     }
 
-    let mut packages = BTreeMap::<PathBuf, (String, String)>::new();
-    while let Some((package_root, requested_name)) = queue.pop_front() {
-        if packages.contains_key(&package_root) {
+    let mut packages = BTreeMap::<PathBuf, DependencyInputRoot>::new();
+    while let Some((package_root, requested_name, resolution_path)) = queue.pop_front() {
+        if let Some(package) = packages.get_mut(&package_root) {
+            package.resolution_paths.push(resolution_path);
+            package.resolution_paths.sort();
+            package.resolution_paths.dedup();
             continue;
         }
         let Some(manifest) = read_package_manifest(&package_root.join("package.json")) else {
@@ -2714,12 +2897,24 @@ fn discover_dependencies(
             .version
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
-        packages.insert(package_root.clone(), (name, version));
+        packages.insert(
+            package_root.clone(),
+            DependencyInputRoot {
+                package_root: package_root.clone(),
+                resolution_paths: vec![resolution_path],
+                name,
+                version,
+            },
+        );
         for dependency in manifest_dependency_names(&manifest) {
-            if let Some(dependency_root) =
-                resolve_installed_package(&package_root, &root, &dependency)
+            dependency_queries.push(DependencyResolutionQuery {
+                from: package_root.clone(),
+                name: dependency.clone(),
+            });
+            if let Some((dependency_root, resolution_path)) =
+                resolve_installed_package_with_path(&package_root, &root, &dependency)
             {
-                queue.push_back((dependency_root, dependency.clone()));
+                queue.push_back((dependency_root, dependency.clone(), resolution_path));
             }
         }
     }
@@ -2729,128 +2924,20 @@ fn discover_dependencies(
 
     let mut files = Vec::new();
     let mut skipped = Vec::new();
-    for (package_root, (name, version)) in &packages {
-        let package_key = format!(
-            "{}@{}-{}",
-            name,
-            version,
-            &sha256(package_root.to_string_lossy().as_bytes())[..10]
-        );
-        let selected_root = ["dist", "lib", "cjs", "esm", "build"]
-            .into_iter()
-            .map(|relative| package_root.join(relative))
-            .find(|candidate| {
-                candidate.is_dir() && WalkDir::new(candidate).follow_links(false).into_iter()
-                    .filter_map(|entry| entry.ok())
-                    .any(|entry| entry.file_type().is_file()
-                        && !entry.file_name().to_string_lossy().ends_with(".d.ts")
-                        && entry.path().extension().and_then(|ext| ext.to_str())
-                            .is_some_and(|ext| CODE_EXTENSIONS.contains(&ext))
-                        && !is_conventionally_filtered_source(
-                            &entry.path()
-                                .strip_prefix(package_root)
-                                .unwrap_or(entry.path())
-                                .to_string_lossy(),
-                        )
-                        && !is_dependency_readme_documentation(entry.path()))
-            })
-            .unwrap_or_else(|| package_root.clone());
-        // Generated/native output directories must not hide declared package entrypoints.
-        // A manifest is executable intent, so it overrides the source-oracle
-        // filename convention even when the entry lives in the selected root.
-        let declared_entries = read_package_manifest(&package_root.join("package.json"))
-            .map(|manifest| manifest_declared_runtime_entries(package_root, &manifest))
-            .unwrap_or_default();
-        let mut package_files = Vec::new();
-        let mut filtered = Vec::new();
-        for entry in &declared_entries {
-            let Ok(relative) = entry.strip_prefix(package_root) else { continue };
-            package_files.push((entry.clone(), format!("npm/{package_key}//{}", relative.display())));
-        }
-        for entry in WalkDir::new(&selected_root)
-            .follow_links(false)
-            .sort_by_file_name()
-            .into_iter()
-            .filter_entry(|entry| {
-                let skip = entry.file_type().is_dir()
-                    && entry.path() != selected_root
-                    && matches!(
-                        entry.file_name().to_string_lossy().as_ref(),
-                        ".git"
-                            | ".history"
-                            | "bin"
-                            | "coverage"
-                            | "docs"
-                            | "examples"
-                            | "node_modules"
-                            | "test"
-                            | "tests"
-                    );
-                if skip {
-                    skipped.push(format!(
-                        "npm/{}/{}",
-                        package_key,
-                        entry
-                            .path()
-                            .strip_prefix(&selected_root)
-                            .unwrap_or(entry.path())
-                            .display()
-                    ));
-                }
-                !skip
-            })
-        {
-            let entry = entry?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".d.ts"))
-            {
-                continue;
-            }
-            let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
-                continue;
-            };
-            if !CODE_EXTENSIONS.contains(&extension) {
-                continue;
-            }
-            // Declared entries were injected above with their package-root
-            // locator, which is the one authenticated against PackageEntry.
-            // Do not add a second selected-root locator for the same file.
-            if declared_entries.contains(path) {
-                continue;
-            }
-            if is_dependency_readme_documentation(path) {
-                continue;
-            }
-            let package_relative = path.strip_prefix(&selected_root).unwrap_or(path);
-            let locator = format!(
-                "npm/{package_key}/{}/{}",
-                selected_root
-                    .strip_prefix(package_root)
-                    .unwrap_or(&selected_root)
-                    .display(),
-                package_relative.display()
-            );
-            if is_conventionally_filtered_source(&package_relative.to_string_lossy()) {
-                filtered.push((path.to_path_buf(), locator));
-                continue;
-            }
-            package_files.push((path.to_path_buf(), locator));
-        }
-        let mut candidates = dependency_reachable_source_candidates(package_root, &package_key);
-        // Preserve the selected-root locator for its conventionally filtered
-        // files; candidates outside that root use the package-root locator.
-        candidates.extend(filtered);
-        rescue_reachable_source_candidates(package_root, &mut package_files, candidates);
-        files.extend(package_files);
+    for (package_root, input_root) in &packages {
+        let (mut package_files, mut package_skipped) =
+            discover_dependency_package_files(package_root, input_root)?;
+        files.append(&mut package_files);
+        skipped.append(&mut package_skipped);
     }
     files.sort_by(|left, right| left.1.cmp(&right.1));
     files.dedup_by(|left, right| left.1 == right.1);
+    dependency_queries.sort_by(|left, right| {
+        left.from
+            .cmp(&right.from)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    dependency_queries.dedup_by(|left, right| left.from == right.from && left.name == right.name);
     skipped.sort();
     skipped.dedup();
     Ok(Some(Discovery {
@@ -2861,13 +2948,321 @@ fn discover_dependencies(
             mode: "installed-runtime-dependencies",
             roots: packages
                 .values()
-                .map(|(name, version)| format!("{name}@{version}"))
+                .map(|package| format!("{}@{}", package.name, package.version))
                 .collect(),
             excluded_derivative_roots: Vec::new(),
             source_root: None,
             projection_tool: None,
         },
+        input_roots: packages.into_values().collect(),
+        dependency_queries,
     }))
+}
+
+fn fingerprint_files(
+    files: &[(PathBuf, String)],
+    candidate_paths: &[String],
+    input_roots: &[DependencyInputRoot],
+    dependency_queries: &[DependencyResolutionQuery],
+    dependency_root: Option<&Path>,
+) -> String {
+    let mut records = Vec::with_capacity(
+        files.len() + input_roots.len() * 2 + dependency_queries.len(),
+    );
+    for (path, relative) in files {
+        let source_hash = sha256_file(path)
+            .unwrap_or_else(|_| "unreadable".to_string());
+        let map_path = adjacent_source_map_path(path);
+        let map_hash = if !map_path.exists() {
+            "absent".to_string()
+        } else {
+            sha256_file(&map_path)
+                .unwrap_or_else(|_| "unreadable".to_string())
+        };
+        records.push(format!("{relative}\0{source_hash}\0{map_hash}"));
+    }
+    for input_root in input_roots {
+        let package_key = format!(
+            "{}@{}-{}",
+            input_root.name,
+            input_root.version,
+            &sha256(input_root.package_root.to_string_lossy().as_bytes())[..10]
+        );
+        let manifest_hash = fs::read(input_root.package_root.join("package.json"))
+            .map(|bytes| sha256(&bytes))
+            .unwrap_or_else(|_| "unreadable".to_string());
+        records.push(format!("npm-manifest\0{package_key}\0{manifest_hash}"));
+        for resolution_path in &input_root.resolution_paths {
+            let target = resolution_path
+                .canonicalize()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| "unresolved".to_string());
+            records.push(format!(
+                "npm-resolution\0{}\0{target}",
+                resolution_path.display()
+            ));
+        }
+    }
+    for query in dependency_queries {
+        let resolved = resolve_installed_package_with_path(&query.from, dependency_root.unwrap_or(&query.from), &query.name)
+            .map(|(package_root, resolution_path)| {
+                format!("{}\0{}", resolution_path.display(), package_root.display())
+            })
+            .unwrap_or_else(|| "unresolved".to_string());
+        records.push(format!(
+            "npm-query\0{}\0{}\0{resolved}",
+            query.from.display(),
+            query.name
+        ));
+    }
+    for candidate in candidate_paths {
+        records.push(format!("candidate-path\0{candidate}"));
+    }
+    if let Some(root) = dependency_root {
+        records.push(format!(
+            "dependency-root\0{}\0{}",
+            root.display(),
+            if root.is_dir() { "present" } else { "missing" }
+        ));
+    }
+    records.sort();
+    sha256(records.join("\n"))
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("open fingerprint input {}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .with_context(|| format!("read fingerprint input {}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn is_resolver_config_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name == "package.json"
+        || name == "jsconfig.json"
+        || name == "tsconfig.json"
+        || ((name.starts_with("tsconfig.") || name.starts_with("jsconfig."))
+            && name.ends_with(".json"))
+}
+
+/// Source inventory for report freshness. Unlike `discover`, this never parses
+/// source code or follows its imports: every candidate source path is included
+/// so additions/removals are visible, and resolver metadata is hashed too.
+fn project_fingerprint_files(root: &Path) -> Result<(Vec<(PathBuf, String)>, Vec<String>)> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("cannot resolve {}", root.display()))?;
+    let include_root_dist = root.join("dist").is_dir()
+        && !["src", "source", "lib"]
+            .iter()
+            .any(|name| root.join(name).is_dir());
+    let mut files = BTreeMap::<PathBuf, String>::new();
+    let mut candidate_paths = BTreeSet::new();
+    let mut tsconfigs = Vec::new();
+    for entry in WalkDir::new(&root)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| !should_skip(entry, &root, include_root_dist))
+    {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+        let is_source = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| CODE_EXTENSIONS.contains(&extension))
+            && !is_derivative_duplicate(path);
+        if is_source {
+            candidate_paths.insert(relative.clone());
+        }
+        if (is_source && !is_conventionally_filtered_source(&relative))
+            || is_resolver_config_file(path)
+        {
+            files.insert(path.to_path_buf(), relative.clone());
+        }
+        if path.file_name().is_some_and(|name| {
+            name == "tsconfig.json" || name == "jsconfig.json"
+        }) {
+            tsconfigs.push(path.to_path_buf());
+        }
+    }
+    // TypeScript `extends` can refer outside the project root or into
+    // node_modules. Include the exact inheritance chain used by resolution.
+    for config in tsconfigs {
+        for (path, _) in tsconfig_tree(&config) {
+            let relative = path
+                .strip_prefix(&root)
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_else(|_| format!("@config/{}", path.display()));
+            files.insert(path, relative);
+        }
+    }
+    let mut files = files
+        .into_iter()
+        .map(|(path, relative)| (path, relative))
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.1.cmp(&right.1));
+    Ok((files, candidate_paths.into_iter().collect()))
+}
+
+fn dependency_fingerprint_files(
+    input_root: &DependencyInputRoot,
+) -> Result<(Vec<(PathBuf, String)>, Vec<String>)> {
+    let package_key = format!(
+        "{}@{}-{}",
+        input_root.name,
+        input_root.version,
+        &sha256(input_root.package_root.to_string_lossy().as_bytes())[..10]
+    );
+    let candidates = dependency_reachable_source_candidates(
+        &input_root.package_root,
+        &package_key,
+    );
+    let mut candidate_paths = BTreeSet::new();
+    let mut files = BTreeMap::<PathBuf, String>::new();
+    for (path, relative) in candidates {
+        candidate_paths.insert(relative.clone());
+        // README-like files affect which package source root is selected. Hash
+        // only those candidates; ordinary unselected package sources are
+        // represented by their path inventory and selected baseline hashes.
+        if source_file_filter::is_dependency_readme_candidate(&path, CODE_EXTENSIONS) {
+            files.insert(path, relative);
+        }
+    }
+    let mut tsconfigs = Vec::new();
+    for entry in WalkDir::new(&input_root.package_root)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            !(entry.file_type().is_dir()
+                && matches!(
+                    entry.file_name().to_string_lossy().as_ref(),
+                    ".git" | ".history" | "node_modules"
+                ))
+        })
+    {
+        let entry = entry?;
+        if !entry.file_type().is_file() || !is_resolver_config_file(entry.path()) {
+            continue;
+        }
+        let path = entry.path().to_path_buf();
+        let relative = path
+            .strip_prefix(&input_root.package_root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .to_string();
+        files.insert(path.clone(), format!("npm/{package_key}//{relative}"));
+        if path.file_name().is_some_and(|name| {
+            name == "tsconfig.json" || name == "jsconfig.json"
+        }) {
+            tsconfigs.push(path);
+        }
+    }
+    for config in tsconfigs {
+        for (path, _) in tsconfig_tree(&config) {
+            let relative = path
+                .strip_prefix(&input_root.package_root)
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_else(|_| format!("@config/{}", path.display()));
+            let locator = format!("npm/{package_key}//{relative}");
+            files.insert(path, locator);
+        }
+    }
+    let mut files = files.into_iter().collect::<Vec<_>>();
+    files.sort_by(|left, right| left.1.cmp(&right.1));
+    Ok((files, candidate_paths.into_iter().collect()))
+}
+
+fn fingerprint_discovery(discovery: &Discovery) -> Result<String> {
+    if !discovery.input_roots.is_empty() {
+        let mut current_files = Vec::new();
+        let mut candidate_paths = BTreeSet::new();
+        for input_root in &discovery.input_roots {
+            let (mut files, paths) = dependency_fingerprint_files(input_root)?;
+            current_files.append(&mut files);
+            candidate_paths.extend(paths);
+        }
+        current_files.extend(discovery.files.iter().cloned());
+        current_files.sort_by(|left, right| left.1.cmp(&right.1));
+        current_files.dedup_by(|left, right| left.1 == right.1);
+        return Ok(fingerprint_files(
+            &current_files,
+            &candidate_paths.into_iter().collect::<Vec<_>>(),
+            &discovery.input_roots,
+            &discovery.dependency_queries,
+            Some(&discovery.root),
+        ));
+    }
+    let (mut files, candidate_paths) = project_fingerprint_files(&discovery.root)?;
+    files.extend(discovery.files.iter().cloned());
+    files.sort_by(|left, right| left.1.cmp(&right.1));
+    files.dedup_by(|left, right| left.1 == right.1);
+    Ok(fingerprint_files(
+        &files,
+        &candidate_paths,
+        &[],
+        &[],
+        None,
+    ))
+}
+
+/// Fingerprint project inputs without parsing source or writing report artifacts.
+pub(crate) fn fingerprint_input(
+    input: &Path,
+    selected_files: &[(PathBuf, String)],
+) -> Result<String> {
+    let (mut files, candidate_paths) = project_fingerprint_files(input)?;
+    files.extend(selected_files.iter().cloned());
+    files.sort_by(|left, right| left.1.cmp(&right.1));
+    files.dedup_by(|left, right| left.1 == right.1);
+    Ok(fingerprint_files(&files, &candidate_paths, &[], &[], None))
+}
+
+/// Fingerprint selected dependencies without parsing source or writing report artifacts.
+pub(crate) fn fingerprint_dependency_input(
+    root: &Path,
+    input_roots: &[DependencyInputRoot],
+    selected_files: &[(PathBuf, String)],
+    dependency_queries: &[DependencyResolutionQuery],
+) -> Result<String> {
+    let mut current_files = Vec::new();
+    let mut candidate_paths = BTreeSet::new();
+    for input_root in input_roots {
+        let (mut files, paths) = dependency_fingerprint_files(input_root)?;
+        current_files.append(&mut files);
+        candidate_paths.extend(paths);
+    }
+    current_files.extend(selected_files.iter().cloned());
+    current_files.sort_by(|left, right| left.1.cmp(&right.1));
+    current_files.dedup_by(|left, right| left.1 == right.1);
+    Ok(fingerprint_files(
+        &current_files,
+        &candidate_paths.into_iter().collect::<Vec<_>>(),
+        input_roots,
+        dependency_queries,
+        Some(root),
+    ))
 }
 
 fn looks_like_markdown_documentation(source: &str) -> bool {
@@ -3184,11 +3579,15 @@ fn release_dependency_unit_features(units: &mut [Unit]) {
 }
 
 fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
+    let input_fingerprint = fingerprint_discovery(&discovery)?;
+    let input_files = discovery.files.clone();
     let Discovery {
         root,
         files: discovered,
         skipped,
         corpus,
+        input_roots,
+        dependency_queries,
     } = discovery;
     let cache_dir = cache_root();
     let _ = fs::create_dir_all(&cache_dir);
@@ -3357,6 +3756,10 @@ fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
         root: root.display().to_string(),
         corpus,
         project_sha256,
+        input_fingerprint,
+        input_roots,
+        dependency_queries,
+        input_files,
         files,
         units,
         graph_nodes,
@@ -3388,11 +3791,15 @@ fn index_dependency_evidence(
     if discovery.files.len() <= 200 {
         return index_discovery(discovery, "dependency");
     }
+    let input_fingerprint = fingerprint_discovery(&discovery)?;
+    let input_files = discovery.files.clone();
     let Discovery {
         root,
         files: discovered,
         skipped,
         corpus,
+        input_roots,
+        dependency_queries,
     } = discovery;
     // Keep bounded AST evidence for package closures while retaining the full
     // file inventory for provenance and parse accounting. Large packages
@@ -3481,6 +3888,8 @@ fn index_dependency_evidence(
                     source_root: corpus.source_root.clone(),
                     projection_tool: corpus.projection_tool.clone(),
                 },
+                input_roots: input_roots.clone(),
+                dependency_queries: dependency_queries.clone(),
             },
             "dependency",
         )?)
@@ -3516,6 +3925,10 @@ fn index_dependency_evidence(
             projection_tool: corpus.projection_tool.clone(),
         },
         project_sha256: project_sha256.clone(),
+        input_fingerprint: input_fingerprint.clone(),
+        input_roots: input_roots.clone(),
+        dependency_queries: dependency_queries.clone(),
+        input_files: input_files.clone(),
         files: Vec::new(),
         units: Vec::new(),
         graph_nodes: Vec::new(),
@@ -3528,6 +3941,10 @@ fn index_dependency_evidence(
         root: root.display().to_string(),
         corpus,
         project_sha256,
+        input_fingerprint,
+        input_roots,
+        dependency_queries,
+        input_files,
         files,
         units: indexed_package_index.units,
         graph_nodes: indexed_package_index.graph_nodes,
@@ -12857,6 +13274,44 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(output.path().join("llm-manifest.json")).unwrap())
                 .unwrap();
+        for side in ["local", "upstream"] {
+            assert!(manifest["inputFingerprints"][side]["sha256"]
+                .as_str()
+                .is_some_and(|fingerprint| !fingerprint.is_empty()));
+            assert!(manifest["inputFingerprints"][side]["inputFiles"]
+                .as_array()
+                .is_some_and(|files| !files.is_empty()));
+        }
+        let dependency_fingerprint = &manifest["inputFingerprints"]["dependencies"];
+        assert!(dependency_fingerprint["sha256"].as_str().is_some());
+        assert!(dependency_fingerprint["packageRoots"]
+            .as_array()
+            .is_some_and(|roots| !roots.is_empty()));
+        assert!(dependency_fingerprint["inputFiles"]
+            .as_array()
+            .is_some_and(|files| !files.is_empty()));
+        assert!(dependency_fingerprint["resolutionQueries"]
+            .as_array()
+            .is_some_and(|queries| !queries.is_empty()));
+        let dependency_root = PathBuf::from(dependency_fingerprint["root"].as_str().unwrap());
+        let package_roots: Vec<DependencyInputRoot> =
+            serde_json::from_value(dependency_fingerprint["packageRoots"].clone()).unwrap();
+        let selected_files: Vec<(PathBuf, String)> =
+            serde_json::from_value(dependency_fingerprint["inputFiles"].clone()).unwrap();
+        let resolution_queries: Vec<DependencyResolutionQuery> = serde_json::from_value(
+            dependency_fingerprint["resolutionQueries"].clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            fingerprint_dependency_input(
+                &dependency_root,
+                &package_roots,
+                &selected_files,
+                &resolution_queries,
+            )
+            .unwrap(),
+            dependency_fingerprint["sha256"].as_str().unwrap()
+        );
         assert!(manifest["summary"]["dependencyCoveredNodes"]
             .as_u64()
             .is_some_and(|count| count > 0));
@@ -12879,6 +13334,9 @@ mod tests {
         assert!(dependency_corpus["files"]
             .as_array()
             .is_some_and(|files| !files.is_empty()));
+        assert!(dependency_corpus["inputRoots"]
+            .as_array()
+            .is_some_and(|roots| !roots.is_empty()));
         let semantic_graph = zstd::stream::decode_all(
             fs::File::open(output.path().join("semantic-graph.jsonl.zst")).unwrap(),
         )
