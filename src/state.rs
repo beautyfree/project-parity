@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -11,6 +11,322 @@ use std::{
 };
 
 use super::ENGINE_VERSION;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RootIdentity {
+    local: PathBuf,
+    upstream: PathBuf,
+}
+
+impl RootIdentity {
+    pub fn paths(&self) -> (&Path, &Path) {
+        (&self.local, &self.upstream)
+    }
+
+    pub fn new(local: &Path, upstream: &Path) -> Result<Self> {
+        Ok(Self {
+            local: local.canonicalize().with_context(|| format!("resolve local root {}", local.display()))?,
+            upstream: upstream.canonicalize().with_context(|| format!("resolve upstream root {}", upstream.display()))?,
+        })
+    }
+
+    fn from_values(local: &Value, upstream: &Value) -> Result<Self> {
+        let local = Path::new(local.as_str().context("missing local root provenance")?);
+        let upstream = Path::new(upstream.as_str().context("missing upstream root provenance")?);
+        if !local.is_absolute() || !upstream.is_absolute() {
+            bail!("root provenance must contain absolute paths; refusing ambiguous relocation");
+        }
+        Self::new(local, upstream)
+    }
+
+    fn require(&self, requested: &Self, owner: &Path) -> Result<()> {
+        if self != requested {
+            bail!(
+                "root identity mismatch at {}: belongs to local {} and upstream {}; requested local {} and upstream {}. Use a separate report and state database for different roots",
+                owner.display(), self.local.display(), self.upstream.display(),
+                requested.local.display(), requested.upstream.display()
+            );
+        }
+        Ok(())
+    }
+
+    pub fn lock_report_status(&self, report: &Path) -> Result<(super::SyncLock, PathBuf)> {
+        let report = destination_path(report)?;
+        // A resync may still own the report when the watcher fails. Wait so its
+        // exit cannot leave a completed resync advertising a running watcher.
+        let lock = lock_resource(&report, true)?;
+        let marker = report.join("root-identity.json");
+        let retained: RootIdentity = serde_json::from_slice(&fs::read(&marker)?)?;
+        // These paths were canonicalized at startup and persisted before any
+        // report writes. Status must still work after a source is unmounted.
+        retained.require(self, &marker)?;
+        Ok((lock, report))
+    }
+}
+
+struct ReportIdentity {
+    roots: RootIdentity,
+    local_hash: String,
+    upstream_hash: String,
+}
+
+fn read_report_identity(path: &Path, manifest: bool) -> Result<ReportIdentity> {
+    let value: Value = serde_json::from_slice(&fs::read(path).with_context(|| format!("read provenance {}", path.display()))?)
+        .with_context(|| format!("parse provenance {}", path.display()))?;
+    let (local, upstream, local_hash, upstream_hash) = if manifest {
+        (&value["localRoot"], &value["analysisProjection"],
+         value["inputHashes"]["local"].as_str().or_else(|| value["inputHashes"]["reproduction"].as_str()),
+         value["inputHashes"]["upstream"].as_str())
+    } else {
+        (&value["left"]["root"], &value["right"]["root"],
+         value["left"]["projectSha256"].as_str(), value["right"]["projectSha256"].as_str())
+    };
+    Ok(ReportIdentity {
+        roots: RootIdentity::from_values(local, upstream)?,
+        local_hash: local_hash.filter(|hash| !hash.is_empty()).context("missing local provenance hash")?.to_owned(),
+        upstream_hash: upstream_hash.filter(|hash| !hash.is_empty()).context("missing upstream provenance hash")?.to_owned(),
+    })
+}
+
+fn check_report_identity(report: &Path, expected: &RootIdentity, allow_interrupted: bool, state_db: Option<&Path>) -> Result<()> {
+    if !report.exists() {
+        return Ok(());
+    }
+    let marker = report.join("root-identity.json");
+    let mut known = false;
+    let mut interrupted = false;
+    if marker.exists() {
+        let value: Value = serde_json::from_slice(&fs::read(&marker)?)?;
+        let roots: RootIdentity = serde_json::from_value(value.clone())?;
+        RootIdentity::new(&roots.local, &roots.upstream)?.require(expected, &marker)?;
+        interrupted = value["generationInProgress"].as_bool() == Some(true);
+        if interrupted && !allow_interrupted {
+            bail!("report generation is incomplete at {}; regenerate it with the same roots before syncing state", report.display());
+        }
+        known = true;
+    }
+    for (name, manifest) in [("llm-manifest.json", true), ("report.json", false)] {
+        let path = report.join(name);
+        if path.exists() {
+            if interrupted && serde_json::from_slice::<Value>(&fs::read(&path)?).is_err() {
+                // Only a recorded interrupted generation may replace truncated
+                // metadata. Valid foreign roots and untracked corruption fail.
+                continue;
+            }
+            read_report_identity(&path, manifest)?.roots.require(expected, &path)?;
+            known = true;
+        }
+    }
+    if !known {
+        let mut state_files = Vec::new();
+        if let Some(db) = state_db {
+            let db = destination_path(db)?;
+            let name = db.file_name().context("state has no file name")?.to_string_lossy();
+            state_files.extend([db.clone(), db.with_file_name(format!("{name}-wal")), db.with_file_name(format!("{name}-shm")), resource_lock_path(&db)?]);
+        }
+        for entry in fs::read_dir(report)? {
+            let entry = entry?;
+            if state_files.contains(&destination_path(&entry.path())?) {
+                continue;
+            }
+            // No report was published if only the uncommitted identity temp
+            // remains. An existing state DB is still checked independently.
+            if entry.file_name() != ".root-identity.json.tmp" || !entry.file_type()?.is_file() {
+                bail!("no root provenance in nonempty report {}; refusing to overwrite it", report.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [table], |row| row.get(0))?)
+}
+
+fn legacy_report_path(db: &Path, stored: &str) -> Result<PathBuf> {
+    let stored = Path::new(stored);
+    if stored.is_absolute() {
+        return stored.canonicalize().context("legacy report is missing; cannot establish state root identity");
+    }
+    // Old runs stored paths relative to the invocation directory. Only one
+    // existing interpretation is safe; a moved database is not a root migration.
+    let mut candidates = std::collections::BTreeSet::new();
+    for base in std::iter::once(std::env::current_dir()?).chain(db.ancestors().skip(1).map(Path::to_path_buf)) {
+        if let Ok(path) = base.join(stored).canonicalize() {
+            candidates.insert(path);
+        }
+    }
+    if candidates.len() != 1 {
+        bail!("legacy report path {} is missing or ambiguous; cannot establish state root identity", stored.display());
+    }
+    Ok(candidates.pop_first().expect("one report path checked"))
+}
+
+fn database_identity(conn: &Connection, db: &Path) -> Result<Option<RootIdentity>> {
+    if table_exists(conn, "parity_identity")? {
+        let (local, upstream): (String, String) = conn.query_row(
+            "SELECT local_root, upstream_root FROM parity_identity WHERE id=1", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).context("state root identity is incomplete")?;
+        return Ok(Some(RootIdentity::new(Path::new(&local), Path::new(&upstream))?));
+    }
+    if !table_exists(conn, "runs")? {
+        let tables: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", [], |row| row.get(0))?;
+        if tables != 0 { bail!("existing database has no parity run provenance: {}", db.display()); }
+        return Ok(None);
+    }
+    let latest: Option<(String, Option<String>, Option<String>, Option<i64>)> = conn.query_row(
+        "SELECT report, local_hash, upstream_hash, CAST(strftime('%s', synced_at) AS INTEGER) FROM runs ORDER BY id DESC LIMIT 1", [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).optional()?;
+    let Some((stored, local_hash, upstream_hash, synced_at)) = latest else {
+        for table in ["work_items", "work_item_decisions"] {
+            if table_exists(conn, table)? && conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table})"), [], |row| row.get::<_, bool>(0))? {
+                bail!("state contains decisions or work without run provenance: {}", db.display());
+            }
+        }
+        return Ok(None);
+    };
+    let report = legacy_report_path(db, &stored)?;
+    let manifest = report.join("llm-manifest.json");
+    let path = if manifest.exists() { manifest } else { report.join("report.json") };
+    let prior = read_report_identity(&path, path.file_name().is_some_and(|name| name == "llm-manifest.json"))?;
+    let modified = fs::metadata(&path)?.modified()?.duration_since(UNIX_EPOCH)?;
+    let synced_at = synced_at.filter(|time| *time >= 0).context("legacy run has no valid sync timestamp")?;
+    // Rootless databases cannot independently authenticate historical roots.
+    // Trust only retained, mutually consistent artifacts predating the recorded
+    // run; same-second timestamps are ambiguous. Backdated substitutions cannot
+    // be detected by this legacy format. New databases persist roots directly.
+    if local_hash.as_deref() != Some(&prior.local_hash)
+        || upstream_hash.as_deref() != Some(&prior.upstream_hash)
+        || modified >= Duration::from_secs(synced_at as u64)
+    {
+        bail!("legacy report no longer matches the latest recorded run at {}; refusing to infer state roots", path.display());
+    }
+    check_report_identity(&report, &prior.roots, false, Some(db))?;
+    Ok(Some(prior.roots))
+}
+
+fn check_database_identity(db: &Path, expected: &RootIdentity) -> Result<()> {
+    if db.exists() {
+        // Never use immutable mode: it can ignore live WAL decisions.
+        let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_millis(1000))?;
+        if let Some(roots) = database_identity(&conn, db)? {
+            roots.require(expected, db)?;
+        }
+    }
+    Ok(())
+}
+
+fn store_database_identity(conn: &Connection, roots: &RootIdentity) -> Result<()> {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS parity_identity (id INTEGER PRIMARY KEY CHECK(id=1), local_root TEXT NOT NULL, upstream_root TEXT NOT NULL)")?;
+    conn.execute("INSERT OR IGNORE INTO parity_identity(id,local_root,upstream_root) VALUES (1,?1,?2)", params![roots.local.to_string_lossy(), roots.upstream.to_string_lossy()])?;
+    Ok(())
+}
+
+pub fn destination_path(path: &Path) -> Result<PathBuf> {
+    if path.exists() { return Ok(path.canonicalize()?); }
+    let absolute = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
+    let parent = absolute.parent().context("destination has no parent")?;
+    Ok(destination_path(parent)?.join(absolute.file_name().context("destination has no file name")?))
+}
+
+fn resource_lock_path(path: &Path) -> Result<PathBuf> {
+    let name = path.file_name().context("destination has no file name")?.to_string_lossy();
+    Ok(path.with_file_name(format!(".{name}.project-parity.lock")))
+}
+
+fn lock_resource(path: &Path, wait: bool) -> Result<super::SyncLock> {
+    let lock = resource_lock_path(path)?;
+    fs::create_dir_all(lock.parent().context("lock has no parent")?)?;
+    super::acquire_path_lock(&lock, wait)
+}
+
+fn write_report_marker(report: &Path, roots: &RootIdentity, in_progress: bool) -> Result<()> {
+    let temporary = report.join(".root-identity.json.tmp");
+    if let Ok(metadata) = fs::symlink_metadata(&temporary) {
+        if !metadata.is_file() { bail!("identity temporary path is not a regular file: {}", temporary.display()); }
+        fs::remove_file(&temporary)?;
+    }
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+    serde_json::to_writer(&mut file, &serde_json::json!({
+        "local": roots.local,
+        "upstream": roots.upstream,
+        "generationInProgress": in_progress,
+    }))?;
+    file.sync_all()?;
+    fs::rename(temporary, report.join("root-identity.json"))?;
+    fs::File::open(report)?.sync_all()?;
+    Ok(())
+}
+
+/// Holds the report and database writer locks through generation/reconciliation.
+pub struct SyncGuard {
+    roots: RootIdentity,
+    report: PathBuf,
+    db: Option<PathBuf>,
+    _locks: Vec<super::SyncLock>,
+}
+
+impl SyncGuard {
+    pub fn paths(&self) -> (&Path, &Path, &Path) {
+        (&self.roots.local, &self.roots.upstream, &self.report)
+    }
+
+    fn acquire(roots: RootIdentity, report: &Path, db: Option<&Path>, generation: bool) -> Result<Self> {
+        let report = destination_path(report)?;
+        let db = db.map(destination_path).transpose()?;
+        let check = || -> Result<()> {
+            check_report_identity(&report, &roots, generation, db.as_deref())?;
+            if let Some(db) = &db { check_database_identity(db, &roots)?; }
+            Ok(())
+        };
+        check()?;
+        let mut resources = vec![report.clone()];
+        resources.extend(db.iter().cloned());
+        resources.sort();
+        resources.dedup();
+        let mut locks = Vec::new();
+        for path in resources {
+            locks.push(lock_resource(&path, false)?);
+        }
+        check()?;
+        Ok(Self { roots, report, db, _locks: locks })
+    }
+
+    pub fn for_generation(local: &Path, upstream: &Path, report: &Path, db: Option<&Path>) -> Result<Self> {
+        let guard = Self::acquire(RootIdentity::new(local, upstream)?, report, db, true)?;
+        if let Some(db) = &guard.db {
+            let mut conn = Connection::open(db)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(roots) = database_identity(&tx, db)? { roots.require(&guard.roots, db)?; }
+            // Bind verified legacy provenance before its report can be replaced.
+            // A later generation failure leaves decisions intact and roots known.
+            store_database_identity(&tx, &guard.roots)?;
+            tx.commit()?;
+        }
+        fs::create_dir_all(&guard.report)?;
+        write_report_marker(&guard.report, &guard.roots, true)?;
+        Ok(guard)
+    }
+
+    pub fn finish_generation(&self) -> Result<()> {
+        write_report_marker(&self.report, &self.roots, false)
+    }
+
+    pub fn sync(&self) -> Result<Value> {
+        let db = self.db.as_deref().context("no state database selected")?;
+        sync_locked(db, &self.report, &self.roots)
+    }
+}
+
+pub fn validate_generation(local: &Path, upstream: &Path, report: &Path, db: Option<&Path>) -> Result<()> {
+    let roots = RootIdentity::new(local, upstream)?;
+    check_report_identity(report, &roots, true, db)?;
+    if let Some(db) = db { check_database_identity(db, &roots)?; }
+    Ok(())
+}
 
 fn compatible_legacy_variant_action(current: Option<&str>, variant: &str) -> bool {
     match (current, variant) {
@@ -173,37 +489,47 @@ fn ensure_queue_index(conn: &Connection, name: &str, confidence: bool, batch: bo
     if existing.as_deref() != Some(expected.as_str()) {
         // A stale expression index cannot serve the new ordering. Rebuild it
         // atomically once; subsequent syncs keep the current index intact.
-        let tx = conn.unchecked_transaction()?;
-        tx.execute_batch(&format!("DROP INDEX IF EXISTS {name}; {expected};"))?;
-        tx.commit()?;
+        let tx = if conn.is_autocommit() { Some(conn.unchecked_transaction()?) } else { None };
+        conn.execute_batch(&format!("DROP INDEX IF EXISTS {name}; {expected};"))?;
+        if let Some(tx) = tx { tx.commit()?; }
     }
     Ok(())
 }
 
 pub fn sync(db_path: &Path, report: &Path) -> Result<Value> {
+    let incoming = read_report_identity(&report.join("llm-manifest.json"), true)?;
+    SyncGuard::acquire(incoming.roots, report, Some(db_path), false)?.sync()
+}
+
+fn sync_locked(db_path: &Path, report: &Path, roots: &RootIdentity) -> Result<Value> {
+    let incoming = read_report_identity(&report.join("llm-manifest.json"), true)?;
+    incoming.roots.require(roots, report)?;
+    check_report_identity(report, roots, true, Some(db_path))?;
     let shared = super::llm_context::read_shared_work_evidence(report)?;
-    let conn = Connection::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, report TEXT NOT NULL, upstream_hash TEXT, local_hash TEXT, synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS work_items (id TEXT PRIMARY KEY, run_id INTEGER NOT NULL, action TEXT, priority TEXT, confidence TEXT, payload TEXT NOT NULL, first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, resolved_at TEXT, batch_id TEXT, FOREIGN KEY(run_id) REFERENCES runs(id)); CREATE TABLE IF NOT EXISTS work_item_decisions (work_item_id TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN ('skipped','pending_sync','done')), reason TEXT NOT NULL, decided_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, payload TEXT, FOREIGN KEY(work_item_id) REFERENCES work_items(id)); CREATE INDEX IF NOT EXISTS work_items_queue ON work_items(resolved_at, priority, id); CREATE INDEX IF NOT EXISTS work_item_decisions_status ON work_item_decisions(status);")?;
+    let mut conn = Connection::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
+    conn.busy_timeout(Duration::from_millis(1000))?;
+    if let Some(previous) = database_identity(&conn, db_path)? { previous.require(roots, db_path)?; }
+    conn.execute_batch("PRAGMA journal_mode=WAL")?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let conn = &tx;
+    if let Some(previous) = database_identity(conn, db_path)? { previous.require(roots, db_path)?; }
+    store_database_identity(conn, roots)?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, report TEXT NOT NULL, upstream_hash TEXT, local_hash TEXT, synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS work_items (id TEXT PRIMARY KEY, run_id INTEGER NOT NULL, action TEXT, priority TEXT, confidence TEXT, payload TEXT NOT NULL, first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, resolved_at TEXT, batch_id TEXT, FOREIGN KEY(run_id) REFERENCES runs(id)); CREATE TABLE IF NOT EXISTS work_item_decisions (work_item_id TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN ('skipped','pending_sync','done')), reason TEXT NOT NULL, decided_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, payload TEXT, FOREIGN KEY(work_item_id) REFERENCES work_items(id)); CREATE INDEX IF NOT EXISTS work_items_queue ON work_items(resolved_at, priority, id); CREATE INDEX IF NOT EXISTS work_item_decisions_status ON work_item_decisions(status);")?;
     ensure_queue_index(&conn, "work_items_queue_phase", false, false)?;
     ensure_queue_index(&conn, "work_items_queue_phase_confidence", true, false)?;
     ensure_batch_schema(&conn)?;
     ensure_decision_schema(&conn)?;
-    let manifest: Value = serde_json::from_slice(&fs::read(report.join("llm-manifest.json"))?)?;
-    let hashes = &manifest["inputHashes"];
     let previous_unresolved: i64 = conn.query_row(
         "SELECT COUNT(*) FROM work_items w LEFT JOIN work_item_decisions d ON d.work_item_id=w.id WHERE w.resolved_at IS NULL AND d.work_item_id IS NULL",
         [],
         |row| row.get(0),
     )?;
-    let tx = conn.unchecked_transaction()?;
     conn.execute(
         "INSERT INTO runs(report, upstream_hash, local_hash) VALUES (?1,?2,?3)",
         params![
             report.to_string_lossy(),
-            hashes["upstream"].as_str(),
-            hashes["local"]
-                .as_str()
-                .or_else(|| hashes["reproduction"].as_str())
+            incoming.upstream_hash,
+            incoming.local_hash,
         ],
     )?;
     let run_id = conn.last_insert_rowid();
@@ -1270,10 +1596,18 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    fn test_manifest(dir: &Path) -> String {
+        serde_json::json!({
+            "localRoot": dir.canonicalize().unwrap(),
+            "analysisProjection": dir.canonicalize().unwrap(),
+            "inputHashes": {"upstream": "u", "reproduction": "l"},
+        }).to_string()
+    }
+
     fn report(dir: &Path, ids: &[&str]) {
         fs::write(
             dir.join("llm-manifest.json"),
-            r#"{"inputHashes":{"upstream":"u","reproduction":"l"}}"#,
+            test_manifest(dir),
         )
         .unwrap();
         let body = ids
@@ -1282,6 +1616,187 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         fs::write(dir.join("llm-work-items.jsonl"), format!("{body}\n")).unwrap();
+    }
+
+    fn root_report(dir: &Path, local: &Path, upstream: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        report(dir, &["done", "pending", "skipped"]);
+        fs::write(dir.join("llm-manifest.json"), serde_json::json!({
+            "engine": "rust-oxc-0.126.0/v73",
+            "localRoot": local,
+            "analysisProjection": upstream,
+            "inputHashes": {"upstream": "u", "local": "l"},
+        }).to_string()).unwrap();
+        fs::write(dir.join("report.json"), serde_json::json!({
+            "left": {"root": local, "projectSha256": "l"},
+            "right": {"root": upstream, "projectSha256": "u"},
+        }).to_string()).unwrap();
+        // Represent retained v73 artifacts that clearly predate their DB run.
+        for name in ["llm-manifest.json", "report.json"] {
+            fs::File::options().write(true).open(dir.join(name)).unwrap()
+                .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now() - Duration::from_secs(60))).unwrap();
+        }
+    }
+
+    fn reviewed_state(db: &Path, report: &Path) {
+        sync(db, report).unwrap();
+        mark_pending_sync(db, "done", "reviewed").unwrap();
+        sync(db, report).unwrap();
+        mark_pending_sync(db, "pending", "reviewed").unwrap();
+        skip(db, "skipped", "verified false positive").unwrap();
+    }
+
+    fn state_snapshot(db: &Path) -> Vec<(String, String)> {
+        let conn = Connection::open(db).unwrap();
+        let mut rows = Vec::new();
+        for table in ["runs", "work_items", "work_item_decisions", "sqlite_master"] {
+            let mut stmt = conn.prepare(&format!("SELECT * FROM {table} ORDER BY 1")).unwrap();
+            let count = stmt.column_count();
+            let values = stmt.query_map([], |row| {
+                Ok((0..count).map(|i| format!("{:?}", row.get_ref(i).unwrap())).collect::<Vec<_>>().join("|"))
+            }).unwrap();
+            rows.extend(values.map(|value| (table.to_owned(), value.unwrap())));
+        }
+        rows
+    }
+
+    #[test]
+    fn root_identity_rejects_foreign_state_sync_without_changing_decisions() {
+        for foreign_local in [false, true] {
+            let root = tempdir().unwrap();
+            let local = root.path().join("local");
+            let upstream = root.path().join("upstream");
+            let foreign = root.path().join("foreign");
+            for path in [&local, &upstream, &foreign] { fs::create_dir(path).unwrap(); }
+            let prior = root.path().join("prior");
+            let incoming = root.path().join("incoming");
+            let db = root.path().join("state.sqlite");
+            root_report(&prior, &local, &upstream);
+            reviewed_state(&db, &prior);
+            root_report(&incoming, if foreign_local { &foreign } else { &local }, if foreign_local { &upstream } else { &foreign });
+            let before = state_snapshot(&db);
+            assert!(sync(&db, &incoming).is_err(), "foreign roots must not reconcile identical hashes and IDs");
+            assert_eq!(state_snapshot(&db), before);
+        }
+    }
+
+    #[test]
+    fn root_identity_rejects_missing_or_replaced_legacy_provenance() {
+        for replacement in [None, Some("wrong hashes"), Some("newer report"), Some("same second")] {
+            let root = tempdir().unwrap();
+            let prior = root.path().join("prior");
+            let incoming = root.path().join("incoming");
+            let db = root.path().join("state.sqlite");
+            root_report(&prior, root.path(), root.path());
+            reviewed_state(&db, &prior);
+            Connection::open(&db).unwrap().execute_batch("DROP TABLE IF EXISTS parity_identity").unwrap();
+            root_report(&incoming, root.path(), root.path());
+            match replacement {
+                None => {
+                    fs::remove_file(prior.join("llm-manifest.json")).unwrap();
+                    fs::remove_file(prior.join("report.json")).unwrap();
+                }
+                Some("wrong hashes") => {
+                    let mut value: Value = serde_json::from_slice(&fs::read(prior.join("llm-manifest.json")).unwrap()).unwrap();
+                    value["inputHashes"]["local"] = Value::String("overwritten".into());
+                    fs::write(prior.join("llm-manifest.json"), value.to_string()).unwrap();
+                }
+                Some("newer report") => {
+                    let file = fs::File::options().write(true).open(prior.join("llm-manifest.json")).unwrap();
+                    file.set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now() + Duration::from_secs(10))).unwrap();
+                }
+                _ => {
+                    let at: u64 = Connection::open(&db).unwrap().query_row("SELECT CAST(strftime('%s', synced_at) AS INTEGER) FROM runs ORDER BY id DESC LIMIT 1", [], |row| row.get(0)).unwrap();
+                    fs::File::options().write(true).open(prior.join("llm-manifest.json")).unwrap()
+                        .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(at))).unwrap();
+                }
+            }
+            let before = state_snapshot(&db);
+            assert!(sync(&db, &incoming).is_err(), "legacy identity cannot come from the incoming report");
+            assert_eq!(state_snapshot(&db), before);
+        }
+    }
+
+    #[test]
+    fn root_identity_accepts_stable_legacy_engine_migration_and_report_fallback() {
+        for fallback in [false, true] {
+            let root = tempdir().unwrap();
+            let prior = root.path().join("prior");
+            let incoming = root.path().join("incoming");
+            let db = root.path().join("state.sqlite");
+            root_report(&prior, root.path(), root.path());
+            reviewed_state(&db, &prior);
+            Connection::open(&db).unwrap().execute_batch("DROP TABLE IF EXISTS parity_identity").unwrap();
+            if fallback {
+                fs::remove_file(prior.join("llm-manifest.json")).unwrap();
+            }
+            root_report(&incoming, root.path(), root.path());
+            let mut value: Value = serde_json::from_slice(&fs::read(incoming.join("llm-manifest.json")).unwrap()).unwrap();
+            value["engine"] = Value::String(ENGINE_VERSION.into());
+            value["inputHashes"]["local"] = Value::String("new source contents".into());
+            fs::write(incoming.join("llm-manifest.json"), value.to_string()).unwrap();
+            let result = sync(&db, &incoming).unwrap();
+            assert_eq!(result["pendingReleased"], 1);
+            assert_eq!(result["reopened"], 0);
+            assert_eq!(stats(&db).unwrap()["done"], 2);
+            assert_eq!(stats(&db).unwrap()["skipped"], 1);
+            fs::remove_dir_all(&prior).unwrap();
+            assert!(sync(&db, &incoming).is_ok(), "persisted roots survive removal of the legacy report");
+        }
+    }
+
+    #[test]
+    fn root_identity_failed_reconciliation_rolls_back_legacy_schema_and_decisions() {
+        let root = tempdir().unwrap();
+        let prior = root.path().join("prior");
+        let incoming = root.path().join("incoming");
+        let db = root.path().join("state.sqlite");
+        root_report(&prior, root.path(), root.path());
+        reviewed_state(&db, &prior);
+        Connection::open(&db).unwrap().execute_batch("DROP TABLE IF EXISTS parity_identity; DROP INDEX work_items_queue_phase").unwrap();
+        root_report(&incoming, root.path(), root.path());
+        fs::write(incoming.join("llm-work-items.jsonl"), "{\"id\":\"new\"}\ninvalid json\n").unwrap();
+        let before = state_snapshot(&db);
+        assert!(sync(&db, &incoming).is_err());
+        assert_eq!(state_snapshot(&db), before);
+    }
+
+    #[test]
+    fn root_identity_legacy_relative_paths_require_one_existing_interpretation() {
+        for ambiguous in [false, true] {
+            let root = tempdir().unwrap();
+            let nested = root.path().join("nested");
+            fs::create_dir(&nested).unwrap();
+            let prior = nested.join("report");
+            let incoming = root.path().join("incoming");
+            let db = nested.join("state.sqlite");
+            root_report(&prior, root.path(), root.path());
+            reviewed_state(&db, &prior);
+            Connection::open(&db).unwrap().execute_batch("DROP TABLE parity_identity; UPDATE runs SET report='report'").unwrap();
+            if ambiguous { root_report(&root.path().join("report"), root.path(), root.path()); }
+            root_report(&incoming, root.path(), root.path());
+            let before = state_snapshot(&db);
+            let result = sync(&db, &incoming);
+            if ambiguous {
+                assert!(result.is_err());
+                assert_eq!(state_snapshot(&db), before);
+            } else {
+                assert_eq!(result.unwrap()["pendingReleased"], 1);
+            }
+        }
+    }
+
+    #[test]
+    fn root_identity_direct_state_sync_rejects_tracked_incomplete_generation() {
+        let root = tempdir().unwrap();
+        let report = root.path().join("report");
+        let db = root.path().join("state.sqlite");
+        root_report(&report, root.path(), root.path());
+        reviewed_state(&db, &report);
+        drop(SyncGuard::for_generation(root.path(), root.path(), &report, Some(&db)).unwrap());
+        let before = state_snapshot(&db);
+        assert!(sync(&db, &report).is_err());
+        assert_eq!(state_snapshot(&db), before);
     }
 
     #[test]
@@ -1381,6 +1896,7 @@ mod tests {
             "engine": ENGINE_VERSION,
             "localRoot": local.display().to_string(),
             "analysisProjection": upstream.display().to_string(),
+            "inputHashes": {"local": "l", "upstream": "u"},
             "inputFingerprints": {
                 "local": {
                     "sha256": crate::fingerprint_input(&local, &[]).unwrap(),
@@ -1487,6 +2003,7 @@ mod tests {
             "analysisProjection": upstream.display().to_string(),
             "inputHashes": {
                 "local": "combined-local-and-dependency-analysis-hash",
+                "upstream": "u",
                 "dependencies": "dependency-analysis-hash",
             },
             "inputFingerprints": {
@@ -1645,7 +2162,7 @@ mod tests {
         let db = root.path().join("state.sqlite");
         fs::write(
             root.path().join("llm-manifest.json"),
-            r#"{"inputHashes":{"upstream":"u","reproduction":"l"}}"#,
+            test_manifest(root.path()),
         )
         .unwrap();
         fs::write(
@@ -1675,7 +2192,7 @@ mod tests {
         let db = root.path().join("state.sqlite");
         fs::write(
             root.path().join("llm-manifest.json"),
-            r#"{"inputHashes":{"upstream":"u","reproduction":"l"}}"#,
+            test_manifest(root.path()),
         )
         .unwrap();
         fs::write(
@@ -1706,7 +2223,7 @@ mod tests {
         let db = root.path().join("state.sqlite");
         fs::write(
             root.path().join("llm-manifest.json"),
-            r#"{"inputHashes":{"upstream":"u","reproduction":"l"}}"#,
+            test_manifest(root.path()),
         )
         .unwrap();
         fs::write(
@@ -1751,7 +2268,7 @@ mod tests {
         let db = root.path().join("state.sqlite");
         fs::write(
             root.path().join("llm-manifest.json"),
-            r#"{"inputHashes":{"upstream":"u","reproduction":"l"}}"#,
+            test_manifest(root.path()),
         )
         .unwrap();
         fs::write(
@@ -1792,7 +2309,7 @@ mod tests {
         let db = root.path().join("state.sqlite");
         fs::write(
             root.path().join("llm-manifest.json"),
-            r#"{"inputHashes":{"upstream":"u","reproduction":"l"}}"#,
+            test_manifest(root.path()),
         )
         .unwrap();
         fs::write(
@@ -1837,7 +2354,7 @@ mod tests {
         let db = root.path().join("state.sqlite");
         fs::write(
             root.path().join("llm-manifest.json"),
-            r#"{"inputHashes":{"upstream":"u","reproduction":"l"}}"#,
+            test_manifest(root.path()),
         )
         .unwrap();
         fs::write(
@@ -1872,7 +2389,7 @@ mod tests {
         let db = root.path().join("state.sqlite");
         fs::write(
             root.path().join("llm-manifest.json"),
-            r#"{"inputHashes":{"upstream":"u","reproduction":"l"}}"#,
+            test_manifest(root.path()),
         )
         .unwrap();
         fs::write(
@@ -1908,7 +2425,7 @@ mod tests {
         let db = root.path().join("state.sqlite");
         fs::write(
             root.path().join("llm-manifest.json"),
-            r#"{"inputHashes":{"upstream":"u","reproduction":"l"}}"#,
+            test_manifest(root.path()),
         )
         .unwrap();
         fs::write(
@@ -1953,7 +2470,7 @@ mod tests {
         let db = root.path().join("state.sqlite");
         fs::write(
             root.path().join("llm-manifest.json"),
-            r#"{"inputHashes":{"upstream":"u","reproduction":"l"}}"#,
+            test_manifest(root.path()),
         )
         .unwrap();
         fs::write(
@@ -1985,7 +2502,7 @@ mod tests {
         let db = root.path().join("state.sqlite");
         fs::write(
             root.path().join("llm-manifest.json"),
-            r#"{"inputHashes":{"upstream":"u","reproduction":"l"}}"#,
+            test_manifest(root.path()),
         )
         .unwrap();
         fs::write(
@@ -2051,7 +2568,7 @@ mod tests {
         let db = root.path().join("state.sqlite");
         fs::write(
             root.path().join("llm-manifest.json"),
-            r#"{"inputHashes":{"upstream":"u","reproduction":"l"}}"#,
+            test_manifest(root.path()),
         )
         .unwrap();
         fs::write(
@@ -2081,7 +2598,7 @@ mod tests {
         let db = root.path().join("state.sqlite");
         fs::write(
             root.path().join("llm-manifest.json"),
-            r#"{"inputHashes":{"upstream":"u","reproduction":"l"}}"#,
+            test_manifest(root.path()),
         )
         .unwrap();
         fs::write(
@@ -2111,7 +2628,7 @@ mod tests {
     fn structural_frontiers_are_deferred_after_active_work() {
         let root = tempdir().unwrap();
         let db = root.path().join("state.sqlite");
-        fs::write(root.path().join("llm-manifest.json"), r#"{"inputHashes":{"upstream":"u","reproduction":"l"}}"#).unwrap();
+        fs::write(root.path().join("llm-manifest.json"), test_manifest(root.path())).unwrap();
         fs::write(root.path().join("llm-work-items.jsonl"), concat!(
             "{\"id\":\"structural\",\"priority\":\"P0\",\"action\":\"inspect-structural-frontier\"}\n",
             "{\"id\":\"active\",\"priority\":\"P2\",\"action\":\"inspect\"}\n"
@@ -2226,7 +2743,7 @@ mod tests {
         let db = root.path().join("state.sqlite");
         fs::write(
             root.path().join("llm-manifest.json"),
-            r#"{"inputHashes":{"upstream":"u","reproduction":"l"}}"#,
+            test_manifest(root.path()),
         )
         .unwrap();
         let mut item = serde_json::json!({
@@ -2323,7 +2840,7 @@ mod tests {
         ] {
             let root = tempdir().unwrap();
             let db = root.path().join("state.sqlite");
-            fs::write(root.path().join("llm-manifest.json"), r#"{"inputHashes":{"upstream":"u","reproduction":"l"}}"#).unwrap();
+            fs::write(root.path().join("llm-manifest.json"), test_manifest(root.path())).unwrap();
             let mut item = serde_json::json!({
                 "id":"work:frontier",
                 "action":previous_action,

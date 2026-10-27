@@ -2546,6 +2546,8 @@ mod tests {
     #[test]
     fn shared_candidate_storage_round_trips_complete_evidence_and_reviewed_decisions() {
         let output = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let upstream_root = tempfile::tempdir().unwrap();
         let upstream = (0..80)
             .map(|i| json!({"id":format!("right:{i}"),"file":"chunk.js","line":i}))
             .collect::<Vec<_>>();
@@ -2561,7 +2563,12 @@ mod tests {
         .unwrap();
         std::fs::write(
             output.path().join("llm-manifest.json"),
-            serde_json::to_vec(&json!({"engine":crate::ENGINE_VERSION,"inputHashes":{}})).unwrap(),
+            serde_json::to_vec(&json!({
+                "engine": crate::ENGINE_VERSION,
+                "localRoot": local.path().canonicalize().unwrap(),
+                "analysisProjection": upstream_root.path().canonicalize().unwrap(),
+                "inputHashes": {"local": "fixture-local", "upstream": "fixture-upstream"}
+            })).unwrap(),
         )
         .unwrap();
         let db = output.path().join("state.sqlite");

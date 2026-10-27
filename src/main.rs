@@ -4,10 +4,9 @@ use std::{
     env, fs,
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::Command,
     sync::{Arc, Mutex, OnceLock},
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use aho_corasick::AhoCorasick;
@@ -7162,12 +7161,12 @@ fn upstream_mentioned_packages<'a>(
     Ok(mentioned)
 }
 
-fn run_with_certificates(
-    left_path: &Path,
-    right_path: &Path,
-    output: &Path,
+// Call only while a SyncGuard holds the report and optional state writer locks.
+fn generate_report(
+    guard: &state::SyncGuard,
     certificates: &[BundleEquivalenceCertificate],
 ) -> Result<Summary> {
+    let (left_path, right_path, output) = guard.paths();
     let stage_started = Instant::now();
     eprintln!("[project-parity] indexing local project");
     let mut left = index_project(left_path, "left")?;
@@ -7890,7 +7889,8 @@ fn oracle_pair_candidate_rank(pair: &OraclePair, output: &Path) -> Result<Option
     Ok(None)
 }
 
-fn evaluate_oracle(output: &Path, oracle_path: &Path) -> Result<OracleMetrics> {
+fn evaluate_oracle(guard: &state::SyncGuard, oracle_path: &Path) -> Result<OracleMetrics> {
+    let (_, _, output) = guard.paths();
     let oracle: Oracle = serde_json::from_slice(
         &fs::read(oracle_path).with_context(|| format!("read {}", oracle_path.display()))?,
     )
@@ -7990,7 +7990,15 @@ fn find_location<'a>(value: &'a serde_json::Value, unit_id: &str) -> Option<&'a 
 
 #[allow(dead_code)]
 fn run(left_path: &Path, right_path: &Path, output: &Path) -> Result<Summary> {
-    run_with_certificates(left_path, right_path, output, &[])
+    run_and_sync(left_path, right_path, output, None).map(|(summary, _)| summary)
+}
+
+fn run_and_sync(left: &Path, right: &Path, output: &Path, db: Option<&Path>) -> Result<(Summary, Option<serde_json::Value>)> {
+    let guard = state::SyncGuard::for_generation(left, right, output, db)?;
+    let summary = generate_report(&guard, &[])?;
+    let sync = db.map(|_| guard.sync()).transpose()?;
+    guard.finish_generation()?;
+    Ok((summary, sync))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -8155,6 +8163,41 @@ fn write_service_status(output: &Path, phase: &str, changes: usize) -> Result<()
     Ok(())
 }
 
+fn update_watched_report(
+    left: &Path,
+    right: &Path,
+    output: &Path,
+    state_db: Option<&Path>,
+    changes: &[ChangedFile],
+    initial: bool,
+) -> Result<()> {
+    let guard = state::SyncGuard::for_generation(left, right, output, state_db)?;
+    let (_, _, output) = guard.paths();
+    let result = (|| {
+        if initial {
+            write_service_status(output, "starting", 0)?;
+        } else {
+            // The impact plan must use the previous graph, before it is replaced.
+            write_resync_plan(output, changes)?;
+        }
+        generate_report(&guard, &[])?;
+        write_change_set(output, changes, initial)?;
+        if initial { write_resync_plan(output, changes)?; }
+        if state_db.is_some() { guard.sync()?; }
+        guard.finish_generation()?;
+        Ok(())
+    })();
+    // Keep the lock on failure, including a partly written report: its identity
+    // was checked before generation and cannot be rebound by another writer.
+    let phase = if result.is_ok() { "running" } else { "failed" };
+    let _ = write_service_status(output, phase, changes.len());
+    result
+}
+
+fn canonical_service_paths(left: &Path, right: &Path, output: &Path, db: Option<&Path>) -> Result<(state::RootIdentity, PathBuf, Option<PathBuf>)> {
+    Ok((state::RootIdentity::new(left, right)?, state::destination_path(output)?, db.map(state::destination_path).transpose()?))
+}
+
 fn watch(
     left_path: &Path,
     right_path: &Path,
@@ -8163,15 +8206,12 @@ fn watch(
     interval: Duration,
     debounce: Duration,
 ) -> Result<()> {
+    let (roots, report, db) = canonical_service_paths(left_path, right_path, output, state_db)?;
+    let (left_path, right_path) = roots.paths();
+    let (output, state_db) = (report.as_path(), db.as_deref());
     let mut left_snapshot = file_snapshot(left_path)?;
     let mut right_snapshot = file_snapshot(right_path)?;
-    run(left_path, right_path, output)?;
-    write_change_set(output, &[], true)?;
-    write_resync_plan(output, &[])?;
-    if let Some(state_db) = state_db {
-        state::sync(state_db, output)?;
-    }
-    let _ = write_service_status(output, "running", 0);
+    update_watched_report(left_path, right_path, output, state_db, &[], true)?;
     eprintln!("watching for source changes; press Ctrl-C to stop");
     loop {
         thread::sleep(interval);
@@ -8195,13 +8235,7 @@ fn watch(
             right_snapshot = settled_right;
             continue;
         }
-        write_resync_plan(output, &changes)?;
-        run(left_path, right_path, output)?;
-        write_change_set(output, &changes, false)?;
-        if let Some(state_db) = state_db {
-            state::sync(state_db, output)?;
-        }
-        let _ = write_service_status(output, "running", changes.len());
+        update_watched_report(left_path, right_path, output, state_db, &changes, false)?;
         left_snapshot = settled_left;
         right_snapshot = settled_right;
         eprintln!("resynced {} changed file(s)", changes.len());
@@ -8219,11 +8253,17 @@ fn serve(
     interval: Duration,
     debounce: Duration,
 ) -> Result<()> {
-    fs::create_dir_all(output)?;
-    write_service_status(output, "starting", 0)?;
+    let (identity, report, db) = canonical_service_paths(left_path, right_path, output, state_db)?;
+    let (left_path, right_path) = identity.paths();
+    let (output, state_db) = (report.as_path(), db.as_deref());
+    state::validate_generation(left_path, right_path, output, state_db)?;
     let result = watch(left_path, right_path, output, state_db, interval, debounce);
-    let phase = if result.is_ok() { "stopped" } else { "failed" };
-    let _ = write_service_status(output, phase, 0);
+    // Snapshot failures occur outside generation. Only update a report whose
+    // roots still validate; generation failures already set status under lock.
+    if let Ok((_guard, report)) = identity.lock_report_status(output) {
+        let phase = if result.is_ok() { "stopped" } else { "failed" };
+        let _ = write_service_status(&report, phase, 0);
+    }
     result
 }
 
@@ -8297,8 +8337,7 @@ fn mcp_tool_result(
                 Ok(graph_node(output, id, limit, offset)?)
             }
             "resync" => {
-                let summary = run(left, right, output)?;
-                let sync = state_db.map(|db| state::sync(db, output)).transpose()?;
+                let (summary, sync) = run_and_sync(left, right, output, state_db)?;
                 Ok(serde_json::json!({"summary": summary, "stateSync": sync}))
             }
             _ => bail!("unknown project-parity tool: {name}"),
@@ -8318,7 +8357,10 @@ fn serve_mcp(
     interval: Duration,
     debounce: Duration,
 ) -> Result<()> {
-    fs::create_dir_all(output)?;
+    let (roots, output_path, db) = canonical_service_paths(left_path, right_path, output, state_db)?;
+    let (left_path, right_path) = roots.paths();
+    let (output, state_db) = (output_path.as_path(), db.as_deref());
+    state::validate_generation(left_path, right_path, output, state_db)?;
     let left = left_path.to_path_buf();
     let right = right_path.to_path_buf();
     let report = output.to_path_buf();
@@ -9204,10 +9246,7 @@ fn absolute_existing_path(path: &Path, label: &str) -> Result<PathBuf> {
         .with_context(|| format!("{label} does not exist: {}", path.display()))
 }
 
-fn write_project_config(local: &Path, upstream: &Path) -> Result<PathBuf> {
-    let local = absolute_existing_path(local, "local project")?;
-    let upstream = absolute_existing_path(upstream, "upstream project")?;
-    let path = project_config_path(&local);
+fn write_project_config(local: &Path, upstream: &Path, path: &Path) -> Result<PathBuf> {
     fs::create_dir_all(path.parent().context("project config has no parent")?)?;
     let config = ProjectConfig {
         schema: "project-parity/project-config-v1".to_string(),
@@ -9215,12 +9254,16 @@ fn write_project_config(local: &Path, upstream: &Path) -> Result<PathBuf> {
         upstream: upstream.to_string_lossy().into_owned(),
     };
     fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
-    Ok(path)
+    Ok(path.to_path_buf())
 }
 
 fn read_project_config(local: &Path) -> Result<(PathBuf, PathBuf)> {
     let local = absolute_existing_path(local, "local project")?;
     let path = project_config_path(&local);
+    read_project_config_at(&local, &path)
+}
+
+fn read_project_config_at(local: &Path, path: &Path) -> Result<(PathBuf, PathBuf)> {
     let bytes = fs::read(&path).with_context(|| {
         format!(
             "no project-parity config at {}; run project-parity init UPSTREAM_DIR here first",
@@ -9239,81 +9282,63 @@ fn read_project_config(local: &Path) -> Result<(PathBuf, PathBuf)> {
     }
     let upstream =
         absolute_existing_path(Path::new(&config.upstream), "configured upstream project")?;
-    Ok((local, upstream))
+    Ok((local.to_path_buf(), upstream))
 }
 
 #[derive(Debug)]
 struct SyncLock {
-    path: PathBuf,
-}
-
-impl Drop for SyncLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
+    _file: fs::File,
 }
 
 fn acquire_sync_lock(parity: &Path) -> Result<SyncLock> {
-    let path = parity.join("sync.lock");
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
+    acquire_path_lock(&parity.join("sync.lock"), false)
+}
+
+fn acquire_path_lock(path: &Path, wait: bool) -> Result<SyncLock> {
+    // Keep a stable inode: unlinking a stale PID file lets two contenders
+    // acquire different files at the same path. The OS releases this on exit.
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    // Opening and checking separately would permit a symlink swap in between.
+    #[cfg(unix)]
     {
-        Ok(mut file) => {
-            writeln!(
-                file,
-                "pid={} started={:?}",
-                std::process::id(),
-                SystemTime::now()
-            )?;
-            Ok(SyncLock { path })
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let owner_pid = fs::read_to_string(&path)
-                .ok()
-                .and_then(|contents| {
-                    contents
-                        .strip_prefix("pid=")?
-                        .split_whitespace()
-                        .next()
-                        .map(str::to_string)
-                })
-                .and_then(|pid| pid.parse::<u32>().ok());
-            let owner_alive = owner_pid.is_some_and(|pid| {
-                Command::new("/bin/kill")
-                    .args(["-0", &pid.to_string()])
-                    .status()
-                    .is_ok_and(|status| status.success())
-            });
-            if !owner_alive {
-                fs::remove_file(&path).context("remove stale project-parity sync lock")?;
-                let mut file = fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                    .context("recreate project-parity sync lock")?;
-                writeln!(
-                    file,
-                    "pid={} started={:?}",
-                    std::process::id(),
-                    SystemTime::now()
-                )?;
-                return Ok(SyncLock { path });
-            }
-            let owner = fs::read_to_string(&path).unwrap_or_else(|_| "unknown owner".to_string());
-            bail!(
-                "another project-parity sync is already running ({owner}); refusing a concurrent run"
-            );
-        }
-        Err(error) => Err(error).with_context(|| format!("create sync lock {}", path.display())),
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)
+        .with_context(|| format!("open sync lock {}", path.display()))?;
+    let metadata = file.metadata().with_context(|| format!("inspect sync lock {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("sync lock is not a regular file: {}", path.display());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            bail!("sync lock is a reparse point: {}", path.display());
+        }
+    }
+    if wait {
+        file.lock().with_context(|| format!("wait for sync lock {}", path.display()))?;
+    } else {
+        file.try_lock().map_err(|error| anyhow::anyhow!(
+            "another project-parity sync is already running or the lock is unavailable at {}: {error}", path.display()
+        ))?;
+    }
+    Ok(SyncLock { _file: file })
 }
 
 fn sync_project(local: &Path, upstream: &Path, command: &'static str) -> Result<serde_json::Value> {
+    let local = absolute_existing_path(local, "local project")?;
+    let upstream = absolute_existing_path(upstream, "upstream project")?;
     let parity = local.join(".parity");
-    let report = parity.join("report");
-    let state_db = parity.join("state.sqlite");
     if command == "sync" && !parity.is_dir() {
         bail!(
             "{} is not initialized; run `project-parity init LOCAL_DIR UPSTREAM_DIR` first",
@@ -9321,22 +9346,36 @@ fn sync_project(local: &Path, upstream: &Path, command: &'static str) -> Result<
         );
     }
     fs::create_dir_all(&parity)?;
+    let parity = parity.canonicalize()?;
+    let config_path = parity.join("config.json");
+    let config_path = if config_path.exists() { config_path.canonicalize()? } else { config_path };
+    let report = parity.join("report");
+    let state_db = parity.join("state.sqlite");
     let _lock = acquire_sync_lock(&parity)?;
+    if config_path.exists() {
+        let (_, configured_upstream) = read_project_config_at(&local, &config_path)?;
+        if configured_upstream != upstream {
+            bail!("root identity mismatch with project config at {}; use a separate report and state database for different roots", config_path.display());
+        }
+    }
     let report_started = Instant::now();
-    let summary = run(local, upstream, &report)?;
+    let guard = state::SyncGuard::for_generation(&local, &upstream, &report, Some(&state_db))?;
+    let summary = generate_report(&guard, &[])?;
     eprintln!(
         "[project-parity] report generation complete ({:.1}s)",
         report_started.elapsed().as_secs_f64()
     );
     let state_started = Instant::now();
-    let sync = state::sync(&state_db, &report)?;
+    let sync = guard.sync()?;
+    guard.finish_generation()?;
     eprintln!(
         "[project-parity] queue state updated: {} items, {} remaining ({:.1}s)",
         sync["workItems"].as_u64().unwrap_or_default(),
         sync["remaining"].as_i64().unwrap_or_default(),
         state_started.elapsed().as_secs_f64()
     );
-    let config = write_project_config(local, upstream)?;
+    let (local_root, upstream_root, _) = guard.paths();
+    let config = write_project_config(local_root, upstream_root, &config_path)?;
     Ok(serde_json::json!({
         "schema": format!("project-parity/{command}-v1"),
         "local": local,
@@ -9716,18 +9755,20 @@ fn main() -> Result<()> {
         .map(|path| read_bundle_equivalence_certificates(Path::new(path)))
         .transpose()?
         .unwrap_or_default();
-    let summary = run_with_certificates(
+    let guard = state::SyncGuard::for_generation(
         Path::new(&args[0]),
         Path::new(&args[1]),
         output,
-        &certificates,
+        None,
     )?;
+    let summary = generate_report(&guard, &certificates)?;
+    guard.finish_generation()?;
     print_stdout(serde_json::to_string_pretty(&summary)?)?;
     if summary.left_failures > 0 || summary.right_failures > 0 {
         std::process::exit(2);
     }
     if let Some(oracle) = oracle {
-        let metrics = evaluate_oracle(output, Path::new(oracle))?;
+        let metrics = evaluate_oracle(&guard, Path::new(oracle))?;
         print_stdout(serde_json::to_string_pretty(&metrics)?)?;
         if metrics.false_promotions > 0 {
             std::process::exit(3);
@@ -9739,6 +9780,288 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn root_identity_projects(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let local = root.join("local");
+        let upstream = root.join("upstream");
+        let foreign = root.join("foreign");
+        for path in [&local, &upstream, &foreign] {
+            fs::create_dir(path).unwrap();
+            fs::write(path.join("entry.js"), "export const answer = 42;\n").unwrap();
+        }
+        (local, upstream, foreign)
+    }
+
+    #[test]
+    fn root_identity_init_and_sync_reject_before_overwriting_report_or_config() {
+        for command in ["init", "sync"] {
+            let root = tempdir().unwrap();
+            let (local, upstream, foreign) = root_identity_projects(root.path());
+            sync_project(&local, &upstream, "init").unwrap();
+            let paths = ["config.json", "report/llm-manifest.json", "report/llm-work-items.jsonl", "state.sqlite"];
+            let before: Vec<_> = paths.iter().map(|path| fs::read(local.join(".parity").join(path)).unwrap()).collect();
+            assert!(sync_project(&local, &foreign, command).is_err(), "{command} must reject a different upstream even when all source bytes match");
+            let after: Vec<_> = paths.iter().map(|path| fs::read(local.join(".parity").join(path)).unwrap()).collect();
+            assert_eq!(after, before);
+        }
+    }
+
+    #[test]
+    fn root_identity_direct_generation_and_mcp_reject_foreign_report() {
+        let root = tempdir().unwrap();
+        let (local, upstream, foreign) = root_identity_projects(root.path());
+        let output = root.path().join("report");
+        run(&local, &upstream, &output).unwrap();
+        let before = fs::read(output.join("llm-manifest.json")).unwrap();
+        assert!(run(&local, &foreign, &output).is_err());
+        assert_eq!(fs::read(output.join("llm-manifest.json")).unwrap(), before);
+        let result = mcp_tool_result("resync", &serde_json::json!({}), &output, None, &local, &foreign);
+        assert_eq!(result["isError"], true);
+        assert_eq!(fs::read(output.join("llm-manifest.json")).unwrap(), before);
+    }
+
+    #[test]
+    fn root_identity_rejects_nonempty_output_with_unknown_provenance() {
+        let root = tempdir().unwrap();
+        let (local, upstream, _) = root_identity_projects(root.path());
+        let output = root.path().join("report");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("llm-work-items.jsonl"), "previous evidence\n").unwrap();
+        assert!(run(&local, &upstream, &output).is_err());
+        assert_eq!(fs::read_to_string(output.join("llm-work-items.jsonl")).unwrap(), "previous evidence\n");
+        assert!(!output.join("llm-manifest.json").exists());
+    }
+
+    #[test]
+    fn root_identity_interrupted_first_generation_retries_only_same_roots() {
+        for partial in [None, Some("llm-manifest.json"), Some("report.json")] {
+            let root = tempdir().unwrap();
+            let (local, upstream, foreign) = root_identity_projects(root.path());
+            let output = root.path().join("report");
+            drop(state::SyncGuard::for_generation(&local, &upstream, &output, None).unwrap());
+            if let Some(name) = partial { fs::write(output.join(name), "{\"partial\":").unwrap(); }
+            assert!(run(&local, &foreign, &output).is_err());
+            run(&local, &upstream, &output).unwrap();
+            let marker: serde_json::Value = serde_json::from_slice(&fs::read(output.join("root-identity.json")).unwrap()).unwrap();
+            assert_eq!(marker["generationInProgress"], false);
+            fs::write(output.join("report.json"), "{untracked corruption").unwrap();
+            assert!(run(&local, &upstream, &output).is_err(), "completed reports must not silently hide unrelated corruption");
+        }
+    }
+
+    #[test]
+    fn root_identity_uncommitted_marker_without_evidence_can_retry() {
+        let root = tempdir().unwrap();
+        let (local, upstream, _) = root_identity_projects(root.path());
+        let output = root.path().join("report");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join(".root-identity.json.tmp"), "{partial identity").unwrap();
+        run(&local, &upstream, &output).unwrap();
+        assert!(output.join("llm-manifest.json").is_file());
+        assert!(!output.join(".root-identity.json.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_identity_accepts_canonical_symlink_aliases() {
+        let root = tempdir().unwrap();
+        let (local, upstream, _) = root_identity_projects(root.path());
+        let output = root.path().join("report");
+        let db = root.path().join("state.sqlite");
+        run_and_sync(&local, &upstream, &output, Some(&db)).unwrap();
+        let local_alias = root.path().join("local-alias");
+        let upstream_alias = root.path().join("upstream-alias");
+        std::os::unix::fs::symlink(&local, &local_alias).unwrap();
+        std::os::unix::fs::symlink(&upstream, &upstream_alias).unwrap();
+        run_and_sync(&local_alias, &upstream_alias, &output, Some(&db)).unwrap();
+        fs::remove_dir_all(&output).unwrap();
+        run_and_sync(&local_alias, &upstream_alias, &output, Some(&db)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_identity_uses_captured_paths_after_aliases_are_retargeted() {
+        use std::os::unix::fs::symlink;
+        let root = tempdir().unwrap();
+        let (local, upstream, foreign) = root_identity_projects(root.path());
+        let output = root.path().join("report");
+        let foreign_output = root.path().join("foreign-report");
+        let db = root.path().join("state.sqlite");
+        let foreign_db = root.path().join("foreign.sqlite");
+        run_and_sync(&local, &upstream, &output, Some(&db)).unwrap();
+        run_and_sync(&foreign, &foreign, &foreign_output, Some(&foreign_db)).unwrap();
+        write_service_status(&foreign_output, "running", 55).unwrap();
+        let foreign_manifest = fs::read(foreign_output.join("llm-manifest.json")).unwrap();
+        let foreign_state = fs::read(&foreign_db).unwrap();
+        let foreign_status = fs::read(foreign_output.join("serve-status.json")).unwrap();
+        let aliases = ["local-alias", "upstream-alias", "report-alias", "state-alias"].map(|name| root.path().join(name));
+        for (alias, target) in aliases.iter().zip([&local, &upstream, &output, &db]) { symlink(target, alias).unwrap(); }
+        let guard = state::SyncGuard::for_generation(&aliases[0], &aliases[1], &aliases[2], Some(&aliases[3])).unwrap();
+        for (alias, target) in aliases.iter().zip([&foreign, &foreign, &foreign_output, &foreign_db]) {
+            fs::remove_file(alias).unwrap();
+            symlink(target, alias).unwrap();
+        }
+        generate_report(&guard, &[]).unwrap();
+        guard.sync().unwrap();
+        guard.finish_generation().unwrap();
+        drop(guard);
+        let manifest: serde_json::Value = serde_json::from_slice(&fs::read(output.join("llm-manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["localRoot"].as_str(), local.canonicalize().unwrap().to_str());
+        assert_eq!(manifest["analysisProjection"].as_str(), upstream.canonicalize().unwrap().to_str());
+        fs::remove_file(&aliases[2]).unwrap();
+        symlink(&output, &aliases[2]).unwrap();
+        let identity = state::RootIdentity::new(&local, &upstream).unwrap();
+        let (_status_lock, captured_output) = identity.lock_report_status(&aliases[2]).unwrap();
+        fs::remove_file(&aliases[2]).unwrap();
+        symlink(&foreign_output, &aliases[2]).unwrap();
+        write_service_status(&captured_output, "failed", 0).unwrap();
+        assert_eq!(fs::read(foreign_output.join("llm-manifest.json")).unwrap(), foreign_manifest);
+        assert_eq!(fs::read(&foreign_db).unwrap(), foreign_state);
+        assert_eq!(fs::read(foreign_output.join("serve-status.json")).unwrap(), foreign_status);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_identity_oracle_keeps_lock_and_captured_output_after_alias_retarget() {
+        let root = tempdir().unwrap();
+        let (local, upstream, foreign) = root_identity_projects(root.path());
+        let output = root.path().join("report");
+        let foreign_output = root.path().join("foreign-report");
+        run(&local, &upstream, &output).unwrap();
+        run(&foreign, &foreign, &foreign_output).unwrap();
+        let alias = root.path().join("report-alias");
+        std::os::unix::fs::symlink(&output, &alias).unwrap();
+        let guard = state::SyncGuard::for_generation(&local, &upstream, &alias, None).unwrap();
+        generate_report(&guard, &[]).unwrap();
+        guard.finish_generation().unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&foreign_output, &alias).unwrap();
+        let oracle = root.path().join("oracle.json");
+        fs::write(&oracle, "{}").unwrap();
+        fs::write(foreign_output.join("oracle-report.json"), "retained oracle evidence").unwrap();
+
+        assert!(run(&local, &upstream, &output).is_err(), "oracle evaluation must retain the report writer lock");
+        evaluate_oracle(&guard, &oracle).unwrap();
+        assert!(output.join("oracle-report.json").is_file());
+        assert_eq!(fs::read_to_string(foreign_output.join("oracle-report.json")).unwrap(), "retained oracle evidence");
+        drop(guard);
+        assert!(run(&local, &upstream, &output).is_ok());
+    }
+
+    #[test]
+    fn root_identity_allows_selected_state_database_inside_new_report_directory() {
+        let root = tempdir().unwrap();
+        let (local, upstream, foreign) = root_identity_projects(root.path());
+        let output = root.path().join("report");
+        let db = output.join("state.sqlite");
+        run_and_sync(&local, &upstream, &output, Some(&db)).unwrap();
+        assert!(run_and_sync(&local, &foreign, &output, Some(&db)).is_err());
+        assert!(state::sync(&db, &output).is_ok());
+    }
+
+    #[test]
+    fn root_identity_generation_lock_blocks_mcp_and_direct_state_sync() {
+        let root = tempdir().unwrap();
+        let (local, upstream, _) = root_identity_projects(root.path());
+        let output = root.path().join("report");
+        let db = root.path().join("state.sqlite");
+        run_and_sync(&local, &upstream, &output, Some(&db)).unwrap();
+        let guard = state::SyncGuard::for_generation(&local, &upstream, &output, Some(&db)).unwrap();
+        let before = fs::read(output.join("llm-manifest.json")).unwrap();
+        let result = mcp_tool_result("resync", &serde_json::json!({}), &output, Some(&db), &local, &upstream);
+        assert_eq!(result["isError"], true);
+        assert!(state::sync(&db, &output).is_err());
+        assert_eq!(fs::read(output.join("llm-manifest.json")).unwrap(), before);
+        guard.finish_generation().unwrap();
+        drop(guard);
+        assert!(state::sync(&db, &output).is_ok());
+    }
+
+    #[test]
+    fn root_identity_services_reject_foreign_roots_without_status_writes() {
+        let root = tempdir().unwrap();
+        let (local, upstream, foreign) = root_identity_projects(root.path());
+        let output = root.path().join("report");
+        run(&local, &upstream, &output).unwrap();
+        write_service_status(&output, "running", 7).unwrap();
+        let before = fs::read(output.join("serve-status.json")).unwrap();
+        let delay = Duration::from_millis(1);
+        assert!(watch(&local, &foreign, &output, None, delay, delay).is_err());
+        assert!(serve(&local, &foreign, &output, None, delay, delay).is_err());
+        assert!(serve_mcp(&local, &foreign, &output, None, delay, delay).is_err());
+        assert_eq!(fs::read(output.join("serve-status.json")).unwrap(), before);
+    }
+
+    #[test]
+    fn root_identity_service_reports_failed_after_source_root_disappears() {
+        let root = tempdir().unwrap();
+        let (local, upstream, _) = root_identity_projects(root.path());
+        let output = root.path().join("report");
+        let thread_roots = (local.clone(), upstream.clone(), output.clone());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let delay = Duration::from_millis(10);
+            sender.send(serve(&thread_roots.0, &thread_roots.1, &thread_roots.2, None, delay, delay)).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = fs::read(output.join("serve-status.json")).ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            if status.is_some_and(|value| value["phase"] == "running") { break; }
+            assert!(Instant::now() < deadline, "service did not reach running state");
+            thread::sleep(Duration::from_millis(10));
+        }
+        fs::remove_dir_all(&upstream).unwrap();
+        assert!(receiver.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
+        worker.join().unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&fs::read(output.join("serve-status.json")).unwrap()).unwrap();
+        assert_eq!(status["phase"], "failed");
+    }
+
+    #[test]
+    fn root_identity_failure_status_waits_for_active_writer() {
+        let root = tempdir().unwrap();
+        let (local, upstream, _) = root_identity_projects(root.path());
+        let output = root.path().join("report");
+        run(&local, &upstream, &output).unwrap();
+        write_service_status(&output, "running", 0).unwrap();
+        let guard = state::SyncGuard::for_generation(&local, &upstream, &output, None).unwrap();
+        let identity = state::RootIdentity::new(&local, &upstream).unwrap();
+        let paths = (local.clone(), upstream.clone(), output.clone());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let delay = Duration::from_millis(1);
+            assert!(watch(&paths.0, &paths.1, &paths.2, None, delay, delay).is_err());
+            sender.send(()).unwrap();
+            let (_lock, report) = identity.lock_report_status(&paths.2).unwrap();
+            write_service_status(&report, "failed", 0).unwrap();
+            sender.send(()).unwrap();
+        });
+
+        receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(receiver.recv_timeout(Duration::from_millis(100)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)), "service must wait to record its failure while another writer owns the report");
+        guard.finish_generation().unwrap();
+        drop(guard);
+        receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&fs::read(output.join("serve-status.json")).unwrap()).unwrap();
+        assert_eq!(status["phase"], "failed");
+    }
+
+    #[test]
+    fn root_identity_service_reports_failed_without_committing_failed_state_sync() {
+        let root = tempdir().unwrap();
+        let (local, upstream, _) = root_identity_projects(root.path());
+        let output = root.path().join("report");
+        let db = root.path().join("state.sqlite");
+        run_and_sync(&local, &upstream, &output, Some(&db)).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_run BEFORE INSERT ON runs BEGIN SELECT RAISE(ABORT, 'injected sync failure'); END;").unwrap();
+        assert!(update_watched_report(&local, &upstream, &output, Some(&db), &[], false).is_err());
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        let status: serde_json::Value = serde_json::from_slice(&fs::read(output.join("serve-status.json")).unwrap()).unwrap();
+        assert_eq!(status["phase"], "failed");
+    }
 
     #[test]
     fn graph_edge_id_sharing_preserves_wire_values_and_distinct_identifiers() {
@@ -10095,7 +10418,69 @@ mod tests {
         let second = acquire_sync_lock(root.path()).unwrap();
         assert!(root.path().join("sync.lock").is_file());
         drop(second);
-        assert!(!root.path().join("sync.lock").exists());
+        assert!(root.path().join("sync.lock").is_file());
+        assert!(acquire_sync_lock(root.path()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_lock_rejects_symlinks_without_touching_targets() {
+        use std::os::unix::fs::symlink;
+        let root = tempdir().unwrap();
+        let lock = root.path().join("sync.lock");
+        let victim = root.path().join("victim");
+        fs::write(&victim, b"keep these bytes").unwrap();
+        symlink(&victim, &lock).unwrap();
+        assert!(acquire_path_lock(&lock, false).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"keep these bytes");
+        fs::remove_file(&lock).unwrap();
+        let missing = root.path().join("missing");
+        symlink(&missing, &lock).unwrap();
+        assert!(acquire_path_lock(&lock, false).is_err());
+        assert!(!missing.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_lock_does_not_modify_hard_linked_file_contents() {
+        let root = tempdir().unwrap();
+        let victim = root.path().join("victim");
+        let lock = root.path().join("sync.lock");
+        fs::write(&victim, b"keep these bytes").unwrap();
+        fs::hard_link(&victim, &lock).unwrap();
+        let guard = acquire_path_lock(&lock, false).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"keep these bytes");
+        drop(guard);
+    }
+
+    #[test]
+    fn root_identity_stale_lock_has_one_owner_without_replacing_inode() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("sync.lock");
+        fs::write(&path, "pid=4294967295 started=stale\n").unwrap();
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&path).unwrap());
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let release = Arc::new(std::sync::Barrier::new(3));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let workers: Vec<_> = (0..2).map(|_| {
+            let (path, start, release, sender) = (path.clone(), start.clone(), release.clone(), sender.clone());
+            thread::spawn(move || {
+                start.wait();
+                let lock = acquire_path_lock(&path, false);
+                sender.send(lock.is_ok()).unwrap();
+                release.wait();
+                drop(lock);
+            })
+        }).collect();
+        start.wait();
+        let mut results = [receiver.recv_timeout(Duration::from_secs(5)).unwrap(), receiver.recv_timeout(Duration::from_secs(5)).unwrap()];
+        release.wait();
+        for worker in workers { worker.join().unwrap(); }
+        results.sort();
+        assert_eq!(results, [false, true]);
+        #[cfg(unix)]
+        assert_eq!(std::os::unix::fs::MetadataExt::ino(&fs::metadata(&path).unwrap()), inode);
     }
     use tempfile::tempdir;
 
@@ -13496,7 +13881,8 @@ mod tests {
         let left = tempdir().unwrap();
         let right = tempdir().unwrap();
         let output = tempdir().unwrap();
-        let oracle_path = output.path().join("oracle.json");
+        let oracle = tempdir().unwrap();
+        let oracle_path = oracle.path().join("oracle.json");
         fs::write(
             left.path().join("left.js"),
             "export function expected(a){return a+1}\nexport function forbidden(a){return a-1}",
@@ -13524,8 +13910,10 @@ mod tests {
         )
         .unwrap();
 
-        run(left.path(), right.path(), output.path()).unwrap();
-        let metrics = evaluate_oracle(output.path(), &oracle_path).unwrap();
+        let guard = state::SyncGuard::for_generation(left.path(), right.path(), output.path(), None).unwrap();
+        generate_report(&guard, &[]).unwrap();
+        guard.finish_generation().unwrap();
+        let metrics = evaluate_oracle(&guard, &oracle_path).unwrap();
 
         assert_eq!(metrics.expected, 1);
         assert_eq!(metrics.promoted_correct, 1);
@@ -13537,8 +13925,10 @@ mod tests {
     fn bundled_oracle_fixture_has_full_recall_and_abstains_on_protocol_change() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/oracle-basic");
         let output = tempdir().unwrap();
-        run(&fixture.join("left"), &fixture.join("right"), output.path()).unwrap();
-        let metrics = evaluate_oracle(output.path(), &fixture.join("oracle.json")).unwrap();
+        let guard = state::SyncGuard::for_generation(&fixture.join("left"), &fixture.join("right"), output.path(), None).unwrap();
+        generate_report(&guard, &[]).unwrap();
+        guard.finish_generation().unwrap();
+        let metrics = evaluate_oracle(&guard, &fixture.join("oracle.json")).unwrap();
         assert_eq!(metrics.promoted_precision, 1.0);
         assert_eq!(metrics.top_k_recall, 1.0);
         assert_eq!(metrics.abstained_expected, 1);
