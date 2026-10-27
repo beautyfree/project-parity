@@ -45,7 +45,7 @@ mod visualize;
 use semantic_graph::{share_graph_edge_ids, GraphEdge, GraphNode, SemanticGraph};
 
 const CODE_EXTENSIONS: &[&str] = &["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"];
-const ENGINE_VERSION: &str = "rust-oxc-0.126.0/v71";
+const ENGINE_VERSION: &str = "rust-oxc-0.126.0/v72";
 // Graph extraction is cache material: change this whenever semantic nodes or
 // edges change, otherwise an old cache silently erases newly added ownership
 // links from a report.
@@ -1119,9 +1119,10 @@ fn is_conventionally_filtered_source(relative: &str) -> bool {
             .any(|needle| relative.contains(needle))
 }
 
-/// Read only runtime module edges from a source file. A parse failure leaves the
-/// file out of the rescue set: discovery must not guess an import target.
-fn runtime_module_specifiers(path: &Path, relative: &str) -> BTreeSet<String> {
+/// Read only runtime module edges from a source file. A parse or semantic
+/// failure leaves the file out of the rescue set: discovery must not guess an
+/// import target or build the full owner graph just to find module strings.
+fn runtime_module_specifiers(path: &Path) -> BTreeSet<String> {
     let Ok(source) = fs::read_to_string(path) else {
         return BTreeSet::new();
     };
@@ -1133,34 +1134,16 @@ fn runtime_module_specifiers(path: &Path, relative: &str) -> BTreeSet<String> {
     } else {
         source_type
     };
-    let Ok((_, _, graph)) = canonicalize(&source, source_type, relative, "discovery") else {
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, &source, source_type).parse();
+    if !parsed.errors.is_empty() {
         return BTreeSet::new();
-    };
-    let module_nodes = graph
-        .nodes
-        .iter()
-        .map(|node| (node.id.as_str(), node.label.as_str()))
-        .collect::<HashMap<_, _>>();
-    graph
-        .edges
-        .iter()
-        .filter(|edge| {
-            matches!(
-                edge.kind.as_str(),
-                "Imports"
-                    | "ImportsBinding"
-                    | "Requires"
-                    | "RequiresBinding"
-                    | "DynamicImports"
-                    | "DynamicImportsBinding"
-                    | "ReExports"
-                    | "ReExportsBinding"
-            )
-        })
-        .filter_map(|edge| module_nodes.get(edge.target.as_str()))
-        .filter_map(|label| label.strip_prefix("module:"))
-        .map(str::to_string)
-        .collect()
+    }
+    let built = SemanticBuilder::new().build(&parsed.program);
+    if !built.errors.is_empty() {
+        return BTreeSet::new();
+    }
+    semantic_graph::runtime_module_specifiers(&parsed.program, &built.semantic)
 }
 
 /// Filename conventions are a useful bulk-corpus reduction, but a module
@@ -1186,10 +1169,10 @@ fn rescue_reachable_source_candidates(
         .collect::<HashMap<_, _>>();
     let mut queue = included.keys().cloned().collect::<VecDeque<_>>();
     while let Some(importer) = queue.pop_front() {
-        let Some(importer_relative) = included.get(&importer) else {
+        if !included.contains_key(&importer) {
             continue;
-        };
-        for specifier in runtime_module_specifiers(&importer, importer_relative) {
+        }
+        for specifier in runtime_module_specifiers(&importer) {
             if !specifier.starts_with('.') {
                 continue;
             }
@@ -13372,6 +13355,47 @@ mod tests {
         assert!(files.iter().any(|relative| relative.ends_with("/lib/helper.test.js")));
         assert!(!files.iter().any(|relative| relative.ends_with("/lib/orphan.stories.js")));
         assert!(!files.iter().any(|relative| relative.ends_with("/dist/fixture.test.js")));
+    }
+
+    #[test]
+    fn runtime_module_specifier_extraction_keeps_runtime_edges_and_respects_scope() {
+        let source = r#"
+            import "./side-effect.js";
+            import type { Shape } from "./types.js";
+            import { type Item } from "./typed-specifier.js";
+            import value from "./value.js";
+            export { value as alias } from "./named-reexport.js";
+            export * from "./star-reexport.js";
+            export type { Shape } from "./type-reexport.js";
+            const lazy = import("./dynamic.js");
+            const required = require("./required.js");
+            import Legacy = require("./legacy.js");
+            function shadowed(require: (path: string) => void) {
+              require("./shadowed.js");
+            }
+        "#;
+        let allocator = Allocator::default();
+        let source_type = SourceType::ts();
+        let parsed = Parser::new(&allocator, source, source_type).parse();
+        assert!(parsed.errors.is_empty(), "fixture must parse: {:?}", parsed.errors);
+        let built = SemanticBuilder::new().build(&parsed.program);
+        assert!(built.errors.is_empty(), "fixture must resolve scopes: {:?}", built.errors);
+
+        let specifiers = semantic_graph::runtime_module_specifiers(&parsed.program, &built.semantic);
+
+        assert_eq!(
+            specifiers,
+            BTreeSet::from([
+                "./dynamic.js".to_string(),
+                "./legacy.js".to_string(),
+                "./named-reexport.js".to_string(),
+                "./required.js".to_string(),
+                "./side-effect.js".to_string(),
+                "./star-reexport.js".to_string(),
+                "./typed-specifier.js".to_string(),
+                "./value.js".to_string(),
+            ])
+        );
     }
 
     #[test]

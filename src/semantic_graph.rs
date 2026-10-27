@@ -7,7 +7,7 @@ use oxc_ast::{
         ComputedMemberExpression, Declaration, ExportAllDeclaration, ExportDefaultDeclaration,
         ExportNamedDeclaration, Function, IdentifierReference, ImportDeclaration,
         ImportDeclarationSpecifier, ImportExpression, JSXElement, JSXElementName, ModuleExportName,
-        NewExpression, ParenthesizedExpression, Program, PropertyKey, Statement,
+        Expression, NewExpression, ParenthesizedExpression, Program, PropertyKey, Statement,
         StaticMemberExpression, TSAsExpression, TSExportAssignment, TSImportEqualsDeclaration,
         TSInstantiationExpression, TSModuleReference, TSNonNullExpression, TSSatisfiesExpression,
         TSTypeAnnotation, TSTypeAssertion, TSTypeParameterDeclaration, TSTypeParameterInstantiation,
@@ -66,6 +66,11 @@ pub(crate) fn share_graph_edge_ids(edges: &mut [GraphEdge], ids: &mut HashSet<Ar
 pub(crate) struct SemanticGraph {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
+}
+
+struct RuntimeModuleSpecifierCollector<'a, 's> {
+    semantic: &'a Semantic<'s>,
+    specifiers: BTreeSet<String>,
 }
 
 struct PendingNode {
@@ -1311,6 +1316,95 @@ impl<'a> Visit<'a> for GraphCollector<'a, '_> {
             );
         }
         walk::walk_export_all_declaration(self, declaration);
+    }
+}
+
+/// Collect the same statically named runtime module edges used by discovery,
+/// without constructing the full ownership graph. This keeps relative-import
+/// closure checks cheap while preserving Oxc parsing and lexical `require`
+/// binding resolution.
+pub(crate) fn runtime_module_specifiers<'s>(
+    program: &Program<'s>,
+    semantic: &Semantic<'s>,
+) -> BTreeSet<String> {
+    let mut collector = RuntimeModuleSpecifierCollector {
+        semantic,
+        specifiers: BTreeSet::new(),
+    };
+    collector.visit_program(program);
+    collector.specifiers
+}
+
+impl<'s> Visit<'s> for RuntimeModuleSpecifierCollector<'_, 's> {
+    fn visit_import_declaration(&mut self, declaration: &ImportDeclaration<'s>) {
+        if !declaration.import_kind.is_type() {
+            self.specifiers
+                .insert(declaration.source.value.to_string());
+        }
+        walk::walk_import_declaration(self, declaration);
+    }
+
+    fn visit_ts_import_equals_declaration(&mut self, declaration: &TSImportEqualsDeclaration<'s>) {
+        if !declaration.import_kind.is_type() {
+            if let TSModuleReference::ExternalModuleReference(reference) =
+                &declaration.module_reference
+            {
+                self.specifiers
+                    .insert(reference.expression.value.to_string());
+            }
+        }
+        walk::walk_ts_import_equals_declaration(self, declaration);
+    }
+
+    fn visit_export_named_declaration(&mut self, declaration: &ExportNamedDeclaration<'s>) {
+        let declaration_is_type = declaration.export_kind == ImportOrExportKind::Type
+            || declaration
+                .declaration
+                .as_ref()
+                .is_some_and(Declaration::is_type);
+        if !declaration_is_type
+            && declaration
+                .specifiers
+                .iter()
+                .any(|specifier| specifier.export_kind != ImportOrExportKind::Type)
+        {
+            if let Some(source) = &declaration.source {
+                self.specifiers.insert(source.value.to_string());
+            }
+        }
+        walk::walk_export_named_declaration(self, declaration);
+    }
+
+    fn visit_export_all_declaration(&mut self, declaration: &ExportAllDeclaration<'s>) {
+        if declaration.export_kind != ImportOrExportKind::Type {
+            self.specifiers
+                .insert(declaration.source.value.to_string());
+        }
+        walk::walk_export_all_declaration(self, declaration);
+    }
+
+    fn visit_import_expression(&mut self, expression: &ImportExpression<'s>) {
+        if let Expression::StringLiteral(module) = expression.source.get_inner_expression() {
+            self.specifiers.insert(module.value.to_string());
+        }
+        walk::walk_import_expression(self, expression);
+    }
+
+    fn visit_call_expression(&mut self, expression: &CallExpression<'s>) {
+        if let Some(identifier) = expression.callee.get_identifier_reference() {
+            let reference = self
+                .semantic
+                .scoping()
+                .get_reference(identifier.reference_id());
+            if identifier.name == "require" && reference.symbol_id().is_none() {
+                if let Some(oxc_ast::ast::Argument::StringLiteral(module)) =
+                    expression.arguments.first()
+                {
+                    self.specifiers.insert(module.value.to_string());
+                }
+            }
+        }
+        walk::walk_call_expression(self, expression);
     }
 }
 
