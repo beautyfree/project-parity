@@ -45,7 +45,7 @@ mod visualize;
 use semantic_graph::{share_graph_edge_ids, GraphEdge, GraphNode, SemanticGraph};
 
 const CODE_EXTENSIONS: &[&str] = &["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"];
-const ENGINE_VERSION: &str = "rust-oxc-0.126.0/v73";
+const ENGINE_VERSION: &str = "rust-oxc-0.126.0/v74";
 // Graph extraction is cache material: change this whenever semantic nodes or
 // edges change, otherwise an old cache silently erases newly added ownership
 // links from a report.
@@ -5999,7 +5999,7 @@ fn insert_graph_pair(
     key: (String, String),
     candidate: PairMeta,
 ) {
-    if let Some(existing) = pair_meta.get_mut(&key) {
+    if let Some(existing) = pair_meta.get(&key) {
         let candidate_key = (
             candidate.basis != "neighbor-binding-owner",
             candidate.depth,
@@ -6033,7 +6033,18 @@ fn insert_graph_pair(
                 .unwrap_or(""),
         );
         if candidate_key < existing_key {
-            *existing = candidate;
+            // A better-ranked relation can point to a descendant of this pair.
+            // Replacing the ancestor with that relation would erase the seed
+            // and create a cycle in the evidence path.
+            let mut cursor = candidate.source.as_ref();
+            let mut seen = HashSet::new();
+            while let Some(source) = cursor {
+                if source == &key || !seen.insert(source.clone()) {
+                    return;
+                }
+                cursor = pair_meta.get(source).and_then(|meta| meta.source.as_ref());
+            }
+            pair_meta.insert(key, candidate);
         }
         return;
     }
@@ -11010,6 +11021,49 @@ mod tests {
     }
 
     #[test]
+    fn graph_pair_provenance_rejects_cyclic_replacements() {
+        for seed_basis in ["seed-unit", "global-behavior"] {
+            let mut pairs = BTreeMap::new();
+            let mut left_to_right = HashMap::new();
+            let mut right_to_left = HashMap::new();
+            let mut queue = VecDeque::new();
+            let mut conflicts = BTreeSet::new();
+            let pair = |n: &str| (format!("left-{n}"), format!("right-{n}"));
+            let meta = |basis, depth, source| PairMeta {
+                basis, depth, via_edge: None, source,
+            };
+            for (key, candidate) in [
+                (pair("seed"), meta(seed_basis, 0, None)),
+                (pair("owner"), meta("neighbor-normalized", 1, Some(pair("seed")))),
+                (pair("scope"), meta("neighbor-structural-exact", 2, Some(pair("owner")))),
+                (pair("symbol"), meta("neighbor-exact", 3, Some(pair("scope")))),
+            ] {
+                insert_graph_pair(&mut pairs, &mut left_to_right, &mut right_to_left, &mut queue, &mut conflicts, key, candidate);
+            }
+            insert_graph_pair(&mut pairs, &mut left_to_right, &mut right_to_left, &mut queue, &mut conflicts,
+                pair("seed"), meta("neighbor-binding-owner", 4, Some(pair("symbol"))));
+            assert_eq!(pairs[&pair("seed")].basis, seed_basis);
+            assert!(pairs[&pair("seed")].source.is_none());
+            insert_graph_pair(&mut pairs, &mut left_to_right, &mut right_to_left, &mut queue, &mut conflicts,
+                pair("seed"), meta("neighbor-binding-owner", 1, Some(pair("seed"))));
+            assert_eq!(pairs[&pair("seed")].basis, seed_basis);
+            // A corrupt pre-existing source cycle must not be adopted either.
+            pairs.insert(pair("cycle-a"), meta("neighbor-exact", 1, Some(pair("cycle-b"))));
+            pairs.insert(pair("cycle-b"), meta("neighbor-exact", 2, Some(pair("cycle-a"))));
+            insert_graph_pair(&mut pairs, &mut left_to_right, &mut right_to_left, &mut queue, &mut conflicts,
+                pair("seed"), meta("neighbor-binding-owner", 1, Some(pair("cycle-a"))));
+            assert_eq!(pairs[&pair("seed")].basis, seed_basis);
+            // A stronger binding from an independent source must remain eligible.
+            insert_graph_pair(&mut pairs, &mut left_to_right, &mut right_to_left, &mut queue, &mut conflicts,
+                pair("other"), meta("seed-unit", 0, None));
+            insert_graph_pair(&mut pairs, &mut left_to_right, &mut right_to_left, &mut queue, &mut conflicts,
+                pair("seed"), meta("neighbor-binding-owner", 1, Some(pair("other"))));
+            assert_eq!(pairs[&pair("seed")].basis, "neighbor-binding-owner");
+            assert_eq!(pairs[&pair("seed")].source, Some(pair("other")));
+        }
+    }
+
+    #[test]
     fn semantic_graph_preserves_scopes_side_effects_iifes_and_typed_edges() {
         let source = r#"
             import { boot as importedBoot } from 'pkg';
@@ -14091,8 +14145,8 @@ mod tests {
         let work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
         assert!(work
             .iter()
-            .any(|item| item["action"] == "inspect-unverified-missing-branch"
-                && item["reason"] == "The frontier has no behavioral-edge corroboration; inspect its semantics before proposing a code change."));
+            .any(|item| item["action"] == "inspect-structural-frontier"
+                && item["confidence"] == "weak-candidate"));
         assert!(!work
             .iter()
             .any(|item| item["action"] == "port-missing-upstream-branch"));

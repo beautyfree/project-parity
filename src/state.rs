@@ -12,6 +12,25 @@ use std::{
 
 use super::ENGINE_VERSION;
 
+fn compatible_legacy_variant_action(current: Option<&str>, variant: &str) -> bool {
+    match (current, variant) {
+        (Some(current), variant) if current == variant => true,
+        (
+            Some("port-missing-upstream-branch" | "inspect-unverified-missing-branch"),
+            "port-missing-upstream-branch" | "inspect-unverified-missing-branch" | "inspect-structural-frontier",
+        ) => true,
+        (
+            Some("reconcile-changed-branch" | "inspect-unverified-changed-branch"),
+            "reconcile-changed-branch" | "inspect-unverified-changed-branch",
+        ) => true,
+        (
+            Some("resolve-ambiguous-owners" | "remove-or-justify-extra-local"),
+            "inspect-structural-frontier",
+        ) => true,
+        _ => false,
+    }
+}
+
 fn routing_reclassification_preserves_evidence(previous: &str, current: &str) -> bool {
     let Ok(mut previous) = serde_json::from_str::<Value>(previous) else {
         return false;
@@ -41,25 +60,132 @@ fn routing_reclassification_preserves_evidence(previous: &str, current: &str) ->
         ) | (
             Some("inspect-weak-changed-branch"),
             Some("inspect-unverified-changed-branch")
+        ) | (
+            Some("inspect-unverified-missing-branch"),
+            Some("inspect-structural-frontier")
+        ) | (
+            Some("inspect-unverified-changed-branch"),
+            Some("inspect-structural-frontier")
+        ) | (
+            Some("resolve-ambiguous-owners"),
+            Some("inspect-structural-frontier")
+        ) | (
+            Some("remove-or-justify-extra-local"),
+            Some("inspect-structural-frontier")
         )
     );
-    if !same_frontier {
+    let same_action = previous_action.is_some() && previous_action == current_action;
+    // A v73 coalesced item could select a weaker route as its representative
+    // even when another variant carried the same owner's active route.
+    // Only permit this promotion during the actionless-variant migration.
+    let legacy_promotion = matches!(
+        (previous_action, current_action),
+        (
+            Some("inspect-unverified-missing-branch" | "inspect-weak-missing-branch"),
+            Some("port-missing-upstream-branch")
+        ) | (
+            Some("inspect-unverified-changed-branch" | "inspect-weak-changed-branch"),
+            Some("reconcile-changed-branch")
+        )
+    );
+    // Only the v73 schema omitted per-variant actions. Do not erase routing
+    // metadata from two current payloads: a changed route must be reviewed.
+    let legacy_variants = previous.get("evidenceVariants").and_then(Value::as_array);
+    let current_variants = current.get("evidenceVariants").and_then(Value::as_array);
+    let legacy_variant_migration = match (legacy_variants, current_variants) {
+        (Some(old), Some(new)) if !old.is_empty() && old.len() == new.len() => {
+            old.iter().all(|variant| variant.is_object() && variant.get("action").is_none())
+                && new.iter().all(|variant| {
+                    variant.get("action").and_then(Value::as_str)
+                        .is_some_and(|action| compatible_legacy_variant_action(current_action, action))
+                })
+        }
+        _ => false,
+    };
+    if !same_frontier && !same_action && !(legacy_promotion && legacy_variant_migration) {
         return false;
+    }
+    if legacy_variant_migration {
+        const STRUCTURAL_REASON: &str = "The frontier is supported only by structural or neighboring graph evidence; keep it visible for later review.";
+        const OLD_REASONS: &[&str] = &[
+            "The frontier has no behavioral-edge corroboration; inspect its semantics before proposing a code change.",
+            "An exact renamed owner has multiple valid graph routes; no arbitrary binding was promoted.",
+            "A typed local edge has no corresponding upstream edge at the first divergence.",
+        ];
+        let new_variants = current["evidenceVariants"].as_array().expect("legacy variants checked");
+        for old in previous["evidenceVariants"].as_array_mut().expect("legacy variants checked") {
+            if !old["reason"].as_str().is_some_and(|reason| OLD_REASONS.contains(&reason)) {
+                continue;
+            }
+            let mut comparable_old = old.clone();
+            comparable_old.as_object_mut().expect("variant object checked").remove("reason");
+            let matching_structural = new_variants.iter().any(|new| {
+                if new["action"] != "inspect-structural-frontier" || new["reason"] != STRUCTURAL_REASON {
+                    return false;
+                }
+                let mut comparable_new = new.clone();
+                let object = comparable_new.as_object_mut().expect("variant object checked");
+                object.remove("action");
+                object.remove("reason");
+                comparable_new == comparable_old
+            });
+            if matching_structural {
+                old["reason"] = Value::String(STRUCTURAL_REASON.to_owned());
+            }
+        }
     }
     for value in [&mut previous, &mut current] {
         if let Some(object) = value.as_object_mut() {
-            for key in ["action", "priority", "confidence", "reason", "batchId"] {
-                object.remove(key);
+            if same_frontier || legacy_promotion {
+                for key in ["action", "priority", "confidence", "reason", "batchId"] {
+                    object.remove(key);
+                }
+            }
+            if legacy_variant_migration {
+                if let Some(variants) = object.get_mut("evidenceVariants").and_then(Value::as_array_mut) {
+                    for variant in variants.iter_mut() {
+                        if let Some(variant) = variant.as_object_mut() {
+                            variant.remove("action");
+                        }
+                    }
+                    variants.sort_by_cached_key(|variant| serde_json::to_string(variant).unwrap_or_default());
+                }
             }
         }
     }
     previous == current
 }
 
+fn ensure_queue_index(conn: &Connection, name: &str, confidence: bool, batch: bool) -> Result<()> {
+    let mut ordering = "CASE WHEN action='remove-or-justify-extra-local' THEN 4 WHEN action='locate-unlinked-upstream-branch' THEN 5 WHEN action='inspect-structural-frontier' THEN 6 WHEN priority='P0' THEN 0 WHEN priority='P1' THEN 1 ELSE 2 END".to_string();
+    if confidence {
+        ordering.push_str(", CASE confidence WHEN 'proven-structure' THEN 0 WHEN 'proven-bundle-normalized' THEN 0 WHEN 'candidate' THEN 1 WHEN 'weak-candidate' THEN 2 ELSE 3 END");
+    }
+    if batch {
+        ordering.push_str(", batch_id");
+    }
+    let expected = format!("CREATE INDEX {name} ON work_items(resolved_at, {ordering}, id)");
+    let existing: Option<String> = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+        params![name],
+        |row| row.get(0),
+    ).optional()?;
+    if existing.as_deref() != Some(expected.as_str()) {
+        // A stale expression index cannot serve the new ordering. Rebuild it
+        // atomically once; subsequent syncs keep the current index intact.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(&format!("DROP INDEX IF EXISTS {name}; {expected};"))?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
 pub fn sync(db_path: &Path, report: &Path) -> Result<Value> {
     let shared = super::llm_context::read_shared_work_evidence(report)?;
     let conn = Connection::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, report TEXT NOT NULL, upstream_hash TEXT, local_hash TEXT, synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS work_items (id TEXT PRIMARY KEY, run_id INTEGER NOT NULL, action TEXT, priority TEXT, confidence TEXT, payload TEXT NOT NULL, first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, resolved_at TEXT, batch_id TEXT, FOREIGN KEY(run_id) REFERENCES runs(id)); CREATE TABLE IF NOT EXISTS work_item_decisions (work_item_id TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN ('skipped','pending_sync','done')), reason TEXT NOT NULL, decided_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, payload TEXT, FOREIGN KEY(work_item_id) REFERENCES work_items(id)); CREATE INDEX IF NOT EXISTS work_items_queue ON work_items(resolved_at, priority, id); CREATE INDEX IF NOT EXISTS work_items_queue_phase ON work_items(resolved_at, CASE WHEN action='remove-or-justify-extra-local' THEN 4 WHEN action='locate-unlinked-upstream-branch' THEN 5 WHEN priority='P0' THEN 0 WHEN priority='P1' THEN 1 ELSE 2 END, id); CREATE INDEX IF NOT EXISTS work_items_queue_phase_confidence ON work_items(resolved_at, CASE WHEN action='remove-or-justify-extra-local' THEN 4 WHEN action='locate-unlinked-upstream-branch' THEN 5 WHEN priority='P0' THEN 0 WHEN priority='P1' THEN 1 ELSE 2 END, CASE confidence WHEN 'proven-structure' THEN 0 WHEN 'proven-bundle-normalized' THEN 0 WHEN 'candidate' THEN 1 WHEN 'weak-candidate' THEN 2 ELSE 3 END, id); CREATE INDEX IF NOT EXISTS work_item_decisions_status ON work_item_decisions(status);")?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, report TEXT NOT NULL, upstream_hash TEXT, local_hash TEXT, synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS work_items (id TEXT PRIMARY KEY, run_id INTEGER NOT NULL, action TEXT, priority TEXT, confidence TEXT, payload TEXT NOT NULL, first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, resolved_at TEXT, batch_id TEXT, FOREIGN KEY(run_id) REFERENCES runs(id)); CREATE TABLE IF NOT EXISTS work_item_decisions (work_item_id TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN ('skipped','pending_sync','done')), reason TEXT NOT NULL, decided_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, payload TEXT, FOREIGN KEY(work_item_id) REFERENCES work_items(id)); CREATE INDEX IF NOT EXISTS work_items_queue ON work_items(resolved_at, priority, id); CREATE INDEX IF NOT EXISTS work_item_decisions_status ON work_item_decisions(status);")?;
+    ensure_queue_index(&conn, "work_items_queue_phase", false, false)?;
+    ensure_queue_index(&conn, "work_items_queue_phase_confidence", true, false)?;
     ensure_batch_schema(&conn)?;
     ensure_decision_schema(&conn)?;
     let manifest: Value = serde_json::from_slice(&fs::read(report.join("llm-manifest.json"))?)?;
@@ -105,10 +231,9 @@ pub fn sync(db_path: &Path, report: &Path) -> Result<Value> {
         "UPDATE work_items SET resolved_at=CURRENT_TIMESTAMP WHERE run_id <> ?1 AND resolved_at IS NULL",
         params![run_id],
     )?;
-    // A graph-only frontier is now routed as an inspection rather than a
-    // repair. Preserve a reviewed decision only when its owner and complete
-    // evidence payload are unchanged; substantive evidence changes still
-    // reopen the item below.
+    // Preserve reviewed decisions across routing and coalesced-evidence schema
+    // changes only when the underlying owner and evidence are unchanged.
+    // Substantive evidence changes still reopen the item below.
     let reclassified = {
         let mut stmt = tx.prepare(
             "SELECT d.work_item_id, d.payload, w.payload FROM work_item_decisions d JOIN work_items w ON w.id=d.work_item_id WHERE w.run_id=?1 AND w.resolved_at IS NULL AND d.payload IS NOT NULL",
@@ -183,7 +308,6 @@ pub fn optimize_queue(db_path: &Path) -> Result<Value> {
     let conn = Connection::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
     conn.busy_timeout(Duration::from_millis(1000))?;
     ensure_batch_schema(&conn)?;
-    conn.execute_batch("CREATE INDEX IF NOT EXISTS work_items_queue_phase_confidence ON work_items(resolved_at, CASE WHEN action='remove-or-justify-extra-local' THEN 4 WHEN action='locate-unlinked-upstream-branch' THEN 5 WHEN priority='P0' THEN 0 WHEN priority='P1' THEN 1 ELSE 2 END, CASE confidence WHEN 'proven-structure' THEN 0 WHEN 'proven-bundle-normalized' THEN 0 WHEN 'candidate' THEN 1 WHEN 'weak-candidate' THEN 2 ELSE 3 END, batch_id, id);")?;
     Ok(serde_json::json!({
         "schema": "project-parity/state-optimize-queue-v1",
         "index": "work_items_queue_phase_confidence_batch",
@@ -206,7 +330,7 @@ fn ensure_batch_schema(conn: &Connection) -> Result<()> {
         "UPDATE work_items SET batch_id=json_extract(payload,'$.batchId') WHERE batch_id IS NULL AND json_valid(payload)",
         [],
     )?;
-    conn.execute_batch("CREATE INDEX IF NOT EXISTS work_items_queue_phase_confidence_batch ON work_items(resolved_at, CASE WHEN action='remove-or-justify-extra-local' THEN 4 WHEN action='locate-unlinked-upstream-branch' THEN 5 WHEN priority='P0' THEN 0 WHEN priority='P1' THEN 1 ELSE 2 END, CASE confidence WHEN 'proven-structure' THEN 0 WHEN 'proven-bundle-normalized' THEN 0 WHEN 'candidate' THEN 1 WHEN 'weak-candidate' THEN 2 ELSE 3 END, batch_id, id);")?;
+    ensure_queue_index(conn, "work_items_queue_phase_confidence_batch", true, true)?;
     Ok(())
 }
 
@@ -296,7 +420,7 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
     // audit phases. Large generated/compatibility-heavy sets can otherwise
     // starve upstream functionality gaps. Keep both classes in the queue and
     // surface them automatically after earlier phases are exhausted.
-    let mut stmt = conn.prepare("SELECT w.id, w.action, w.priority, w.confidence, w.payload FROM work_items w JOIN (SELECT w.id FROM work_items w LEFT JOIN work_item_decisions d ON d.work_item_id=w.id WHERE w.resolved_at IS NULL AND d.work_item_id IS NULL ORDER BY CASE WHEN w.action='remove-or-justify-extra-local' THEN 4 WHEN w.action='locate-unlinked-upstream-branch' THEN 5 WHEN w.priority='P0' THEN 0 WHEN w.priority='P1' THEN 1 ELSE 2 END, CASE w.confidence WHEN 'proven-structure' THEN 0 WHEN 'proven-bundle-normalized' THEN 0 WHEN 'candidate' THEN 1 WHEN 'weak-candidate' THEN 2 ELSE 3 END, w.batch_id, w.id LIMIT ?1) next ON next.id=w.id ORDER BY CASE WHEN w.action='remove-or-justify-extra-local' THEN 4 WHEN w.action='locate-unlinked-upstream-branch' THEN 5 WHEN w.priority='P0' THEN 0 WHEN w.priority='P1' THEN 1 ELSE 2 END, CASE w.confidence WHEN 'proven-structure' THEN 0 WHEN 'proven-bundle-normalized' THEN 0 WHEN 'candidate' THEN 1 WHEN 'weak-candidate' THEN 2 ELSE 3 END, w.batch_id, w.id")?;
+    let mut stmt = conn.prepare("SELECT w.id, w.action, w.priority, w.confidence, w.payload FROM work_items w JOIN (SELECT w.id FROM work_items w LEFT JOIN work_item_decisions d ON d.work_item_id=w.id WHERE w.resolved_at IS NULL AND d.work_item_id IS NULL ORDER BY CASE WHEN w.action='remove-or-justify-extra-local' THEN 4 WHEN w.action='locate-unlinked-upstream-branch' THEN 5 WHEN w.action='inspect-structural-frontier' THEN 6 WHEN w.priority='P0' THEN 0 WHEN w.priority='P1' THEN 1 ELSE 2 END, CASE w.confidence WHEN 'proven-structure' THEN 0 WHEN 'proven-bundle-normalized' THEN 0 WHEN 'candidate' THEN 1 WHEN 'weak-candidate' THEN 2 ELSE 3 END, w.batch_id, w.id LIMIT ?1) next ON next.id=w.id ORDER BY CASE WHEN w.action='remove-or-justify-extra-local' THEN 4 WHEN w.action='locate-unlinked-upstream-branch' THEN 5 WHEN w.action='inspect-structural-frontier' THEN 6 WHEN w.priority='P0' THEN 0 WHEN w.priority='P1' THEN 1 ELSE 2 END, CASE w.confidence WHEN 'proven-structure' THEN 0 WHEN 'proven-bundle-normalized' THEN 0 WHEN 'candidate' THEN 1 WHEN 'weak-candidate' THEN 2 ELSE 3 END, w.batch_id, w.id")?;
     let rows = stmt.query_map(params![limit as i64], |row| row.get::<_, String>(4))?;
     let items = if routing && summary {
         rows.map(|row| -> Result<Value> {
@@ -954,17 +1078,17 @@ pub fn stats(db_path: &Path) -> Result<Value> {
             COALESCE(SUM(CASE WHEN w.resolved_at IS NULL AND d.status='pending_sync' THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN w.resolved_at IS NULL AND d.status='done' THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN w.resolved_at IS NOT NULL THEN 1 ELSE 0 END), 0),
-            COALESCE(SUM(CASE WHEN w.resolved_at IS NULL AND d.work_item_id IS NULL AND w.action IN ('remove-or-justify-extra-local','locate-unlinked-upstream-branch') THEN 1 ELSE 0 END), 0)
+            COALESCE(SUM(CASE WHEN w.resolved_at IS NULL AND d.work_item_id IS NULL AND w.action IN ('remove-or-justify-extra-local','locate-unlinked-upstream-branch','inspect-structural-frontier') THEN 1 ELSE 0 END), 0)
          FROM work_items w LEFT JOIN work_item_decisions d ON d.work_item_id=w.id",
         [],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
     )?;
     let mut breakdown_stmt = conn.prepare(
-        "SELECT CASE WHEN w.action IN ('remove-or-justify-extra-local','locate-unlinked-upstream-branch') THEN 'P2' ELSE COALESCE(w.priority,'unknown') END, COALESCE(w.confidence,'unknown'), COALESCE(w.action,'unknown'), COUNT(*)
+        "SELECT CASE WHEN w.action IN ('remove-or-justify-extra-local','locate-unlinked-upstream-branch','inspect-structural-frontier') THEN 'P2' ELSE COALESCE(w.priority,'unknown') END, COALESCE(w.confidence,'unknown'), COALESCE(w.action,'unknown'), COUNT(*)
          FROM work_items w LEFT JOIN work_item_decisions d ON d.work_item_id=w.id
          WHERE w.resolved_at IS NULL AND d.work_item_id IS NULL
          GROUP BY w.priority, w.confidence, w.action
-         ORDER BY CASE WHEN w.action='remove-or-justify-extra-local' THEN 4 WHEN w.action='locate-unlinked-upstream-branch' THEN 5 WHEN w.priority='P0' THEN 0 WHEN w.priority='P1' THEN 1 ELSE 2 END,
+         ORDER BY CASE WHEN w.action='remove-or-justify-extra-local' THEN 4 WHEN w.action='locate-unlinked-upstream-branch' THEN 5 WHEN w.action='inspect-structural-frontier' THEN 6 WHEN w.priority='P0' THEN 0 WHEN w.priority='P1' THEN 1 ELSE 2 END,
                   CASE w.confidence WHEN 'proven-structure' THEN 0 WHEN 'proven-bundle-normalized' THEN 0 WHEN 'candidate' THEN 1 WHEN 'weak-candidate' THEN 2 ELSE 3 END,
                   w.action",
     )?;
@@ -1558,16 +1682,17 @@ mod tests {
             root.path().join("llm-work-items.jsonl"),
             concat!(
                 "{\"id\":\"locator\",\"priority\":\"P0\",\"confidence\":\"unknown\",\"action\":\"locate-unlinked-upstream-branch\"}\n",
-                "{\"id\":\"extra\",\"priority\":\"P0\",\"confidence\":\"unknown\",\"action\":\"remove-or-justify-extra-local\"}\n"
+                "{\"id\":\"extra\",\"priority\":\"P0\",\"confidence\":\"unknown\",\"action\":\"remove-or-justify-extra-local\"}\n",
+                "{\"id\":\"structural\",\"priority\":\"P0\",\"confidence\":\"weak-candidate\",\"action\":\"inspect-structural-frontier\"}\n"
             ),
         )
         .unwrap();
         sync(&db, root.path()).unwrap();
 
         let stats = stats(&db).unwrap();
-        assert_eq!(stats["active"], 2);
+        assert_eq!(stats["active"], 3);
         assert_eq!(stats["actionable"], 0);
-        assert_eq!(stats["deferred"], 2);
+        assert_eq!(stats["deferred"], 3);
         assert!(stats["queueBreakdown"]
             .as_array()
             .unwrap()
@@ -1904,7 +2029,7 @@ mod tests {
         let conn = Connection::open(&db).unwrap();
         let plan = conn
             .prepare(
-        "EXPLAIN QUERY PLAN SELECT w.id FROM work_items w LEFT JOIN work_item_decisions d ON d.work_item_id=w.id WHERE w.resolved_at IS NULL AND d.work_item_id IS NULL ORDER BY CASE WHEN w.action='remove-or-justify-extra-local' THEN 4 WHEN w.action='locate-unlinked-upstream-branch' THEN 5 WHEN w.priority='P0' THEN 0 WHEN w.priority='P1' THEN 1 ELSE 2 END, CASE w.confidence WHEN 'proven-structure' THEN 0 WHEN 'proven-bundle-normalized' THEN 0 WHEN 'candidate' THEN 1 WHEN 'weak-candidate' THEN 2 ELSE 3 END, w.batch_id, w.id LIMIT 100",
+        "EXPLAIN QUERY PLAN SELECT w.id FROM work_items w LEFT JOIN work_item_decisions d ON d.work_item_id=w.id WHERE w.resolved_at IS NULL AND d.work_item_id IS NULL ORDER BY CASE WHEN w.action='remove-or-justify-extra-local' THEN 4 WHEN w.action='locate-unlinked-upstream-branch' THEN 5 WHEN w.action='inspect-structural-frontier' THEN 6 WHEN w.priority='P0' THEN 0 WHEN w.priority='P1' THEN 1 ELSE 2 END, CASE w.confidence WHEN 'proven-structure' THEN 0 WHEN 'proven-bundle-normalized' THEN 0 WHEN 'candidate' THEN 1 WHEN 'weak-candidate' THEN 2 ELSE 3 END, w.batch_id, w.id LIMIT 100",
             )
             .unwrap()
             .query_map([], |row| row.get::<_, String>(3))
@@ -1980,6 +2105,24 @@ mod tests {
         let stats = stats(&db).unwrap();
         assert_eq!(stats["deferred"], 2);
         assert_eq!(stats["actionable"], 3);
+    }
+
+    #[test]
+    fn structural_frontiers_are_deferred_after_active_work() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("state.sqlite");
+        fs::write(root.path().join("llm-manifest.json"), r#"{"inputHashes":{"upstream":"u","reproduction":"l"}}"#).unwrap();
+        fs::write(root.path().join("llm-work-items.jsonl"), concat!(
+            "{\"id\":\"structural\",\"priority\":\"P0\",\"action\":\"inspect-structural-frontier\"}\n",
+            "{\"id\":\"active\",\"priority\":\"P2\",\"action\":\"inspect\"}\n"
+        )).unwrap();
+        sync(&db, root.path()).unwrap();
+        let items = next(&db, 2).unwrap()["items"].as_array().unwrap().clone();
+        assert_eq!(items[0]["id"], "active");
+        assert_eq!(items[1]["id"], "structural");
+        let stats = stats(&db).unwrap();
+        assert_eq!(stats["deferred"], 1);
+        assert_eq!(stats["actionable"], 1);
     }
 
     #[test]
@@ -2167,6 +2310,256 @@ mod tests {
                 &previous.to_string(),
                 &current.to_string()
             ));
+        }
+    }
+
+    #[test]
+    fn unverified_to_structural_reclassification_preserves_decisions() {
+        for (previous_action, status) in [
+            ("inspect-unverified-missing-branch", "done"),
+            ("inspect-unverified-changed-branch", "pending_sync"),
+            ("resolve-ambiguous-owners", "done"),
+            ("remove-or-justify-extra-local", "pending_sync"),
+        ] {
+            let root = tempdir().unwrap();
+            let db = root.path().join("state.sqlite");
+            fs::write(root.path().join("llm-manifest.json"), r#"{"inputHashes":{"upstream":"u","reproduction":"l"}}"#).unwrap();
+            let mut item = serde_json::json!({
+                "id":"work:frontier",
+                "action":previous_action,
+                "priority":"P2",
+                "confidence":"weak-candidate",
+                "reason":"Review frontier semantics.",
+                "batchId":"batch:old",
+                "local":[{"id":"left:edge","file":"src/local.ts","line":10}],
+                "upstream":[{"id":"right:edge","file":"dist/chunk.js","line":20}],
+                "evidencePath":[{"basis":"neighbor-shape"}],
+                "inspectNodeIds":["left:edge","right:edge"]
+            });
+            fs::write(root.path().join("llm-work-items.jsonl"), format!("{}\n", item)).unwrap();
+            sync(&db, root.path()).unwrap();
+            if status == "pending_sync" {
+                mark_pending_sync(&db, "work:frontier", "reviewed; sync pending").unwrap();
+            } else {
+                skip(&db, "work:frontier", "reviewed as non-actionable").unwrap();
+            }
+
+            item["action"] = serde_json::json!("inspect-structural-frontier");
+            item["priority"] = serde_json::json!("P2");
+            item["confidence"] = serde_json::json!("weak-candidate");
+            item["reason"] = serde_json::json!("Only weak graph evidence supports this frontier.");
+            item["batchId"] = serde_json::json!("batch:new");
+            fs::write(root.path().join("llm-work-items.jsonl"), format!("{}\n", item)).unwrap();
+            let result = sync(&db, root.path()).unwrap();
+            assert_eq!(result["reopened"], 0, "{previous_action}");
+            if status == "pending_sync" {
+                assert_eq!(result["pendingReleased"], 1, "{previous_action}");
+                assert_eq!(stats(&db).unwrap()["done"], 1, "{previous_action}");
+            } else {
+                assert_eq!(stats(&db).unwrap()["skipped"], 1, "{previous_action}");
+            }
+        }
+    }
+
+    #[test]
+    fn coalesced_reclassification_preserves_only_unchanged_evidence() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("state.sqlite");
+        report(root.path(), &[]);
+        let variant = |id: &str| serde_json::json!({
+            "priority":"P2", "confidence":"weak-candidate", "reason":"The frontier has no behavioral-edge corroboration; inspect its semantics before proposing a code change.",
+            "local":[], "upstream":[{"id":id}],
+            "evidencePath":[{"basis":"neighbor-shape", "right":{"id":id}}],
+            "inspectNodeIds":[id]
+        });
+        let mut item = serde_json::json!({
+            "id":"work:coalesced", "action":"inspect-unverified-missing-branch",
+            "priority":"P2", "confidence":"weak-candidate", "reason":"old route",
+            "local":[], "upstream":[{"id":"a"},{"id":"b"}],
+            "evidencePath":[{"basis":"neighbor-shape"}], "inspectNodeIds":["a","b"],
+            "evidenceVariants":[variant("a"),variant("b")]
+        });
+        fs::write(root.path().join("llm-work-items.jsonl"), format!("{}\n", item)).unwrap();
+        sync(&db, root.path()).unwrap();
+        mark_pending_sync(&db, "work:coalesced", "reviewed").unwrap();
+        item["action"] = serde_json::json!("inspect-structural-frontier");
+        item["reason"] = serde_json::json!("new route");
+        let variants = item["evidenceVariants"].as_array_mut().unwrap();
+        variants.reverse();
+        for variant in variants {
+            variant["action"] = serde_json::json!("inspect-structural-frontier");
+            variant["reason"] = serde_json::json!("The frontier is supported only by structural or neighboring graph evidence; keep it visible for later review.");
+        }
+        let previous: String = Connection::open(&db).unwrap().query_row(
+            "SELECT payload FROM work_item_decisions WHERE work_item_id='work:coalesced'", [], |row| row.get(0)
+        ).unwrap();
+        let mut changed_reason = item.clone();
+        changed_reason["evidenceVariants"][0]["reason"] = serde_json::json!("A genuinely different review reason");
+        assert!(!routing_reclassification_preserves_evidence(&previous, &changed_reason.to_string()));
+        fs::write(root.path().join("llm-work-items.jsonl"), format!("{}\n", item)).unwrap();
+        let result = sync(&db, root.path()).unwrap();
+        assert_eq!(result["reopened"], 0);
+        assert_eq!(result["pendingReleased"], 1);
+        assert_eq!(stats(&db).unwrap()["done"], 1);
+
+        item["evidenceVariants"][0]["evidencePath"][0]["right"]["id"] = serde_json::json!("changed");
+        fs::write(root.path().join("llm-work-items.jsonl"), format!("{}\n", item)).unwrap();
+        let result = sync(&db, root.path()).unwrap();
+        assert_eq!(result["reopened"], 1);
+    }
+
+    #[test]
+    fn queue_index_migration_rebuilds_only_stale_definitions() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("state.sqlite");
+        report(root.path(), &["a"]);
+        sync(&db, root.path()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("DROP INDEX work_items_queue_phase; CREATE INDEX work_items_queue_phase ON work_items(resolved_at, priority, id); DROP INDEX work_items_queue_phase_confidence; CREATE INDEX work_items_queue_phase_confidence ON work_items(resolved_at, priority, id); DROP INDEX work_items_queue_phase_confidence_batch; CREATE INDEX work_items_queue_phase_confidence_batch ON work_items(resolved_at, priority, id);").unwrap();
+        drop(conn);
+        sync(&db, root.path()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        for name in ["work_items_queue_phase", "work_items_queue_phase_confidence", "work_items_queue_phase_confidence_batch"] {
+            let sql: String = conn.query_row("SELECT sql FROM sqlite_master WHERE name=?1", [name], |row| row.get(0)).unwrap();
+            assert!(sql.contains("inspect-structural-frontier"), "{name}");
+        }
+        let before: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0)).unwrap();
+        drop(conn);
+        sync(&db, root.path()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let after: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0)).unwrap();
+        assert_eq!(after, before, "unchanged indexes should not be rebuilt");
+        drop(conn);
+        optimize_queue(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let after_optimize: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0)).unwrap();
+        drop(conn);
+        sync(&db, root.path()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let after_sync: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0)).unwrap();
+        assert_eq!(after_sync, after_optimize, "sync must retain optimized indexes");
+    }
+
+    #[test]
+    fn coalesced_schema_migration_preserves_same_action_decision() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("state.sqlite");
+        report(root.path(), &[]);
+        let mut item = serde_json::json!({
+            "id":"work:coalesced", "action":"inspect-unresolved-upstream-graph-context",
+            "priority":"P2", "confidence":"unknown", "reason":"module boundary",
+            "evidenceVariants":[{"priority":"P2", "confidence":"unknown", "reason":"module boundary", "upstream":[{"id":"edge"}]}]
+        });
+        fs::write(root.path().join("llm-work-items.jsonl"), format!("{}\n", item)).unwrap();
+        sync(&db, root.path()).unwrap();
+        mark_pending_sync(&db, "work:coalesced", "reviewed").unwrap();
+        item["evidenceVariants"][0]["action"] = serde_json::json!("inspect-unresolved-upstream-graph-context");
+        fs::write(root.path().join("llm-work-items.jsonl"), format!("{}\n", item)).unwrap();
+        let result = sync(&db, root.path()).unwrap();
+        assert_eq!(result["reopened"], 0);
+        assert_eq!(result["pendingReleased"], 1);
+        assert_eq!(stats(&db).unwrap()["done"], 1);
+    }
+
+    #[test]
+    fn legacy_coalesced_mixed_routes_preserve_decisions_only_for_unchanged_evidence() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("state.sqlite");
+        report(root.path(), &[]);
+        let mut item = serde_json::json!({
+            "id":"work:mixed", "action":"inspect-unverified-missing-branch",
+            "priority":"P2", "confidence":"weak-candidate", "reason":"review",
+            "evidenceVariants":[
+                {"priority":"P2", "confidence":"weak-candidate", "reason":"review", "upstream":[{"id":"a"}]},
+                {"priority":"P2", "confidence":"weak-candidate", "reason":"structural", "upstream":[{"id":"b"}]}
+            ]
+        });
+        fs::write(root.path().join("llm-work-items.jsonl"), format!("{}\n", item)).unwrap();
+        sync(&db, root.path()).unwrap();
+        mark_pending_sync(&db, "work:mixed", "reviewed").unwrap();
+        let previous = item.to_string();
+        item["evidenceVariants"][0]["action"] = serde_json::json!("inspect-unverified-missing-branch");
+        item["evidenceVariants"][1]["action"] = serde_json::json!("inspect-structural-frontier");
+        let mut unrelated = item.clone();
+        unrelated["evidenceVariants"][1]["action"] = serde_json::json!("unrelated-route");
+        assert!(!routing_reclassification_preserves_evidence(&previous, &unrelated.to_string()));
+        fs::write(root.path().join("llm-work-items.jsonl"), format!("{}\n", item)).unwrap();
+        let result = sync(&db, root.path()).unwrap();
+        assert_eq!(result["reopened"], 0);
+        assert_eq!(result["pendingReleased"], 1);
+        assert_eq!(stats(&db).unwrap()["done"], 1);
+
+        item["evidenceVariants"][1]["upstream"][0]["id"] = serde_json::json!("changed");
+        fs::write(root.path().join("llm-work-items.jsonl"), format!("{}\n", item)).unwrap();
+        assert_eq!(sync(&db, root.path()).unwrap()["reopened"], 1);
+    }
+
+    #[test]
+    fn legacy_variant_routes_must_share_the_current_frontier_identity() {
+        assert!(compatible_legacy_variant_action(Some("inspect-unverified-missing-branch"), "port-missing-upstream-branch"));
+        assert!(compatible_legacy_variant_action(Some("resolve-ambiguous-owners"), "inspect-structural-frontier"));
+        assert!(compatible_legacy_variant_action(Some("remove-or-justify-extra-local"), "inspect-structural-frontier"));
+        assert!(!compatible_legacy_variant_action(Some("inspect-unresolved-upstream-graph-context"), "inspect-structural-frontier"));
+        assert!(!compatible_legacy_variant_action(Some("inspect-unverified-missing-branch"), "reconcile-changed-branch"));
+    }
+
+    #[test]
+    fn legacy_coalesced_representative_promotion_preserves_only_legacy_evidence() {
+        for (review_action, active_action) in [
+            ("inspect-unverified-missing-branch", "port-missing-upstream-branch"),
+            ("inspect-unverified-changed-branch", "reconcile-changed-branch"),
+        ] {
+            let previous = serde_json::json!({
+                "id":"work:owner", "action":review_action, "priority":"P2",
+                "confidence":"weak-candidate", "reason":"review",
+                "evidenceVariants":[
+                    {"priority":"P2", "confidence":"weak-candidate", "reason":"review", "upstream":[{"id":"a"}]},
+                    {"priority":"P0", "confidence":"candidate", "reason":"active", "upstream":[{"id":"b"}]}
+                ]
+            });
+            let mut current = previous.clone();
+            current["action"] = serde_json::json!(active_action);
+            current["priority"] = serde_json::json!("P0");
+            current["confidence"] = serde_json::json!("candidate");
+            current["reason"] = serde_json::json!("active");
+            current["evidenceVariants"][0]["action"] = serde_json::json!(review_action);
+            current["evidenceVariants"][1]["action"] = serde_json::json!(active_action);
+            assert!(routing_reclassification_preserves_evidence(&previous.to_string(), &current.to_string()));
+            let mut modern_previous = previous.clone();
+            modern_previous["evidenceVariants"][0]["action"] = serde_json::json!(review_action);
+            modern_previous["evidenceVariants"][1]["action"] = serde_json::json!(active_action);
+            assert!(!routing_reclassification_preserves_evidence(&modern_previous.to_string(), &current.to_string()));
+        }
+    }
+
+    #[test]
+    fn changed_coalesced_variant_routing_reopens_reviewed_decision() {
+        for (field, changed, reclassify) in [
+            ("action", "inspect-structural-frontier", false),
+            ("action", "inspect-structural-frontier", true),
+            ("priority", "P0", false),
+            ("confidence", "candidate", false),
+            ("reason", "changed route", false),
+            ("batchId", "new-batch", false),
+        ] {
+            let root = tempdir().unwrap();
+            let db = root.path().join("state.sqlite");
+            report(root.path(), &[]);
+            let mut item = serde_json::json!({
+                "id":"work:coalesced", "action":"inspect-unverified-missing-branch",
+                "priority":"P2", "confidence":"weak-candidate", "reason":"old route",
+                "evidenceVariants":[{"action":"inspect-unverified-missing-branch", "priority":"P2", "confidence":"weak-candidate", "reason":"old route", "batchId":"old-batch", "upstream":[{"id":"edge"}]}]
+            });
+            fs::write(root.path().join("llm-work-items.jsonl"), format!("{}\n", item)).unwrap();
+            sync(&db, root.path()).unwrap();
+            mark_pending_sync(&db, "work:coalesced", "reviewed").unwrap();
+            item["evidenceVariants"][0][field] = serde_json::json!(changed);
+            if reclassify {
+                item["action"] = serde_json::json!("inspect-structural-frontier");
+            }
+            fs::write(root.path().join("llm-work-items.jsonl"), format!("{}\n", item)).unwrap();
+            let result = sync(&db, root.path()).unwrap();
+            assert_eq!(result["reopened"], 1, "changed {field}, reclassified={reclassify}");
         }
     }
 

@@ -488,6 +488,10 @@ fn work_item_id(action: &str, identities: impl IntoIterator<Item = String>) -> S
     format!("work-{}", &sha256(material)[..20])
 }
 
+fn frontier_identity_override<'a>(base_action: &'a str, routed_action: &str) -> Option<&'a str> {
+    (routed_action == "inspect-structural-frontier").then_some(base_action)
+}
+
 fn relation_path(
     relation_by_pair: &HashMap<(String, String), &GraphRelation>,
     left: &str,
@@ -548,19 +552,26 @@ fn frontier_triage(
 
 fn is_behavior_edge(edge: &str) -> bool {
     let edge_kind = edge.rsplit_once(':').map_or(edge, |(_, kind)| kind);
-    // A reference records lexical use, including constants and configuration.
-    // It is a useful locator but does not by itself prove executable behavior.
-    matches!(edge_kind, "Calls" | "Instantiates" | "Renders")
+    // Reads of constants and configuration can affect behavior too. An edge
+    // corroborates the need for review; it does not prove owner equivalence.
+    matches!(edge_kind, "Calls" | "References" | "Instantiates" | "Renders")
 }
 
 fn frontier_work_action(
     action: &'static str,
     edge_kinds: &[&str],
+    defer_structural: bool,
 ) -> (&'static str, &'static str) {
     // As in frontier triage, behavior in the correspondence path is context,
     // not evidence about the edge that is actually missing or changed.
     if edge_kinds.iter().any(|edge| is_behavior_edge(edge)) {
         return (action, "");
+    }
+    if defer_structural {
+        return (
+            "inspect-structural-frontier",
+            "The frontier is supported only by structural or neighboring graph evidence; keep it visible for later review.",
+        );
     }
     match action {
         "port-missing-upstream-branch" => (
@@ -575,6 +586,29 @@ fn frontier_work_action(
     }
 }
 
+fn should_defer_structural_frontier(
+    evidence_path: &[Value],
+    has_behavior_edge: bool,
+    changed_branch: bool,
+    weak_candidate: bool,
+) -> bool {
+    // Changed branches stay actionable because containment can carry return,
+    // guard, and side-effect behavior even without a Calls edge.
+    // A local binding under a globally inferred owner does not strengthen the
+    // owner correspondence; its trust is bounded by the path's root.
+    let weak_global_root = evidence_path.first().is_some_and(|relation| relation["basis"] == "global-behavior");
+    !has_behavior_edge
+        && !changed_branch
+        && weak_candidate
+        && !evidence_path.is_empty()
+        && evidence_path.iter().all(|relation| {
+            relation["basis"].as_str().is_some_and(|basis| {
+                basis == "global-behavior"
+                    || (basis.starts_with("neighbor-") && (basis != "neighbor-binding-owner" || weak_global_root))
+            })
+        })
+}
+
 fn unlinked_upstream_triage() -> (&'static str, &'static str) {
     // There is no owner correspondence or package provenance yet. Preserve
     // the completeness locator, but don't label it as a confirmed urgent bug.
@@ -582,7 +616,15 @@ fn unlinked_upstream_triage() -> (&'static str, &'static str) {
 }
 
 fn push_work_item(items: &mut Vec<Value>, draft: WorkItemDraft) -> String {
-    let id = work_item_id(draft.action, draft.identities);
+    push_work_item_with_identity_action(items, draft, None)
+}
+
+fn push_work_item_with_identity_action(
+    items: &mut Vec<Value>,
+    draft: WorkItemDraft,
+    identity_action: Option<&str>,
+) -> String {
+    let id = work_item_id(identity_action.unwrap_or(draft.action), draft.identities);
     let inspect_node_ids = draft
         .local
         .iter()
@@ -657,6 +699,7 @@ fn coalesce_work_items(items: Vec<Value>, shared: &HashMap<String, Value>) -> Re
                     .into_iter()
                     .map(|variant| {
                         json!({
+                            "action": variant["action"],
                             "priority": variant["priority"],
                             "confidence": variant["confidence"],
                             "reason": variant["reason"],
@@ -668,6 +711,38 @@ fn coalesce_work_items(items: Vec<Value>, shared: &HashMap<String, Value>) -> Re
                     })
                     .collect(),
             );
+            let active_fields = merged["evidenceVariants"]
+                .as_array()
+                .and_then(|variants| {
+                    variants
+                        .iter()
+                        .filter(|variant| variant["action"] != "inspect-structural-frontier")
+                        .min_by_key(|variant| {
+                            let priority = match variant["priority"].as_str() {
+                                Some("P0") => 0,
+                                Some("P1") => 1,
+                                _ => 2,
+                            };
+                            let confidence = match variant["confidence"].as_str() {
+                                Some("proven-structure" | "proven-bundle-normalized") => 0,
+                                Some("candidate") => 1,
+                                Some("weak-candidate") => 2,
+                                _ => 3,
+                            };
+                            (priority, confidence)
+                        })
+                })
+                .map(|active| {
+                    ["action", "priority", "confidence", "reason"]
+                        .into_iter()
+                        .map(|key| (key, active[key].clone()))
+                        .collect::<Vec<_>>()
+                });
+            if let Some(active_fields) = active_fields {
+                for (key, value) in active_fields {
+                    merged[key] = value;
+                }
+            }
             Ok(merged)
         })
         .collect()
@@ -1615,6 +1690,7 @@ pub(crate) fn write_llm_context(
                 "A typed local edge has no corresponding upstream edge at the first divergence.",
             ),
         };
+        let identity_action = action;
         let local = frontier
             .left_edge
             .as_ref()
@@ -1657,11 +1733,17 @@ pub(crate) fn write_llm_context(
                 let (action, routed_reason) = frontier_work_action(
                     action,
                     &frontier_edge_kinds,
+                    should_defer_structural_frontier(
+                        &evidence_path,
+                        frontier_edge_kinds.iter().any(|edge| is_behavior_edge(edge)),
+                        frontier.classification == "changed-branch",
+                        confidence == "weak-candidate",
+                    ),
                 );
                 let reason = if routed_reason.is_empty() { reason } else { routed_reason };
                 (action, priority, confidence, reason)
             };
-        let id = push_work_item(
+        let id = push_work_item_with_identity_action(
             &mut work_items,
             WorkItemDraft {
                 action,
@@ -1673,6 +1755,7 @@ pub(crate) fn write_llm_context(
                 evidence_path,
                 identities,
             },
+            frontier_identity_override(identity_action, action),
         );
         upstream_work_by_node.insert(right_edge.target.id.clone(), id.clone());
         if let Some(status) = node_status.get_mut(&right_edge.target.id) {
@@ -2279,12 +2362,26 @@ Edit only local sources. Treat the upstream input as read-only. After each coher
 mod tests {
     use super::{
         candidate_owner_triage, coalesce_work_items,
-        compact_work_evidence, expand_work_evidence, frontier_triage, frontier_work_action,
-        read_shared_work_evidence, same_file_identity, unlinked_upstream_triage, work_item_id,
+        compact_work_evidence, expand_work_evidence, frontier_identity_override, frontier_triage, frontier_work_action,
+        push_work_item, push_work_item_with_identity_action, read_shared_work_evidence,
+        same_file_identity, should_defer_structural_frontier, unlinked_upstream_triage,
+        work_item_id, WorkItemDraft,
         write_json_lines,
     };
     use crate::{FileRecord, Location, MatchRecord};
     use serde_json::json;
+
+    #[test]
+    fn frontier_identity_override_only_applies_to_structural_routing() {
+        let identities = vec!["left:owner".to_string(), "right:owner".to_string(), "right:edge".to_string()];
+        let base = "port-missing-upstream-branch";
+        let module = "inspect-unresolved-upstream-graph-context";
+        let selected = frontier_identity_override(base, module).unwrap_or(module);
+        assert_eq!(work_item_id(selected, identities.clone()), work_item_id(module, identities.clone()));
+        let structural = "inspect-structural-frontier";
+        let selected = frontier_identity_override(base, structural).unwrap_or(structural);
+        assert_eq!(work_item_id(selected, identities.clone()), work_item_id(base, identities));
+    }
 
     fn file_record(file: &str, source_sha256: &str, source_map_sha256: Option<&str>) -> FileRecord {
         FileRecord {
@@ -2556,40 +2653,77 @@ mod tests {
         assert_eq!(frontier_triage(&[], "P0", "candidate"), ("P2", "weak-candidate"));
         assert_eq!(frontier_triage(&["Contains"], "P0", "candidate"), ("P2", "weak-candidate"));
         assert_eq!(frontier_triage(&["NextStatement"], "P0", "candidate"), ("P2", "weak-candidate"));
-        assert_eq!(frontier_triage(&["References"], "P0", "candidate"), ("P2", "weak-candidate"));
+        assert_eq!(frontier_triage(&["References"], "P0", "candidate"), ("P0", "candidate"));
         assert_eq!(
-            frontier_work_action("port-missing-upstream-branch", &["References"]),
-            (
-                "inspect-unverified-missing-branch",
-                "The frontier has no behavioral-edge corroboration; inspect its semantics before proposing a code change."
-            )
+            frontier_work_action("port-missing-upstream-branch", &["References"], false),
+            ("port-missing-upstream-branch", "")
         );
         assert_eq!(
             frontier_triage(&["Calls"], "P0", "candidate"),
             ("P0", "candidate")
         );
-        assert_eq!(frontier_work_action("port-missing-upstream-branch", &["Calls"]), ("port-missing-upstream-branch", ""));
+        assert_eq!(frontier_work_action("port-missing-upstream-branch", &["Calls"], false), ("port-missing-upstream-branch", ""));
         assert_eq!(
-            frontier_work_action("port-missing-upstream-branch", &["Contains"]),
+            frontier_work_action("port-missing-upstream-branch", &["Contains"], false),
             (
                 "inspect-unverified-missing-branch",
                 "The frontier has no behavioral-edge corroboration; inspect its semantics before proposing a code change."
             )
         );
         assert_eq!(
-            frontier_work_action("port-missing-upstream-branch", &[]),
+            frontier_work_action("port-missing-upstream-branch", &[], false),
             (
                 "inspect-unverified-missing-branch",
                 "The frontier has no behavioral-edge corroboration; inspect its semantics before proposing a code change."
             )
         );
         assert_eq!(
-            frontier_work_action("reconcile-changed-branch", &["Incoming:Defines"]),
+            frontier_work_action("reconcile-changed-branch", &["Incoming:Defines"], false),
             (
                 "inspect-unverified-changed-branch",
                 "The frontier has no behavioral-edge corroboration; inspect its semantics before proposing a code change."
             )
         );
+    }
+
+    #[test]
+    fn structural_frontier_deferral_requires_only_weak_graph_evidence() {
+        assert!(!should_defer_structural_frontier(&[], false, false, true));
+        assert!(should_defer_structural_frontier(
+            &[json!({"basis":"global-behavior"}), json!({"basis":"neighbor-shape"})],
+            false, false, true
+        ));
+        assert!(!should_defer_structural_frontier(
+            &[json!({"basis":"neighbor-binding-owner"})], false, false, true
+        ));
+        assert!(!should_defer_structural_frontier(
+            &[json!({"basis":"seed-unit"})], false, false, true
+        ));
+        assert!(!should_defer_structural_frontier(
+            &[json!({"basis":"global-behavior"})], true, false, true
+        ));
+        assert!(!should_defer_structural_frontier(&[json!({"basis":"neighbor-shape"})], false, true, true));
+        assert!(!should_defer_structural_frontier(
+            &[json!({"basis":"neighbor-shape"})], false, false, false
+        ));
+        assert_eq!(frontier_work_action("port-missing-upstream-branch", &[], true).0, "inspect-structural-frontier");
+    }
+
+    #[test]
+    fn local_binding_does_not_strengthen_a_weak_global_owner_route() {
+        let weak = [json!({"basis":"global-behavior"}), json!({"basis":"neighbor-normalized"}), json!({"basis":"neighbor-binding-owner"})];
+        let seeded = [json!({"basis":"seed-unit"}), json!({"basis":"neighbor-binding-owner"})];
+        let unknown = [json!({"basis":"global-behavior"}), json!({"basis":"unknown"}), json!({"basis":"neighbor-binding-owner"})];
+        assert!(should_defer_structural_frontier(&weak, false, false, true));
+        assert!(!should_defer_structural_frontier(&seeded, false, false, true));
+        assert!(!should_defer_structural_frontier(&unknown, false, false, true));
+        assert!(!should_defer_structural_frontier(&weak, true, false, true));
+        assert!(!should_defer_structural_frontier(&weak, false, true, true));
+        assert!(!should_defer_structural_frontier(&weak, false, false, false));
+        for edge in ["Calls", "References", "Incoming:References", "Instantiates", "Renders"] {
+            assert_eq!(frontier_triage(&[edge], "P0", "candidate"), ("P0", "candidate"));
+            assert_eq!(frontier_work_action("port-missing-upstream-branch", &[edge], true).0, "port-missing-upstream-branch");
+        }
     }
 
     #[test]
@@ -2703,5 +2837,71 @@ mod tests {
         assert_eq!(owner["upstream"].as_array().unwrap().len(), 2);
         assert_eq!(owner["inspectNodeIds"].as_array().unwrap().len(), 2);
         assert!(merged.iter().any(|item| item["id"] == "work-other"));
+    }
+
+    #[test]
+    fn coalescing_keeps_frontier_active_when_any_route_has_stronger_evidence() {
+        let identities = vec![
+            "left:owner".to_string(),
+            "right:owner".to_string(),
+            "left:edge".to_string(),
+            "right:edge".to_string(),
+        ];
+        let make_draft = |action, priority, confidence, basis| WorkItemDraft {
+            action,
+            priority,
+            confidence,
+            reason: "frontier evidence".to_string(),
+            local: vec![json!({"id":"left:edge","file":"src/local.ts"})],
+            upstream: vec![json!({"id":"right:edge","file":"dist/chunk.js"})],
+            evidence_path: vec![json!({"basis":basis})],
+            identities: identities.clone(),
+        };
+        let mut items = Vec::new();
+        let structural_id = push_work_item_with_identity_action(
+            &mut items,
+            make_draft(
+                "inspect-structural-frontier",
+                "P2",
+                "weak-candidate",
+                "neighbor-shape",
+            ),
+            Some("port-missing-upstream-branch"),
+        );
+        let active_id = push_work_item(
+            &mut items,
+            make_draft(
+                "inspect-unverified-missing-branch",
+                "P0",
+                "candidate",
+                "seed-unit",
+            ),
+        );
+        assert_eq!(structural_id, active_id, "routing preserves the base frontier identity");
+        let merged = coalesce_work_items(items, &std::collections::HashMap::new()).unwrap();
+        assert_eq!(merged.len(), 1);
+        let item = &merged[0];
+        assert_eq!(item["action"], "inspect-unverified-missing-branch");
+        assert_eq!(item["priority"], "P0");
+        assert_eq!(item["confidence"], "candidate");
+        assert_eq!(item["evidenceVariants"].as_array().unwrap().len(), 2);
+        assert!(item["evidenceVariants"].as_array().unwrap().iter().any(|variant| {
+            variant["action"] == "inspect-structural-frontier"
+        }));
+
+        // A corroborating reference must keep an owner active even when a
+        // second route for the same owner is deferred as purely structural.
+        let mut referenced = Vec::new();
+        push_work_item_with_identity_action(
+            &mut referenced,
+            make_draft("inspect-structural-frontier", "P2", "weak-candidate", "neighbor-shape"),
+            Some("port-missing-upstream-branch"),
+        );
+        let reference_action = frontier_work_action("port-missing-upstream-branch", &["References"], true).0;
+        push_work_item(&mut referenced, make_draft(reference_action, "P0", "candidate", "global-behavior"));
+        let merged = coalesce_work_items(referenced, &std::collections::HashMap::new()).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["action"], "port-missing-upstream-branch");
+        assert_eq!(merged[0]["priority"], "P0");
     }
 }
