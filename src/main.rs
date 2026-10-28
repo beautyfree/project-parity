@@ -1360,7 +1360,14 @@ struct TsConfig {
     #[serde(default)]
     compiler_options: TsCompilerOptions,
     #[serde(default)]
-    extends: Option<String>,
+    extends: Option<TsConfigExtends>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum TsConfigExtends {
+    Single(String),
+    Multiple(Vec<String>),
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1429,30 +1436,74 @@ fn config_file_path(base: &Path, reference: &str) -> Option<PathBuf> {
 /// project references are separate compilation projects, not inherited
 /// compiler options; treating them as a flat union made unrelated aliases
 /// resolve to arbitrary files.
-fn tsconfig_tree(root_config: &Path) -> Vec<(PathBuf, TsConfig)> {
-    let mut queue = VecDeque::from([root_config.to_path_buf()]);
-    let mut seen = HashSet::new();
-    let mut configs = Vec::new();
-    while let Some(config_path) = queue.pop_front() {
-        let Ok(config_path) = config_path.canonicalize() else {
-            continue;
-        };
-        if !seen.insert(config_path.clone()) {
-            continue;
-        }
+fn tsconfig_tree(root_config: &Path) -> Result<Vec<(PathBuf, TsConfig)>> {
+    fn visit(path: &Path, active: &mut HashSet<PathBuf>, memo: &mut HashMap<PathBuf, Vec<(PathBuf, TsConfig)>>, budget: &mut usize) -> Result<Vec<(PathBuf, TsConfig)>, ()> {
+        let Ok(config_path) = path.canonicalize() else { return Ok(Vec::new()) };
+        if active.contains(&config_path) { return Err(()); }
+        if let Some(cached) = memo.get(&config_path) { return Ok(cached.clone()); }
+        if active.len() >= 128 || *budget == 0 { return Err(()); }
+        *budget -= 1;
+        active.insert(config_path.clone());
         let Some(config) = read_tsconfig(&config_path) else {
-            continue;
+            active.remove(&config_path);
+            return Ok(Vec::new());
         };
+        let mut configs = Vec::new();
         let directory = config_path.parent().unwrap_or(&config_path);
         if let Some(extends) = &config.extends {
-            if let Some(path) = config_file_path(directory, extends) {
-                queue.push_back(path);
+            let references: Vec<&str> = match extends {
+                TsConfigExtends::Single(value) => vec![value],
+                TsConfigExtends::Multiple(values) => values.iter().map(String::as_str).collect(),
+            };
+            for reference in references {
+                if let Some(parent) = config_file_path(directory, reference) {
+                    configs.extend(visit(&parent, active, memo, budget)?);
+                }
             }
         }
-        configs.push((config_path, config));
+        active.remove(&config_path);
+        configs.push((config_path.clone(), config));
+        // Only the final owner of each effective option influences path resolution.
+        let base = configs.iter().rposition(|(_, c)| c.compiler_options.base_url.is_some());
+        let paths = configs.iter().rposition(|(_, c)| c.compiler_options.paths.is_some());
+        let reduced = configs.into_iter().enumerate().filter_map(|(i, c)| (Some(i) == base || Some(i) == paths).then_some(c)).collect::<Vec<_>>();
+        memo.insert(config_path, reduced.clone());
+        Ok(reduced)
     }
-    configs.reverse();
-    configs
+    visit(root_config, &mut HashSet::new(), &mut HashMap::new(), &mut 4096)
+        .map_err(|_| anyhow::anyhow!("cyclic or excessively complex tsconfig inheritance: {}", root_config.display()))
+}
+
+// Fingerprinting must include every ancestor, even when its options are overridden.
+fn tsconfig_inventory(root_config: &Path) -> Result<Vec<PathBuf>> {
+    let mut seen = HashSet::new();
+    let mut pending = vec![root_config.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let Ok(path) = path.canonicalize() else { continue };
+        if !seen.insert(path.clone()) { continue; }
+        if let Some(config) = read_tsconfig(&path) {
+            let directory = path.parent().unwrap_or(&path);
+            if let Some(extends) = config.extends {
+                let references = match extends { TsConfigExtends::Single(value) => vec![value], TsConfigExtends::Multiple(values) => values };
+                for reference in references {
+                    if let Some(parent) = config_file_path(directory, &reference) { pending.push(parent); }
+                }
+            }
+        }
+    }
+    Ok(seen.into_iter().collect())
+}
+
+fn tsconfig_failures(discovery: &Discovery) -> Vec<Failure> {
+    let configs = discovery.files.iter().filter_map(|(path, _)| nearest_tsconfig(path, &discovery.root)).collect::<BTreeSet<_>>();
+    configs.into_iter().filter_map(|config| tsconfig_tree(&config).err().map(|error| Failure {
+        file: config.display().to_string(),
+        error: format!("tsconfig configuration failure: {error}"),
+    })).collect()
+}
+
+fn invalid_tsconfig(importer: &Path, root: &Path) -> bool {
+    nearest_tsconfig(importer, root).is_some_and(|config| cached_tsconfig_tree(&config).is_err())
 }
 
 type TsConfigTree = Vec<(PathBuf, TsConfig)>;
@@ -1460,30 +1511,47 @@ type TsConfigTreeCache = HashMap<PathBuf, TsConfigTree>;
 
 static TSCONFIG_TREE_CACHE: OnceLock<Mutex<TsConfigTreeCache>> = OnceLock::new();
 
-fn cached_tsconfig_tree(root_config: &Path) -> Vec<(PathBuf, TsConfig)> {
+fn cached_tsconfig_tree(root_config: &Path) -> Result<Vec<(PathBuf, TsConfig)>> {
     let key = root_config
         .canonicalize()
         .unwrap_or_else(|_| root_config.to_path_buf());
     let cache = TSCONFIG_TREE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(configs) = cache.lock().expect("tsconfig cache poisoned").get(&key) {
-        return configs.clone();
+        return Ok(configs.clone());
     }
-    let configs = tsconfig_tree(&key);
+    let configs = tsconfig_tree(&key)?;
     cache
         .lock()
         .expect("tsconfig cache poisoned")
         .insert(key, configs.clone());
-    configs
+    Ok(configs)
 }
 
 fn nearest_tsconfig(importer: &Path, project_root: &Path) -> Option<PathBuf> {
+    let importer = importer.canonicalize().unwrap_or_else(|_| {
+        importer.parent().and_then(|parent| parent.canonicalize().ok())
+            .zip(importer.file_name()).map(|(parent, name)| parent.join(name))
+            .unwrap_or_else(|| importer.to_path_buf())
+    });
+    let project_root = project_root.canonicalize().unwrap_or_else(|_| project_root.to_path_buf());
+    let external = !importer.starts_with(&project_root);
+    let dependency = external || importer.strip_prefix(&project_root).ok().is_some_and(|relative| {
+        relative.components().any(|component| component.as_os_str() == "node_modules")
+    });
+    let boundary = if dependency {
+        importer.parent()?.ancestors().find(|directory| directory.join("package.json").is_file())?.to_path_buf()
+    } else {
+        project_root.clone()
+    };
     let mut cursor = importer.parent();
     while let Some(directory) = cursor {
         let config = directory.join("tsconfig.json");
         if config.is_file() {
             return Some(config);
         }
-        if directory == project_root {
+        // Dependency configs belong to their package, never the enclosing store
+        // or consuming application. Explicit extends may still leave this boundary.
+        if directory == boundary {
             break;
         }
         cursor = directory.parent();
@@ -2060,7 +2128,11 @@ fn resolve_tsconfig_path(
     let mut effective_base_url = None;
     let mut paths_base = None;
     let mut paths = None;
-    for (config_path, config) in cached_tsconfig_tree(&root_config) {
+    let configs = match cached_tsconfig_tree(&root_config) {
+        Ok(configs) => configs,
+        Err(_) => return Some(TsConfigPathEntry { resolution: "unresolved-tsconfig-configuration", path: None }),
+    };
+    for (config_path, config) in configs {
         let config_dir = config_path.parent().unwrap_or(&config_path);
         if let Some(base_url) = config.compiler_options.base_url {
             effective_base_url = Some(config_dir.join(base_url));
@@ -2930,6 +3002,7 @@ fn discover_dependencies(
                 continue;
             };
             let importer = root.join(&module.file);
+            if invalid_tsconfig(&importer, &root) { continue; }
             let from = importer.parent().unwrap_or(&root).to_path_buf();
             dependency_queries.push(DependencyResolutionQuery {
                 from: from.clone(),
@@ -3174,7 +3247,7 @@ fn project_fingerprint_files(root: &Path) -> Result<(Vec<(PathBuf, String)>, Vec
     // TypeScript `extends` can refer outside the project root or into
     // node_modules. Include the exact inheritance chain used by resolution.
     for config in tsconfigs {
-        for (path, _) in tsconfig_tree(&config) {
+        for path in tsconfig_inventory(&config)? {
             let relative = path
                 .strip_prefix(&root)
                 .map(|path| path.to_string_lossy().to_string())
@@ -3245,7 +3318,7 @@ fn dependency_fingerprint_files(
         }
     }
     for config in tsconfigs {
-        for (path, _) in tsconfig_tree(&config) {
+        for path in tsconfig_inventory(&config)? {
             let relative = path
                 .strip_prefix(&input_root.package_root)
                 .map(|path| path.to_string_lossy().to_string())
@@ -3646,6 +3719,7 @@ fn release_dependency_unit_features(units: &mut [Unit]) {
 }
 
 fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
+    let config_failures = tsconfig_failures(&discovery);
     let input_fingerprint = fingerprint_discovery(&discovery)?;
     let input_files = discovery.files.clone();
     let Discovery {
@@ -3675,7 +3749,7 @@ fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
     let mut units = Vec::new();
     let mut graph_nodes = Vec::new();
     let mut graph_edges = Vec::new();
-    let mut failures = Vec::new();
+    let mut failures = config_failures;
     let mut cache_hits = 0;
     let mut cache_misses = 0;
     let mut token_strings = HashSet::<Arc<str>>::new();
@@ -3855,6 +3929,7 @@ fn index_dependency_evidence(
     discovery: Discovery,
     direct_dependency_packages: &BTreeSet<String>,
 ) -> Result<ProjectIndex> {
+    let config_failures = tsconfig_failures(&discovery);
     if discovery.files.len() <= 200 {
         return index_discovery(discovery, "dependency");
     }
@@ -3982,7 +4057,7 @@ fn index_dependency_evidence(
             .collect::<Vec<_>>()
             .join("\n"),
     );
-    let indexed_package_index = indexed_package_index.unwrap_or(ProjectIndex {
+    let mut indexed_package_index = indexed_package_index.unwrap_or(ProjectIndex {
         root: root.display().to_string(),
         corpus: CorpusSelection {
             mode: corpus.mode,
@@ -4004,6 +4079,11 @@ fn index_dependency_evidence(
         failures: Vec::new(),
         skipped: Vec::new(),
     });
+    for failure in config_failures {
+        if !indexed_package_index.failures.iter().any(|existing| existing.file == failure.file && existing.error == failure.error) {
+            indexed_package_index.failures.push(failure);
+        }
+    }
     Ok(ProjectIndex {
         root: root.display().to_string(),
         corpus,
@@ -4077,6 +4157,7 @@ fn link_installed_package_entries(index: &mut ProjectIndex) {
             continue;
         };
         let importer = root.join(&module.file);
+        if invalid_tsconfig(&importer, root) { continue; }
         let Some(package_root) =
             resolve_installed_package(importer.parent().unwrap_or(root), root, package_name)
         else {
@@ -9850,6 +9931,128 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tsconfig_dependencies_do_not_inherit_foreign_parent_config() {
+        let root = tempdir().unwrap();
+        let app = root.path().join("app");
+        let package = root.path().join("store/pkg");
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(package.join("src")).unwrap();
+        fs::write(root.path().join("tsconfig.json"), r#"{"extends":"./tsconfig.json"}"#).unwrap();
+        fs::write(package.join("package.json"), r#"{"name":"pkg","version":"1.0.0"}"#).unwrap();
+        let importer = package.join("src/main.ts");
+        fs::write(&importer, "export function value() { return 1; }").unwrap();
+        assert!(nearest_tsconfig(&importer, &app).is_none());
+        assert!(!invalid_tsconfig(&importer, &app));
+        fs::write(package.join("tsconfig.json"), r#"{"extends":"../shared.json"}"#).unwrap();
+        fs::write(root.path().join("store/shared.json"), r#"{"compilerOptions":{"paths":{"@pkg":["src/main.ts"]}}}"#).unwrap();
+        assert_eq!(nearest_tsconfig(&importer, &app).unwrap(), package.join("tsconfig.json").canonicalize().unwrap());
+        assert!(tsconfig_tree(&package.join("tsconfig.json")).is_ok());
+        assert!(tsconfig_inventory(&package.join("tsconfig.json")).unwrap().contains(&root.path().join("store/shared.json").canonicalize().unwrap()));
+        let installed = app.join("node_modules/installed");
+        fs::create_dir_all(&installed).unwrap();
+        fs::write(app.join("tsconfig.json"), r#"{"extends":"./tsconfig.json"}"#).unwrap();
+        fs::write(installed.join("package.json"), r#"{"name":"installed"}"#).unwrap();
+        fs::write(installed.join("index.js"), "module.exports = 1;").unwrap();
+        assert!(nearest_tsconfig(&installed.join("index.js"), &app).is_none());
+    }
+
+    #[test]
+    fn tsconfig_cycle_is_reported_without_aborting_or_package_fallback() {
+        let project = tempdir().unwrap();
+        fs::create_dir_all(project.path().join("src")).unwrap();
+        fs::create_dir_all(project.path().join("node_modules/pkg")).unwrap();
+        fs::write(project.path().join("tsconfig.json"), r#"{"extends":"./tsconfig.json"}"#).unwrap();
+        fs::write(project.path().join("src/main.ts"), "import { f } from 'pkg'; export function run() { return f(); }").unwrap();
+        fs::write(project.path().join("src/healthy.ts"), "export function healthy() { return 42; }").unwrap();
+        fs::write(project.path().join("node_modules/pkg/package.json"), r#"{"name":"pkg","version":"1.0.0","main":"index.js"}"#).unwrap();
+        fs::write(project.path().join("node_modules/pkg/index.js"), "exports.f = () => 1;").unwrap();
+        let indexed = index_project(project.path(), "left").unwrap();
+        assert!(indexed.failures.iter().any(|f| f.error.contains("tsconfig configuration failure")));
+        assert!(indexed.files.iter().any(|f| f.file.ends_with("healthy.ts")));
+        assert!(!indexed.graph_edges.iter().any(|edge| edge.kind == "ResolvesToPackageEntry"));
+        let provenance = dependency_provenance(&indexed, "left");
+        assert!(provenance.iter().any(|row| row.specifier == "pkg" && row.resolution == "unresolved-tsconfig-configuration"));
+        for i in 0..201 {
+            fs::write(project.path().join(format!("src/extra{i}.ts")), "export const value = 1;").unwrap();
+        }
+        let dependencies = index_dependency_evidence(discover(project.path()).unwrap(), &BTreeSet::new()).unwrap();
+        assert!(dependencies.failures.iter().any(|f| f.error.contains("tsconfig configuration failure")));
+        assert!(dependencies.files.len() > 200);
+        let output = tempdir().unwrap();
+        run(project.path(), project.path(), output.path()).unwrap();
+        let summary: serde_json::Value = serde_json::from_str(&fs::read_to_string(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(summary["summary"]["leftFailures"].as_u64().unwrap_or(0) > 0, "{summary}");
+        let discovery = discover(project.path()).unwrap();
+        let fingerprint = fingerprint_discovery(&discovery).unwrap();
+        fs::write(project.path().join("tsconfig.json"), "{}").unwrap();
+        assert_ne!(fingerprint, fingerprint_discovery(&discover(project.path()).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn tsconfig_inventory_keeps_overridden_external_ancestors_and_rejects_cycles() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("app")).unwrap();
+        let external = root.path().join("external.json");
+        std::fs::write(&external, r#"{"compilerOptions":{"paths":{"@old":["old.ts"]}}}"#).unwrap();
+        let config = root.path().join("app/tsconfig.json");
+        std::fs::write(&config, r#"{"extends":"../external.json","compilerOptions":{"paths":{"@new":["new.ts"]}}}"#).unwrap();
+        assert!(super::tsconfig_inventory(&config).unwrap().contains(&external.canonicalize().unwrap()));
+        let before = super::fingerprint_input(&root.path().join("app"), &[]).unwrap();
+        std::fs::write(&external, r#"{"compilerOptions":{"paths":{"@old":["changed.ts"]}}}"#).unwrap();
+        let after = super::fingerprint_input(&root.path().join("app"), &[]).unwrap();
+        assert_ne!(before, after);
+        std::fs::write(&external, r#"{"extends":"./app/tsconfig.json"}"#).unwrap();
+        assert!(super::tsconfig_inventory(&config).unwrap().contains(&external.canonicalize().unwrap()));
+        assert!(super::fingerprint_input(&root.path().join("app"), &[]).is_ok());
+    }
+    #[test]
+    fn tsconfig_inventory_rejects_excessive_depth() {
+        let root = tempfile::tempdir().unwrap();
+        for i in 0..130 {
+            let data = if i == 129 { "{}".to_string() } else { format!(r#"{{"extends":"./{}.json"}}"#, i + 1) };
+            std::fs::write(root.path().join(format!("{i}.json")), data).unwrap();
+        }
+        assert!(super::tsconfig_tree(&root.path().join("0.json")).is_err());
+    }
+    #[test]
+    fn tsconfig_multiple_extends_preserves_parent_order_and_stops_cycles() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("src")).unwrap();
+        std::fs::write(project.path().join("src/first.ts"), "export {};").unwrap();
+        std::fs::write(project.path().join("src/second.ts"), "export {};").unwrap();
+        std::fs::write(project.path().join("first.json"), r#"{"extends":"./tsconfig.json","compilerOptions":{"paths":{"@x":["src/first.ts"]}}}"#).unwrap();
+        std::fs::write(project.path().join("second.json"), r#"{"compilerOptions":{"paths":{"@x":["src/second.ts"]}}}"#).unwrap();
+        std::fs::write(project.path().join("tsconfig.json"), r#"{"extends":["./first.json","./second.json"]}"#).unwrap();
+        assert_eq!(super::resolve_tsconfig_path(&project.path().join("src/main.ts"), project.path(), "@x", false).unwrap().resolution, "unresolved-tsconfig-configuration");
+    }
+    #[test]
+    fn tsconfig_layered_diamond_is_bounded_and_preserves_resolution() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("src")).unwrap();
+        std::fs::write(project.path().join("src/a.ts"), "export {};").unwrap();
+        std::fs::write(project.path().join("0.json"), r#"{"compilerOptions":{"paths":{"@x":["src/a.ts"]}}}"#).unwrap();
+        for i in 1..30 {
+            std::fs::write(project.path().join(format!("{i}.json")), format!(r#"{{"extends":["./{}.json","./{}.json"]}}"#, i - 1, i - 1)).unwrap();
+        }
+        std::fs::write(project.path().join("tsconfig.json"), r#"{"extends":"./29.json"}"#).unwrap();
+        let entry = super::resolve_tsconfig_path(&project.path().join("src/main.ts"), project.path(), "@x", false).unwrap();
+        assert_eq!(entry.path.unwrap(), project.path().join("src/a.ts").canonicalize().unwrap());
+    }
+    #[test]
+    fn tsconfig_multiple_extends_replays_shared_ancestor() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("src")).unwrap();
+        std::fs::write(project.path().join("src/common.ts"), "export {};").unwrap();
+        std::fs::write(project.path().join("src/a.ts"), "export {};").unwrap();
+        std::fs::write(project.path().join("common.json"), r#"{"compilerOptions":{"paths":{"@common":["src/common.ts"]}}}"#).unwrap();
+        std::fs::write(project.path().join("a.json"), r#"{"extends":"./common.json","compilerOptions":{"paths":{"@a":["src/a.ts"]}}}"#).unwrap();
+        std::fs::write(project.path().join("b.json"), r#"{"extends":"./common.json"}"#).unwrap();
+        std::fs::write(project.path().join("tsconfig.json"), r#"{"extends":["./a.json","./b.json"]}"#).unwrap();
+        let importer = project.path().join("src/main.ts");
+        assert!(super::resolve_tsconfig_path(&importer, project.path(), "@a", false).is_none());
+        assert_eq!(super::resolve_tsconfig_path(&importer, project.path(), "@common", false).unwrap().path.unwrap(), project.path().join("src/common.ts").canonicalize().unwrap());
+    }
     #[test]
     fn tsconfig_wildcard_requires_suffix_match() {
         assert_eq!(super::tsconfig_path_target("@x/*.js", "src/*.ts", "@x/a.js"), Some("src/a.ts".into()));
