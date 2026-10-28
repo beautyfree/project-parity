@@ -861,6 +861,9 @@ impl<'a> Visit<'a> for GraphCollector<'a, '_> {
                         false,
                         Some(module.value.to_string()),
                     );
+                } else {
+                    let target = self.external_node("module:<dynamic>", false);
+                    self.add_edge(occurrence.clone(), target, "Requires", true, Some("<dynamic>".to_string()));
                 }
             }
         }
@@ -1030,6 +1033,9 @@ impl<'a> Visit<'a> for GraphCollector<'a, '_> {
             },
             declaration.source.value.as_str(),
         );
+        if !declaration_is_type && declaration.specifiers.is_none() {
+            self.add_module_edge("SideEffectImports", declaration.source.value.as_str());
+        }
         let module = declaration.source.value.as_str();
         let module_node = self.external_node(&format!("module:{module}"), false);
         if let Some(specifiers) = &declaration.specifiers {

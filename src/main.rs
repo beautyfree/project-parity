@@ -2147,6 +2147,7 @@ fn dependency_provenance(index: &ProjectIndex, side: &str) -> Vec<DependencyProv
             edge.kind.as_str(),
             "ImportsBinding"
                 | "Imports"
+                | "SideEffectImports"
                 | "TypeImportsBinding"
                 | "TypeImports"
                 | "RequiresBinding"
@@ -2199,6 +2200,7 @@ fn dependency_provenance(index: &ProjectIndex, side: &str) -> Vec<DependencyProv
             specifier.to_string(),
             imported_export.clone(),
             binding.clone(),
+            edge.kind.clone(),
         );
         if !seen.insert(key) {
             continue;
@@ -2563,6 +2565,23 @@ struct DependencyContextEntry {
 
 type DependencyContextIndex = HashMap<String, Vec<DependencyContextEntry>>;
 
+// A local entry's bytes do not prove its runtime imports. Include every
+// statically indexed import in its closure; unknown packages and cycles fail closed.
+fn local_dependency_closure(provenance: &[DependencyProvenance], file: &str, visiting: &mut BTreeSet<String>) -> Option<BTreeSet<String>> {
+    if !visiting.insert(file.to_owned()) { return None; }
+    let mut entries = BTreeSet::new();
+    for row in provenance.iter().filter(|row| row.importer_file == file && !row.edge_kind.starts_with("Type")) {
+        if !matches!(row.resolution, "resolved-local-source" | "resolved-tsconfig-path" | "resolved-package-import-map") { return None; }
+        let path = row.resolved_path.as_deref()?;
+        if path.split(['/', '\\']).any(|part| part == "node_modules") { return None; }
+        let hash = row.entry_sha256.as_deref()?;
+        entries.insert(format!("{}\0{}\0{}\0{}", row.specifier, row.imported_export, path, hash));
+        entries.extend(local_dependency_closure(provenance, path, visiting)?);
+    }
+    visiting.remove(file);
+    Some(entries)
+}
+
 fn build_dependency_context_index(
     index: &ProjectIndex,
     provenance: &[DependencyProvenance],
@@ -2577,6 +2596,20 @@ fn build_dependency_context_index(
         .map(|node| (node.id.as_str(), node))
         .collect::<HashMap<_, _>>();
     let mut contexts = HashMap::<String, Vec<DependencyContextEntry>>::new();
+    // Every runtime load executes module initialization, even an unused binding.
+    // Unresolved loads stay unknown; local closures are compared structurally.
+    let context_for_row = |binding: &DependencyProvenance| -> Option<String> {
+        if !matches!(binding.resolution, "resolved-local-source" | "resolved-tsconfig-path" | "resolved-package-import-map") || binding.entry_resolution.is_none() || binding.entry_sha256.is_none() { return None; }
+        let path = binding.resolved_path.as_deref()?;
+        if path.split(['/', '\\']).any(|part| part == "node_modules") { return None; }
+        let closure = local_dependency_closure(provenance, path, &mut BTreeSet::new())?;
+        Some(format!("{}\0{}\0{}\0{}\0{}\0{}\0{}", binding.resolution, binding.specifier, binding.imported_export, path, binding.entry_resolution.unwrap_or(""), binding.entry_sha256.as_deref().unwrap_or(""), closure.into_iter().collect::<Vec<_>>().join("\n")))
+    };
+    for row in provenance.iter().filter(|row| row.binding_symbol_id.is_none() && !row.edge_kind.starts_with("Type")) {
+        contexts.entry(row.importer_file.clone()).or_default().push(DependencyContextEntry {
+            start: u32::MAX, end: u32::MAX, context: context_for_row(row),
+        });
+    }
     for edge in &index.graph_edges {
         if !matches!(
             edge.kind.as_str(),
@@ -2590,15 +2623,7 @@ fn build_dependency_context_index(
         let Some(binding) = provenance_by_binding.get(edge.target.as_str()) else {
             continue;
         };
-        let context = {
-            if !matches!(binding.resolution, "resolved-local-source" | "resolved-tsconfig-path" | "resolved-package-import-map" | "resolved-installed-package")
-                || binding.entry_resolution.is_none() || binding.entry_sha256.is_none()
-                || binding.resolution == "resolved-installed-package"
-                || (binding.resolution != "resolved-installed-package" && binding.resolved_path.as_deref().is_some_and(|path| path.split(['/', '\\']).any(|part| part == "node_modules")))
-            { None } else {
-                Some(format!("{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}", binding.resolution, binding.specifier, binding.imported_export, binding.package.as_deref().unwrap_or(""), binding.version.as_deref().unwrap_or(""), binding.package_runtime_sha256.as_deref().unwrap_or(""), binding.resolved_path.as_deref().unwrap_or(""), binding.entry_resolution.unwrap_or(""), binding.entry_path.as_deref().unwrap_or(""), binding.entry_sha256.as_deref().unwrap_or("")))
-            }
-        };
+        let context = context_for_row(binding);
         contexts
             .entry(owner.file.clone())
             .or_default()
@@ -2620,7 +2645,7 @@ fn units_have_equivalent_dependency_context(
     fn context_for(index: &DependencyContextIndex, unit: &Unit) -> Option<BTreeSet<String>> {
         let mut result = BTreeSet::new();
         for entry in index.get(&unit.file).into_iter().flatten() {
-            if entry.start < unit.start || entry.end > unit.end {
+            if entry.start != u32::MAX && (entry.start < unit.start || entry.end > unit.end) {
                 continue;
             }
             let Some(context) = &entry.context else {
@@ -12972,6 +12997,24 @@ mod tests {
     }
 
     #[test]
+    fn local_dependency_closure_fails_closed_for_wrapped_package_and_allows_local_chain() {
+        let row = |importer: &str, resolution: &'static str, target: &str| DependencyProvenance {
+            side: "left".into(), edge_kind: "Imports".into(), importer_file: importer.into(),
+            specifier: target.into(), imported_export: "run".into(), binding_symbol_id: None,
+            module_node_id: "module".into(), resolution, resolved_path: Some(target.into()),
+            package: None, version: None, package_runtime_sha256: None,
+            entry_resolution: Some("exact-relative-source"), entry_path: Some(target.into()),
+            entry_sha256: Some("same".into()), entry_candidates: Vec::new(),
+        };
+        let mut rows = vec![row("wrapper.js", "resolved-local-source", "inner.js")];
+        assert!(local_dependency_closure(&rows, "wrapper.js", &mut BTreeSet::new()).is_some());
+        rows.push(row("inner.js", "resolved-installed-package", "node_modules/pkg/index.js"));
+        assert!(local_dependency_closure(&rows, "wrapper.js", &mut BTreeSet::new()).is_none());
+        rows[1] = row("inner.js", "resolved-local-source", "wrapper.js");
+        assert!(local_dependency_closure(&rows, "wrapper.js", &mut BTreeSet::new()).is_none());
+    }
+
+    #[test]
     fn binding_contract_requires_graph_identity_and_runtime_package_fingerprint() {
         let row = |side: &str, binding: &str, fingerprint: &str| DependencyProvenance {
             side: side.to_string(),
@@ -13188,6 +13231,80 @@ mod tests {
         run(left.path(), right.path(), output.path()).unwrap();
         let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
         assert!(report["matches"].as_array().unwrap().iter().any(|m| m["left"]["name"] == "caller" && m["confidence"] == "proven-structure"));
+    }
+
+    #[test]
+    fn unused_runtime_bindings_still_prevent_proof() {
+        for source in ["import {run} from 'runtime-fixture'; export function caller(){return 42;}", "const {run} = require('runtime-fixture'); export function caller(){return 42;}"] {
+            let left = tempdir().unwrap(); let right = tempdir().unwrap(); let output = tempdir().unwrap();
+            for root in [left.path(), right.path()] {
+                fs::write(root.join("main.js"), source).unwrap();
+                write_runtime_package(root, "1.0.0", "globalThis.value = 1; export const run = 1;");
+            }
+            run(left.path(), right.path(), output.path()).unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+            assert!(!report["matches"].as_array().unwrap().iter().any(|m| m["left"]["name"] == "caller" && m["confidence"] == "proven-structure"), "{report}");
+        }
+    }
+
+    #[test]
+    fn side_effect_import_with_unused_binding_still_prevents_proof() {
+        let left = tempdir().unwrap(); let right = tempdir().unwrap(); let output = tempdir().unwrap();
+        for root in [left.path(), right.path()] {
+            fs::write(root.join("main.js"), "import 'runtime-fixture'; import {run} from 'runtime-fixture'; export function caller(){ return 42; }").unwrap();
+            write_runtime_package(root, "1.0.0", "globalThis.value = 1; export const run = 1;");
+        }
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(!report["matches"].as_array().unwrap().iter().any(|m| m["left"]["name"] == "caller" && m["confidence"] == "proven-structure"), "{report}");
+    }
+
+    #[test]
+    fn identical_file_with_side_effect_import_never_proves_caller() {
+        let left = tempdir().unwrap(); let right = tempdir().unwrap(); let output = tempdir().unwrap();
+        for root in [left.path(), right.path()] {
+            fs::write(root.join("main.js"), "import 'runtime-fixture'; export function caller(){ return 42; }").unwrap();
+            write_runtime_package(root, "1.0.0", "globalThis.value = 1;");
+        }
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(!report["matches"].as_array().unwrap().iter().any(|m| m["left"]["name"] == "caller" && m["confidence"] == "proven-structure"), "{report}");
+    }
+
+    #[test]
+    fn identical_file_with_dynamic_require_never_proves_caller() {
+        let left = tempdir().unwrap(); let right = tempdir().unwrap(); let output = tempdir().unwrap();
+        for root in [left.path(), right.path()] {
+            fs::write(root.join("main.js"), "export function caller(name){ return require(name); }").unwrap();
+        }
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(!report["matches"].as_array().unwrap().iter().any(|m| m["left"]["name"] == "caller" && m["confidence"] == "proven-structure"), "{report}");
+    }
+
+    #[test]
+    fn identical_caller_through_local_only_wrapper_remains_proven() {
+        let left = tempdir().unwrap(); let right = tempdir().unwrap(); let output = tempdir().unwrap();
+        for root in [left.path(), right.path()] {
+            fs::write(root.join("main.js"), "import { run as target } from './wrapper.js'; export function caller(){ return target() * 3; }").unwrap();
+            fs::write(root.join("wrapper.js"), "export function run(){ return 42 + 2; }").unwrap();
+        }
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(report["matches"].as_array().unwrap().iter().any(|m| m["left"]["name"] == "caller" && m["confidence"] == "proven-structure"), "{report}");
+    }
+
+    #[test]
+    fn identical_caller_through_local_wrapper_keeps_changed_package_actionable() {
+        let left = tempdir().unwrap(); let right = tempdir().unwrap(); let output = tempdir().unwrap();
+        for (root, value) in [(left.path(), "left"), (right.path(), "right")] {
+            fs::write(root.join("main.js"), "import { run as target } from './wrapper.js'; export function caller(){ return target() * 3; }").unwrap();
+            fs::write(root.join("wrapper.js"), "import { run as target } from 'runtime-fixture'; export function run(){ return target() + 2; }").unwrap();
+            write_runtime_package(root, "1.0.0", &format!("export const run = () => '{}';", value));
+        }
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(report["matches"].as_array().unwrap().iter().any(|m| m["left"]["name"] == "caller" && m["confidence"] == "candidate" && m["status"] == "dependency-context-changed"), "{report}");
     }
 
     #[test]
