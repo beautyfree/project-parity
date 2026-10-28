@@ -4,7 +4,7 @@ use std::{
     env, fs,
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -1507,23 +1507,53 @@ fn invalid_tsconfig(importer: &Path, root: &Path) -> bool {
 }
 
 type TsConfigTree = Vec<(PathBuf, TsConfig)>;
-type TsConfigTreeCache = HashMap<PathBuf, TsConfigTree>;
 
-static TSCONFIG_TREE_CACHE: OnceLock<Mutex<TsConfigTreeCache>> = OnceLock::new();
+#[derive(Default)]
+struct ResolutionCaches {
+    tsconfigs: HashMap<PathBuf, TsConfigTree>,
+    modules: ProjectModuleResolutionCache,
+}
 
-fn cached_tsconfig_tree(root_config: &Path) -> Result<Vec<(PathBuf, TsConfig)>> {
-    let key = root_config
-        .canonicalize()
-        .unwrap_or_else(|_| root_config.to_path_buf());
-    let cache = TSCONFIG_TREE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(configs) = cache.lock().expect("tsconfig cache poisoned").get(&key) {
-        return Ok(configs.clone());
+thread_local! {
+    // Resolution depends on mutable project/configuration inputs. Reuse it
+    // only within one index/report generation, never across service updates.
+    static RESOLUTION_CACHES: RefCell<Option<ResolutionCaches>> = const { RefCell::new(None) };
+}
+
+struct ResolutionGeneration(bool);
+
+impl ResolutionGeneration {
+    fn enter() -> Self {
+        Self(RESOLUTION_CACHES.with(|slot| {
+            let mut cache = slot.borrow_mut();
+            if cache.is_some() { return false; }
+            *cache = Some(ResolutionCaches::default());
+            true
+        }))
+    }
+}
+
+impl Drop for ResolutionGeneration {
+    fn drop(&mut self) {
+        if self.0 {
+            RESOLUTION_CACHES.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+}
+
+fn cached_tsconfig_tree(root_config: &Path) -> Result<TsConfigTree> {
+    let key = root_config.canonicalize().unwrap_or_else(|_| root_config.to_path_buf());
+    if let Some(configs) = RESOLUTION_CACHES.with(|slot| {
+        slot.borrow().as_ref().and_then(|cache| cache.tsconfigs.get(&key).cloned())
+    }) {
+        return Ok(configs);
     }
     let configs = tsconfig_tree(&key)?;
-    cache
-        .lock()
-        .expect("tsconfig cache poisoned")
-        .insert(key, configs.clone());
+    RESOLUTION_CACHES.with(|slot| {
+        if let Some(cache) = slot.borrow_mut().as_mut() {
+            cache.tsconfigs.insert(key, configs.clone());
+        }
+    });
     Ok(configs)
 }
 
@@ -3719,6 +3749,7 @@ fn release_dependency_unit_features(units: &mut [Unit]) {
 }
 
 fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
+    let _resolution_generation = ResolutionGeneration::enter();
     let config_failures = tsconfig_failures(&discovery);
     let input_fingerprint = fingerprint_discovery(&discovery)?;
     let input_files = discovery.files.clone();
@@ -3916,6 +3947,7 @@ fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
 }
 
 fn index_project(input: &Path, side: &str) -> Result<ProjectIndex> {
+    let _resolution_generation = ResolutionGeneration::enter();
     let mut index = index_discovery(discover(input)?, side)?;
     link_installed_package_entries(&mut index);
     Ok(index)
@@ -3929,6 +3961,7 @@ fn index_dependency_evidence(
     discovery: Discovery,
     direct_dependency_packages: &BTreeSet<String>,
 ) -> Result<ProjectIndex> {
+    let _resolution_generation = ResolutionGeneration::enter();
     let config_failures = tsconfig_failures(&discovery);
     if discovery.files.len() <= 200 {
         return index_discovery(discovery, "dependency");
@@ -4111,9 +4144,6 @@ struct ProjectModuleResolutionKey {
 }
 
 type ProjectModuleResolutionCache = HashMap<ProjectModuleResolutionKey, Option<PathBuf>>;
-
-static PROJECT_MODULE_RESOLUTION_CACHE: OnceLock<Mutex<ProjectModuleResolutionCache>> =
-    OnceLock::new();
 
 /// Materialize installed package boundaries in the same graph as the project
 /// source.  The dependency corpus remains useful for broad package analysis,
@@ -4394,13 +4424,10 @@ fn resolve_project_module_path(
         specifier: specifier.to_string(),
         type_only,
     };
-    let cache = PROJECT_MODULE_RESOLUTION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(resolved) = cache
-        .lock()
-        .expect("project resolver cache poisoned")
-        .get(&key)
-    {
-        return resolved.clone();
+    if let Some(resolved) = RESOLUTION_CACHES.with(|slot| {
+        slot.borrow().as_ref().and_then(|cache| cache.modules.get(&key).cloned())
+    }) {
+        return resolved;
     }
     let resolved = if specifier.starts_with('.') || specifier.starts_with('/') {
         if type_only {
@@ -4413,10 +4440,11 @@ fn resolve_project_module_path(
     } else {
         resolve_tsconfig_path(importer, root, specifier, type_only).and_then(|entry| entry.path)
     };
-    cache
-        .lock()
-        .expect("project resolver cache poisoned")
-        .insert(key, resolved.clone());
+    RESOLUTION_CACHES.with(|slot| {
+        if let Some(cache) = slot.borrow_mut().as_mut() {
+            cache.modules.insert(key, resolved.clone());
+        }
+    });
     resolved
 }
 
@@ -7315,6 +7343,7 @@ fn generate_report(
     guard: &state::SyncGuard,
     certificates: &[BundleEquivalenceCertificate],
 ) -> Result<Summary> {
+    let _resolution_generation = ResolutionGeneration::enter();
     let (left_path, right_path, output) = guard.paths();
     let stage_started = Instant::now();
     eprintln!("[project-parity] indexing local project");
@@ -8166,9 +8195,10 @@ struct ChangedFile {
 type FileSnapshot = BTreeMap<String, String>;
 
 fn file_snapshot(root: &Path) -> Result<FileSnapshot> {
-    let discovery = discover(root)?;
-    discovery
-        .files
+    // Poll the same source/configuration inventory used for report freshness.
+    // Resolver-only edits (including external extends) must schedule a new report.
+    project_fingerprint_files(root)?
+        .0
         .into_iter()
         .map(|(path, relative)| {
             let source = fs::read(&path)
@@ -9931,6 +9961,85 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn watched_reports_reload_root_and_external_inherited_aliases_without_stale_barrels() {
+        let project = tempdir().unwrap();
+        let upstream = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let root = project.path();
+        fs::create_dir(root.join("src")).unwrap();
+        for file in ["first", "second"] {
+            fs::write(root.join(format!("src/{file}.ts")), format!("export function value() {{ return '{file}'; }}")).unwrap();
+        }
+        fs::write(root.join("src/main.ts"), "import { value } from './barrel'; export function read() { return value(); }").unwrap();
+        fs::write(root.join("src/barrel.ts"), "export { value } from '@x';").unwrap();
+        fs::write(upstream.path().join("index.js"), "export function read() { return 'first'; }").unwrap();
+        let shared_config = tempdir().unwrap();
+        let parent = shared_config.path().join("base.json");
+        let config = root.join("tsconfig.json");
+        let alias_config = |owner: &str| serde_json::to_string(&serde_json::json!({
+            "compilerOptions": {"paths": {"@x": [root.join(format!("src/{owner}.ts"))]}}
+        })).unwrap();
+        let first = alias_config("first");
+        let second = alias_config("second");
+        let inherited = serde_json::to_string(&serde_json::json!({"extends": parent})).unwrap();
+        fs::write(&parent, &first).unwrap();
+        fs::write(&config, &inherited).unwrap();
+
+        let mut snapshot = file_snapshot(root).unwrap();
+        // Exercise the watcher snapshot -> resync path in one process with warm
+        // file caches. Main -> barrel -> alias must follow each new owner.
+        for (phase, expected) in [(0, Some("first")), (1, Some("first")), (2, Some("second")), (3, Some("first")), (4, None), (5, Some("second"))] {
+            match phase {
+                2 => fs::write(&parent, &second).unwrap(),
+                3 => fs::write(&config, &first).unwrap(),
+                4 => fs::write(&config, r#"{"extends":"./tsconfig.json"}"#).unwrap(),
+                5 => fs::write(&config, &inherited).unwrap(),
+                _ => {},
+            }
+            let next_snapshot = file_snapshot(root).unwrap();
+            let changes = changed_files(&snapshot, &next_snapshot, "local");
+            if phase <= 1 {
+                assert!(changes.is_empty(), "unchanged inputs must remain idle");
+            } else {
+                assert!(!changes.is_empty(), "configuration-only change must wake the watcher: phase {phase}");
+                assert!(changes.iter().all(|change| !change.file.starts_with("src/")));
+                if phase == 2 {
+                    assert!(changes.iter().any(|change| change.file.starts_with("@config/") && change.change == "modified"));
+                }
+            }
+            update_watched_report(root, upstream.path(), output.path(), None, &changes, phase == 0).unwrap();
+            snapshot = next_snapshot;
+            let graph = zstd::stream::decode_all(fs::File::open(output.path().join("semantic-graph.jsonl.zst")).unwrap()).unwrap();
+            let records = std::str::from_utf8(&graph).unwrap().lines()
+                .map(|line| serde_json::from_str::<JsonValue>(line).unwrap())
+                .filter(|row| row["side"] == "left").collect::<Vec<_>>();
+            let nodes = records.iter().filter(|row| row["recordType"] == "node")
+                .map(|row| (row["node"]["id"].as_str().unwrap(), &row["node"]))
+                .collect::<HashMap<_, _>>();
+            let edges = records.iter().filter(|row| row["recordType"] == "edge")
+                .map(|row| &row["edge"]).collect::<Vec<_>>();
+            let alias_targets = edges.iter().filter(|edge| edge["kind"] == "ResolvesTo" && edge["label"] == "@x")
+                .map(|edge| nodes[edge["target"].as_str().unwrap()]["file"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            let binding_targets = edges.iter().filter(|edge| {
+                edge["kind"] == "BindsTo" && edge["label"] == "value"
+                    && nodes[edge["source"].as_str().unwrap()]["file"] == "src/main.ts"
+            }).map(|edge| nodes[edge["target"].as_str().unwrap()]["file"].as_str().unwrap()).collect::<Vec<_>>();
+            let provenance = read_json_lines(&output.path().join("dependency-provenance.jsonl")).unwrap();
+            if let Some(owner) = expected {
+                let file = format!("src/{owner}.ts");
+                assert_eq!(alias_targets, vec![file.as_str()], "phase {phase}");
+                assert_eq!(binding_targets, vec![file.as_str()], "phase {phase}");
+                assert!(provenance.iter().any(|row| row["specifier"] == "@x" && row["resolvedPath"] == file), "phase {phase}");
+            } else {
+                assert!(alias_targets.is_empty(), "cycle must not reuse a previous resolution");
+                assert!(binding_targets.is_empty(), "cycle must not reuse a previous barrel owner");
+                assert!(provenance.iter().any(|row| row["specifier"] == "@x" && row["resolution"] == "unresolved-tsconfig-configuration"));
+            }
+            assert!(RESOLUTION_CACHES.with(|slot| slot.borrow().is_none()), "generation cache must be dropped");
+        }
+    }
     #[test]
     fn tsconfig_dependencies_do_not_inherit_foreign_parent_config() {
         let root = tempdir().unwrap();
