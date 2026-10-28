@@ -48,7 +48,7 @@ const ENGINE_VERSION: &str = "rust-oxc-0.126.0/v74";
 // Graph extraction is cache material: change this whenever semantic nodes or
 // edges change, otherwise an old cache silently erases newly added ownership
 // links from a report.
-const INDEX_CACHE_VERSION: &str = "rust-oxc-0.126.0/v38";
+const INDEX_CACHE_VERSION: &str = "rust-oxc-0.126.0/v39";
 thread_local! {
     // Graph similarity compares many pairs that reuse the same finite token
     // vocabulary. Cache the pure token normalization, not pair scores, so
@@ -3576,10 +3576,12 @@ fn compact_semantic_graph(graph: &mut SemanticGraph) {
             node.tokens.clear();
         }
     }
+    // Runtime-load call sites carry dependency provenance even in compact graphs.
+    let runtime_load_sites = graph.edges.iter().filter(|edge| edge.kind == "Requires").map(|edge| edge.source.clone()).collect::<HashSet<_>>();
     let retained = graph
         .nodes
         .iter()
-        .filter(|node| !node.kind.ends_with("Site") && node.kind != "MemberAccess")
+        .filter(|node| (!node.kind.ends_with("Site") && node.kind != "MemberAccess") || runtime_load_sites.contains(&node.id))
         .map(|node| node.id.clone())
         .collect::<HashSet<_>>();
     graph.nodes.retain(|node| retained.contains(&node.id));
@@ -13312,6 +13314,39 @@ mod tests {
         run(left.path(), right.path(), output.path()).unwrap();
         let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
         assert!(!report["matches"].as_array().unwrap().iter().any(|m| m["left"]["name"] == "caller" && m["confidence"] == "proven-structure"), "{report}");
+    }
+
+    #[test]
+    fn compact_warm_cache_stream_retains_runtime_load_sites() {
+        let project = tempdir().unwrap(); let cache = tempdir().unwrap();
+        let path = project.path().join("source.js");
+        fs::write(&path, "export function a(name){return require(name);} export async function b(name){return import(name);}").unwrap();
+        let (mut cold, hit) = index_file(&path, "source.js", "left", cache.path()).unwrap();
+        assert!(!hit);
+        compact_semantic_graph(&mut cold.graph);
+        let mut records = Vec::new();
+        let (warm, hit, streamed) = index_project_file(&path, "source.js", "left", cache.path(), &mut records, true, true).unwrap();
+        assert!(hit && streamed, "second pass must use streamed cache");
+        assert!(warm.graph.edges.iter().any(|edge| edge.kind == "Requires" && edge.label.as_deref() == Some("<dynamic>")));
+        assert!(warm.graph.edges.iter().any(|edge| edge.kind == "DynamicImports" && edge.label.as_deref() == Some("<dynamic>")));
+        assert_eq!(serde_json::to_value(&warm.graph).unwrap(), serde_json::to_value(&cold.graph).unwrap());
+    }
+
+    #[test]
+    fn compact_graph_keeps_dynamic_require_actionable() {
+        let left = tempdir().unwrap(); let right = tempdir().unwrap(); let output = tempdir().unwrap();
+        for root in [left.path(), right.path()] {
+            fs::write(root.join("dynamic.js"), "export function dynamicCaller(name){return require(name);}").unwrap();
+            fs::write(root.join("import.js"), "export async function dynamicImport(name){return import(name);}").unwrap();
+            for i in 0..55 { fs::write(root.join(format!("plain{i}.js")), format!("export function plain{i}(){{return {i};}}")).unwrap(); }
+        }
+        for _ in 0..2 {
+            run(left.path(), right.path(), output.path()).unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+            for name in ["dynamicCaller", "dynamicImport"] {
+                assert!(report["matches"].as_array().unwrap().iter().any(|m| m["left"]["name"] == name && m["confidence"] == "candidate"), "{name}: {report}");
+            }
+        }
     }
 
     #[test]

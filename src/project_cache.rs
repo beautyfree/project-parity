@@ -5,7 +5,7 @@ use serde::{
     de::{DeserializeOwned, DeserializeSeed, Error, MapAccess, SeqAccess, Visitor},
     ser::SerializeMap, Deserializer, Serialize, Serializer,
 };
-use std::{collections::HashSet, fmt, io::Write, marker::PhantomData};
+use std::{fmt, io::Write, marker::PhantomData};
 
 
 // Keep the historical Value serializer's sorted keys without allocating a
@@ -181,7 +181,7 @@ impl<'de> DeserializeSeed<'de> for GraphSeed<'_> {
     }
 }
 fn keep_node(mut node: GraphNode) -> Option<GraphNode> {
-    if node.kind.ends_with("Site") || node.kind == "MemberAccess" {
+    if (node.kind.ends_with("Site") && node.kind != "CallSite") || node.kind == "MemberAccess" {
         return None;
     }
     if !matches!(node.kind.as_str(), "Statement" | "Function" | "Arrow") {
@@ -225,17 +225,12 @@ impl<'de> Visitor<'de> for GraphSeed<'_> {
             }
         }
         let nodes = nodes.ok_or_else(|| M::Error::missing_field("nodes"))?;
-        let mut edges = edges.ok_or_else(|| M::Error::missing_field("edges"))?;
-        if self.compact && !edges.is_empty() {
-            let retained = nodes
-                .iter()
-                .map(|node: &GraphNode| node.id.as_str())
-                .collect::<HashSet<_>>();
-            edges.retain(|edge| {
-                retained.contains(edge.source.as_str()) && retained.contains(edge.target.as_str())
-            });
+        let edges = edges.ok_or_else(|| M::Error::missing_field("edges"))?;
+        let mut graph = SemanticGraph { nodes, edges };
+        if self.compact {
+            super::compact_semantic_graph(&mut graph);
         }
-        Ok(SemanticGraph { nodes, edges })
+        Ok(graph)
     }
 }
 struct Records<'a, T> {
