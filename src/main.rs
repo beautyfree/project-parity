@@ -2567,19 +2567,32 @@ type DependencyContextIndex = HashMap<String, Vec<DependencyContextEntry>>;
 
 // A local entry's bytes do not prove its runtime imports. Include every
 // statically indexed import in its closure; unknown packages and cycles fail closed.
-fn local_dependency_closure(provenance: &[DependencyProvenance], file: &str, visiting: &mut BTreeSet<String>) -> Option<BTreeSet<String>> {
+fn local_dependency_closure_indexed(provenance: &HashMap<&str, Vec<&DependencyProvenance>>, file: &str, visiting: &mut BTreeSet<String>) -> Option<BTreeSet<String>> {
     if !visiting.insert(file.to_owned()) { return None; }
     let mut entries = BTreeSet::new();
-    for row in provenance.iter().filter(|row| row.importer_file == file && !row.edge_kind.starts_with("Type")) {
+    for row in provenance.get(file).into_iter().flatten() {
         if !matches!(row.resolution, "resolved-local-source" | "resolved-tsconfig-path" | "resolved-package-import-map") { return None; }
         let path = row.resolved_path.as_deref()?;
         if path.split(['/', '\\']).any(|part| part == "node_modules") { return None; }
         let hash = row.entry_sha256.as_deref()?;
         entries.insert(format!("{}\0{}\0{}\0{}", row.specifier, row.imported_export, path, hash));
-        entries.extend(local_dependency_closure(provenance, path, visiting)?);
+        entries.extend(local_dependency_closure_indexed(provenance, path, visiting)?);
     }
     visiting.remove(file);
     Some(entries)
+}
+
+fn dependency_adjacency(provenance: &[DependencyProvenance]) -> HashMap<&str, Vec<&DependencyProvenance>> {
+    let mut rows = HashMap::<&str, Vec<&DependencyProvenance>>::new();
+    for row in provenance.iter().filter(|row| !row.edge_kind.starts_with("Type")) {
+        rows.entry(row.importer_file.as_str()).or_default().push(row);
+    }
+    rows
+}
+
+#[cfg(test)]
+fn local_dependency_closure(provenance: &[DependencyProvenance], file: &str, visiting: &mut BTreeSet<String>) -> Option<BTreeSet<String>> {
+    local_dependency_closure_indexed(&dependency_adjacency(provenance), file, visiting)
 }
 
 fn build_dependency_context_index(
@@ -2598,12 +2611,13 @@ fn build_dependency_context_index(
     let mut contexts = HashMap::<String, Vec<DependencyContextEntry>>::new();
     // Every runtime load executes module initialization, even an unused binding.
     // Unresolved loads stay unknown; local closures are compared structurally.
+    let adjacency = dependency_adjacency(provenance);
     let mut closure_cache = HashMap::<String, Option<BTreeSet<String>>>::new();
     let mut context_for_row = |binding: &DependencyProvenance| -> Option<String> {
         if !matches!(binding.resolution, "resolved-local-source" | "resolved-tsconfig-path" | "resolved-package-import-map") || binding.entry_resolution.is_none() || binding.entry_sha256.is_none() { return None; }
         let path = binding.resolved_path.as_deref()?;
         if path.split(['/', '\\']).any(|part| part == "node_modules") { return None; }
-        let closure = closure_cache.entry(path.to_owned()).or_insert_with(|| local_dependency_closure(provenance, path, &mut BTreeSet::new())).clone()?;
+        let closure = closure_cache.entry(path.to_owned()).or_insert_with(|| local_dependency_closure_indexed(&adjacency, path, &mut BTreeSet::new())).clone()?;
         Some(format!("{}\0{}\0{}\0{}\0{}\0{}\0{}", binding.resolution, binding.specifier, binding.imported_export, path, binding.entry_resolution.unwrap_or(""), binding.entry_sha256.as_deref().unwrap_or(""), closure.into_iter().collect::<Vec<_>>().join("\n")))
     };
     for row in provenance.iter().filter(|row| row.binding_symbol_id.is_none() && !row.edge_kind.starts_with("Type")) {
