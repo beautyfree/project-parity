@@ -1369,7 +1369,23 @@ struct TsCompilerOptions {
     #[serde(default)]
     base_url: Option<String>,
     #[serde(default)]
-    paths: BTreeMap<String, Vec<String>>,
+    #[serde(deserialize_with = "deserialize_ordered_paths")]
+    paths: Option<Vec<(String, Vec<String>)>>,
+}
+
+fn deserialize_ordered_paths<'de, D>(deserializer: D) -> Result<Option<Vec<(String, Vec<String>)>>, D::Error>
+where D: serde::Deserializer<'de> {
+    struct PathsVisitor;
+    impl<'de> serde::de::Visitor<'de> for PathsVisitor {
+        type Value = Vec<(String, Vec<String>)>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("a paths object") }
+        fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+            let mut entries = Vec::new();
+            while let Some(entry) = map.next_entry()? { entries.push(entry); }
+            Ok(entries)
+        }
+    }
+    deserializer.deserialize_map(PathsVisitor).map(Some)
 }
 
 #[derive(Debug)]
@@ -2018,14 +2034,14 @@ fn tsconfig_path_target(pattern: &str, target: &str, specifier: &str) -> Option<
             let matched = specifier
                 .strip_prefix(prefix)?
                 .strip_suffix(suffix)?;
-            (target.matches('*').count() == 1).then(|| target.replacen('*', matched, 1))
+            (target.matches('*').count() <= 1).then(|| target.replacen('*', matched, 1))
         }
         _ => None,
     }
 }
 
 /// Resolves aliases from the effective `extends` chain of the importing
-/// project. A child overrides a matching path key from its parent; project
+/// project. A child `paths` object replaces its parent's; project
 /// references deliberately do not participate. Among patterns, TypeScript
 /// selects the most specific match, then tries its declared targets in order.
 fn resolve_tsconfig_path(
@@ -2041,25 +2057,27 @@ fn resolve_tsconfig_path(
     let canonical_project_root = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
-    let mut rules = BTreeMap::<String, (PathBuf, Vec<String>)>::new();
+    let mut effective_base_url = None;
+    let mut paths_base = None;
+    let mut paths = None;
     for (config_path, config) in cached_tsconfig_tree(&root_config) {
         let config_dir = config_path.parent().unwrap_or(&config_path);
-        let base_url = config
-            .compiler_options
-            .base_url
-            .as_deref()
-            .map(|base_url| config_dir.join(base_url))
-            .unwrap_or_else(|| config_dir.to_path_buf());
-        for (pattern, targets) in config.compiler_options.paths {
-            rules.insert(pattern, (base_url.clone(), targets));
+        if let Some(base_url) = config.compiler_options.base_url {
+            effective_base_url = Some(config_dir.join(base_url));
+        }
+        if let Some(declared_paths) = config.compiler_options.paths {
+            paths_base = Some(config_dir.to_path_buf());
+            paths = Some(declared_paths);
         }
     }
+    let base_url = effective_base_url.or(paths_base)?;
+    let rules = paths?.into_iter().map(|(pattern, targets)| (pattern, (base_url.clone(), targets))).collect::<Vec<_>>();
     let mut matching = rules
         .iter()
         .filter_map(|(pattern, rule)| {
             tsconfig_path_target(pattern, pattern, specifier).map(|_| {
                 let specificity = if pattern.contains('*') {
-                    pattern.len() - 1
+                    pattern.find('*').unwrap()
                 } else {
                     usize::MAX
                 };
@@ -2067,7 +2085,7 @@ fn resolve_tsconfig_path(
             })
         })
         .collect::<Vec<_>>();
-    matching.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(right.1)));
+    matching.sort_by(|left, right| right.0.cmp(&left.0));
     let (_, pattern, (base_url, targets)) = matching.first()?;
     for target in targets {
         let Some(target) = tsconfig_path_target(pattern, target, specifier) else {
@@ -12221,6 +12239,43 @@ mod tests {
                 .resolution,
             "exact-package-import-map"
         );
+    }
+
+    #[test]
+    fn tsconfig_paths_choose_longest_prefix_and_declaration_order() {
+        let project = tempdir().unwrap();
+        fs::create_dir_all(project.path().join("src")).unwrap();
+        for file in ["first.ts", "second.ts", "third.ts"] {
+            fs::write(project.path().join("src").join(file), "export {};").unwrap();
+        }
+        fs::write(project.path().join("tsconfig.json"), r#"{"compilerOptions":{"paths":{"@/*long.js":["src/first.ts"],"@/foo/*":["src/second.ts"]}}}"#).unwrap();
+        let importer = project.path().join("src/main.ts");
+        assert_eq!(resolve_tsconfig_path(&importer, project.path(), "@/foo/long.js", false).unwrap().path.unwrap(), project.path().join("src/second.ts").canonicalize().unwrap());
+        let other = tempdir().unwrap();
+        fs::create_dir_all(other.path().join("src")).unwrap();
+        fs::write(other.path().join("src/first.ts"), "export {};").unwrap();
+        fs::write(other.path().join("src/second.ts"), "export {};").unwrap();
+        fs::write(other.path().join("tsconfig.json"), r#"{"compilerOptions":{"paths":{"@x/*js":["src/first.ts"],"@x/*.js":["src/second.ts"]}}}"#).unwrap();
+        assert_eq!(resolve_tsconfig_path(&other.path().join("src/main.ts"), other.path(), "@x/a.js", false).unwrap().path.unwrap(), other.path().join("src/first.ts").canonicalize().unwrap());
+    }
+
+    #[test]
+    fn tsconfig_paths_inherit_base_url_and_child_paths_replace_parent() {
+        let project = tempdir().unwrap();
+        fs::create_dir_all(project.path().join("base/src")).unwrap();
+        fs::create_dir_all(project.path().join("child")).unwrap();
+        fs::write(project.path().join("base/src/a.ts"), "export {};").unwrap();
+        fs::write(project.path().join("base.json"), r#"{"compilerOptions":{"baseUrl":"base","paths":{"@parent/*":["src/*"]}}}"#).unwrap();
+        fs::write(project.path().join("child/tsconfig.json"), r#"{"extends":"../base.json","compilerOptions":{"paths":{"@child/*":["src/*"]}}}"#).unwrap();
+        let importer = project.path().join("child/main.ts");
+        assert_eq!(resolve_tsconfig_path(&importer, project.path(), "@child/a", false).unwrap().path.unwrap(), project.path().join("base/src/a.ts").canonicalize().unwrap());
+        assert!(resolve_tsconfig_path(&importer, project.path(), "@parent/a", false).is_none());
+        let second = tempdir().unwrap();
+        fs::create_dir_all(second.path().join("child/base/src")).unwrap();
+        fs::write(second.path().join("child/base/src/a.ts"), "export {};").unwrap();
+        fs::write(second.path().join("base.json"), r#"{"compilerOptions":{"paths":{"@parent/*":["src/*"]}}}"#).unwrap();
+        fs::write(second.path().join("child/tsconfig.json"), r#"{"extends":"../base.json","compilerOptions":{"baseUrl":"base"}}"#).unwrap();
+        assert_eq!(resolve_tsconfig_path(&second.path().join("child/main.ts"), second.path(), "@parent/a", false).unwrap().path.unwrap(), second.path().join("child/base/src/a.ts").canonicalize().unwrap());
     }
 
     #[test]
