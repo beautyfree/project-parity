@@ -2463,6 +2463,19 @@ fn equivalent_package_contract(left: &DependencyProvenance, right: &DependencyPr
         && left.imported_export == right.imported_export
 }
 
+fn equivalent_tsconfig_entry(left: &DependencyProvenance, right: &DependencyProvenance) -> bool {
+    left.resolution == "resolved-tsconfig-path"
+        && right.resolution == "resolved-tsconfig-path"
+        && left.entry_resolution == Some("exact-tsconfig-path")
+        && right.entry_resolution == Some("exact-tsconfig-path")
+        && left.entry_path.is_some()
+        && left.entry_path == right.entry_path
+        && left.entry_sha256.is_some()
+        && left.entry_sha256 == right.entry_sha256
+        && left.specifier == right.specifier
+        && left.imported_export == right.imported_export
+}
+
 /// Pair import bindings only after the semantic graph has identified their
 /// lexical relationship.  This deliberately leaves a matched package contract
 /// at candidate level: graph correspondence is static evidence, not a claim
@@ -2512,6 +2525,11 @@ fn dependency_binding_contracts(
                 (
                     "candidate-identical-package-contract",
                     "Lexical bindings are graph-related; package name, version, runtime fingerprint, specifier and imported export are identical. Static graph evidence still requires behavior review.".to_string(),
+                )
+            } else if equivalent_tsconfig_entry(left, right) {
+                (
+                    "candidate-identical-local-entry",
+                    "Lexical bindings are graph-related and resolve to identical local entry paths and bytes. Transitive dependencies and runtime behavior still require review.".to_string(),
                 )
             } else {
                 (
@@ -12294,6 +12312,29 @@ mod tests {
     }
 
     #[test]
+    fn tsconfig_binding_contract_report_distinguishes_identical_and_changed_entries() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        for root in [left.path(), right.path()] {
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::write(root.join("tsconfig.json"), r#"{"compilerOptions":{"paths":{"@app/*":["src/*"]}}}"#).unwrap();
+            fs::write(root.join("src/runtime.ts"), "export const runtime = 1;").unwrap();
+            fs::write(root.join("src/consumer.ts"), "import { runtime } from '@app/runtime'; export function read() { return runtime; }").unwrap();
+        }
+        let check = |expected: &str| {
+            let output = tempdir().unwrap();
+            run(left.path(), right.path(), output.path()).unwrap();
+            let rows = fs::read_to_string(output.path().join("dependency-binding-contracts.jsonl")).unwrap();
+            assert!(rows.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()).any(|row| {
+                row["disposition"] == expected && row["left"]["specifier"] == "@app/runtime" && row["left"]["importedExport"] == "runtime"
+            }), "missing {expected}: {rows}");
+        };
+        check("candidate-identical-local-entry");
+        fs::write(right.path().join("src/runtime.ts"), "export const runtime = 2;").unwrap();
+        check("changed-or-unresolved-package-contract");
+    }
+
+    #[test]
     fn tsconfig_paths_resolve_local_value_and_type_bindings() {
         let left = tempdir().unwrap();
         let right = tempdir().unwrap();
@@ -13154,6 +13195,17 @@ mod tests {
             entry_sha256: Some(fingerprint.to_string()),
             entry_candidates: Vec::new(),
         };
+        let mut local_left = row("left", "left-binding", "same");
+        local_left.resolution = "resolved-tsconfig-path";
+        local_left.entry_resolution = Some("exact-tsconfig-path");
+        local_left.entry_path = Some("src/entry.ts".to_string());
+        let mut local_right = local_left.clone();
+        local_right.side = "right".to_string();
+        assert!(equivalent_tsconfig_entry(&local_left, &local_right));
+        local_right.entry_sha256 = Some("changed".to_string());
+        assert!(!equivalent_tsconfig_entry(&local_left, &local_right));
+        local_right.entry_sha256 = None;
+        assert!(!equivalent_tsconfig_entry(&local_left, &local_right));
         let relation = GraphRelation {
             confidence: "candidate",
             basis: "neighbor-exact",
@@ -13179,6 +13231,19 @@ mod tests {
                 end: 1,
             },
         };
+        local_right.binding_symbol_id = Some("right-binding".to_string());
+        local_right.entry_sha256 = local_left.entry_sha256.clone();
+        let local_contracts = dependency_binding_contracts(
+            &[local_left.clone(), local_right.clone()],
+            std::slice::from_ref(&relation),
+        );
+        assert_eq!(local_contracts[0].disposition, "candidate-identical-local-entry");
+        local_right.entry_sha256 = Some("changed".to_string());
+        let changed_contracts = dependency_binding_contracts(
+            &[local_left, local_right],
+            std::slice::from_ref(&relation),
+        );
+        assert_eq!(changed_contracts[0].disposition, "changed-or-unresolved-package-contract");
         let contracts = dependency_binding_contracts(
             &[
                 row("left", "left-binding", "same"),
