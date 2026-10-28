@@ -2598,11 +2598,12 @@ fn build_dependency_context_index(
     let mut contexts = HashMap::<String, Vec<DependencyContextEntry>>::new();
     // Every runtime load executes module initialization, even an unused binding.
     // Unresolved loads stay unknown; local closures are compared structurally.
-    let context_for_row = |binding: &DependencyProvenance| -> Option<String> {
+    let mut closure_cache = HashMap::<String, Option<BTreeSet<String>>>::new();
+    let mut context_for_row = |binding: &DependencyProvenance| -> Option<String> {
         if !matches!(binding.resolution, "resolved-local-source" | "resolved-tsconfig-path" | "resolved-package-import-map") || binding.entry_resolution.is_none() || binding.entry_sha256.is_none() { return None; }
         let path = binding.resolved_path.as_deref()?;
         if path.split(['/', '\\']).any(|part| part == "node_modules") { return None; }
-        let closure = local_dependency_closure(provenance, path, &mut BTreeSet::new())?;
+        let closure = closure_cache.entry(path.to_owned()).or_insert_with(|| local_dependency_closure(provenance, path, &mut BTreeSet::new())).clone()?;
         Some(format!("{}\0{}\0{}\0{}\0{}\0{}\0{}", binding.resolution, binding.specifier, binding.imported_export, path, binding.entry_resolution.unwrap_or(""), binding.entry_sha256.as_deref().unwrap_or(""), closure.into_iter().collect::<Vec<_>>().join("\n")))
     };
     for row in provenance.iter().filter(|row| row.binding_symbol_id.is_none() && !row.edge_kind.starts_with("Type")) {
