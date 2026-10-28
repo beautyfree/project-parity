@@ -2017,8 +2017,7 @@ fn tsconfig_path_target(pattern: &str, target: &str, specifier: &str) -> Option<
             let (prefix, suffix) = pattern.split_once('*')?;
             let matched = specifier
                 .strip_prefix(prefix)?
-                .strip_suffix(suffix)
-                .unwrap_or_default();
+                .strip_suffix(suffix)?;
             (target.matches('*').count() == 1).then(|| target.replacen('*', matched, 1))
         }
         _ => None,
@@ -9815,6 +9814,12 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tsconfig_wildcard_requires_suffix_match() {
+        assert_eq!(super::tsconfig_path_target("@x/*.js", "src/*.ts", "@x/a.js"), Some("src/a.ts".into()));
+        assert_eq!(super::tsconfig_path_target("@x/*.js", "src/*.ts", "@x/a"), None);
+        assert_eq!(super::tsconfig_path_target("@x/*", "fallback/*", "@x/a"), Some("fallback/a".into()));
+    }
     use super::*;
 
     fn root_identity_projects(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
@@ -12216,6 +12221,21 @@ mod tests {
                 .resolution,
             "exact-package-import-map"
         );
+    }
+
+    #[test]
+    fn tsconfig_paths_suffix_mismatch_uses_matching_fallback() {
+        let project = tempdir().unwrap();
+        fs::create_dir_all(project.path().join("src")).unwrap();
+        fs::create_dir_all(project.path().join("special")).unwrap();
+        fs::write(project.path().join("tsconfig.json"), r#"{"compilerOptions":{"baseUrl":".","paths":{"@x/*.js":["special/*.ts"],"@x/*":["src/*"]}}}"#).unwrap();
+        fs::write(project.path().join("src/a.ts"), "export const value = 1;").unwrap();
+        fs::write(project.path().join("special/a.ts"), "export const value = 2;").unwrap();
+        let importer = project.path().join("src/main.ts");
+        for (specifier, expected) in [("@x/a", "src/a.ts"), ("@x/a.js", "special/a.ts")] {
+            let entry = resolve_tsconfig_path(&importer, project.path(), specifier, false).unwrap();
+            assert_eq!(entry.path.unwrap(), project.path().join(expected).canonicalize().unwrap());
+        }
     }
 
     #[test]
