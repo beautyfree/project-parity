@@ -2091,14 +2091,29 @@ fn resolve_tsconfig_path(
 
 fn package_runtime_sha256(package_root: &Path) -> Option<String> {
     let selected_root = package_root.canonicalize().ok()?;
+    // A direct package fingerprint does not prove the identities of its own
+    // dependencies. Until transitive resolution is indexed, refuse proof for
+    // packages declaring runtime dependencies or containing nested installs.
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(selected_root.join("package.json")).ok()?).ok()?;
+    for key in ["dependencies", "optionalDependencies", "peerDependencies"] {
+        if manifest.get(key).and_then(|value| value.as_object()).is_some_and(|entries| !entries.is_empty()) {
+            return None;
+        }
+    }
+    if selected_root.join("node_modules").exists() {
+        return None;
+    }
     let mut files = Vec::new();
     for entry in WalkDir::new(&selected_root)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
         .filter_entry(|entry| entry.file_name() != "node_modules")
-        .filter_map(Result::ok)
     {
+        let entry = entry.ok()?;
+        if entry.file_type().is_symlink() {
+            return None;
+        }
         if !entry.file_type().is_file() {
             continue;
         }
@@ -2108,13 +2123,6 @@ fn package_runtime_sha256(package_root: &Path) -> Option<String> {
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.ends_with(".d.ts"))
         {
-            continue;
-        }
-        let name = path.file_name().and_then(|name| name.to_str());
-        let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
-            continue;
-        };
-        if !CODE_EXTENSIONS.contains(&extension) && name != Some("package.json") {
             continue;
         }
         let relative = path.strip_prefix(&selected_root).ok()?.to_string_lossy();
@@ -2583,34 +2591,12 @@ fn build_dependency_context_index(
             continue;
         };
         let context = {
-            // A matching spelling for an unresolved or conditional import is not
-            // evidence that two units execute the same dependency. Do not promote
-            // a strict AST match to proven structure until this edge has one exact
-            // source/entry identity on both sides.
-            if !matches!(
-                binding.resolution,
-                "resolved-local-source"
-                    | "resolved-tsconfig-path"
-                    | "resolved-package-import-map"
-                    | "resolved-installed-package"
-            ) || binding.entry_resolution.is_none()
-                || binding.entry_sha256.is_none()
-            {
-                None
-            } else {
-                Some(format!(
-                    "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
-                    binding.resolution,
-                    binding.specifier,
-                    binding.imported_export,
-                    binding.package.as_deref().unwrap_or(""),
-                    binding.version.as_deref().unwrap_or(""),
-                    binding.package_runtime_sha256.as_deref().unwrap_or(""),
-                    binding.resolved_path.as_deref().unwrap_or(""),
-                    binding.entry_resolution.unwrap_or(""),
-                    binding.entry_path.as_deref().unwrap_or(""),
-                    binding.entry_sha256.as_deref().unwrap_or(""),
-                ))
+            if !matches!(binding.resolution, "resolved-local-source" | "resolved-tsconfig-path" | "resolved-package-import-map" | "resolved-installed-package")
+                || binding.entry_resolution.is_none() || binding.entry_sha256.is_none()
+                || binding.resolution == "resolved-installed-package"
+                || (binding.resolution != "resolved-installed-package" && binding.resolved_path.as_deref().is_some_and(|path| path.split(['/', '\\']).any(|part| part == "node_modules")))
+            { None } else {
+                Some(format!("{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}", binding.resolution, binding.specifier, binding.imported_export, binding.package.as_deref().unwrap_or(""), binding.version.as_deref().unwrap_or(""), binding.package_runtime_sha256.as_deref().unwrap_or(""), binding.resolved_path.as_deref().unwrap_or(""), binding.entry_resolution.unwrap_or(""), binding.entry_path.as_deref().unwrap_or(""), binding.entry_sha256.as_deref().unwrap_or("")))
             }
         };
         contexts
@@ -7434,6 +7420,9 @@ fn generate_report(
         }) else {
             continue;
         };
+        if !units_have_equivalent_dependency_context(&left_dependency_contexts, &right_dependency_contexts, old, new) {
+            continue;
+        }
         used_left.insert(old.id.clone());
         used_right.insert(new.id.clone());
         matches.push(MatchRecord {
@@ -13107,6 +13096,165 @@ mod tests {
                     && record["confidence"] == "proven-structure"
             })
         }));
+    }
+
+    fn write_runtime_package(root: &Path, version: &str, source: &str) {
+        let package = root.join("node_modules/runtime-fixture");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join("package.json"),
+            format!(
+                r#"{{"name":"runtime-fixture","version":"{version}","main":"index.js"}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(package.join("index.js"), source).unwrap();
+    }
+
+    #[test]
+    fn identical_source_with_different_installed_package_runtime_is_not_proven_structure() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let source = "import { run as target } from 'runtime-fixture'; export function caller(){ return target(); }";
+        fs::write(left.path().join("main.js"), source).unwrap();
+        fs::write(right.path().join("main.js"), source).unwrap();
+        write_runtime_package(left.path(), "1.0.0", "export const run = () => 'left';");
+        write_runtime_package(right.path(), "2.0.0", "export const run = () => 'right';");
+
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(report["matches"].as_array().is_some_and(|matches| {
+            matches.iter().any(|record| {
+                record["left"]["name"] == "caller"
+                    && record["basis"] == "strict-dependency-context"
+                    && record["status"] == "dependency-context-changed"
+                    && record["confidence"] == "candidate"
+            })
+        }), "identical source must not prove a changed installed runtime: {report}");
+        assert!(!report["matches"].as_array().is_some_and(|matches| {
+            matches.iter().any(|record| {
+                record["left"]["name"] == "caller"
+                    && record["basis"] == "identical-file"
+                    && record["confidence"] == "proven-structure"
+            })
+        }));
+    }
+
+    #[test]
+    fn identical_source_with_matching_installed_package_runtime_remains_candidate() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let source = "import { run as target } from 'runtime-fixture'; export function caller(){ return target(); }";
+        fs::write(left.path().join("main.js"), source).unwrap();
+        fs::write(right.path().join("main.js"), source).unwrap();
+        write_runtime_package(left.path(), "1.0.0", "export const run = () => 'same';");
+        write_runtime_package(right.path(), "1.0.0", "export const run = () => 'same';");
+
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(report["matches"].as_array().is_some_and(|matches| {
+            matches.iter().any(|record| {
+                record["left"]["name"] == "caller"
+                    && record["basis"] == "strict-dependency-context"
+                    && record["status"] == "dependency-context-changed"
+                    && record["confidence"] == "candidate"
+            })
+        }), "unproven installed dependency closure must remain actionable: {report}");
+    }
+
+    #[test]
+    fn identical_source_with_undeclared_dependency_stays_actionable() {
+        let left = tempdir().unwrap(); let right = tempdir().unwrap(); let output = tempdir().unwrap();
+        let source = "import { run } from 'runtime-fixture'; export function caller(){ return run(); }";
+        for (root, value) in [(left.path(), "left"), (right.path(), "right")] {
+            fs::write(root.join("main.js"), source).unwrap();
+            write_runtime_package(root, "1.0.0", "export const run = () => require('undeclared');");
+            let dep = root.join("node_modules/undeclared"); fs::create_dir_all(&dep).unwrap();
+            fs::write(dep.join("index.js"), value).unwrap();
+        }
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(report["matches"].as_array().unwrap().iter().any(|m| m["left"]["name"] == "caller" && m["confidence"] == "candidate" && m["status"] == "dependency-context-changed"));
+    }
+
+    #[test]
+    fn identical_source_without_package_dependencies_stays_proven() {
+        let left = tempdir().unwrap(); let right = tempdir().unwrap(); let output = tempdir().unwrap();
+        for root in [left.path(), right.path()] { fs::write(root.join("main.js"), "export function caller(){ return 42; }").unwrap(); }
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(report["matches"].as_array().unwrap().iter().any(|m| m["left"]["name"] == "caller" && m["confidence"] == "proven-structure"));
+    }
+
+    #[test]
+    fn identical_source_with_nested_package_dependencies_is_not_proven() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let source = "import { run as target } from 'runtime-fixture'; export function caller(){ return target(); }";
+        for root in [left.path(), right.path()] {
+            fs::write(root.join("main.js"), source).unwrap();
+            write_runtime_package(root, "1.0.0", "export { run } from 'nested';");
+            let nested = root.join("node_modules/runtime-fixture/node_modules/nested");
+            fs::create_dir_all(&nested).unwrap();
+            fs::write(nested.join("index.js"), if root == left.path() { "export const run = 1" } else { "export const run = 2" }).unwrap();
+        }
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(!report["matches"].as_array().is_some_and(|matches| matches.iter().any(|record| record["left"]["name"] == "caller" && record["confidence"] == "proven-structure")));
+    }
+
+    #[test]
+    fn identical_source_with_changed_package_json_asset_is_not_proven() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let source = "import { run as target } from 'runtime-fixture'; export function caller(){ return target(); }";
+        for (root, asset) in [(left.path(), "1"), (right.path(), "2")] {
+            fs::write(root.join("main.js"), source).unwrap();
+            write_runtime_package(root, "1.0.0", "export const run = () => require('./data.json');");
+            fs::write(root.join("node_modules/runtime-fixture/data.json"), asset).unwrap();
+        }
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(!report["matches"].as_array().is_some_and(|matches| matches.iter().any(|record| record["left"]["name"] == "caller" && record["confidence"] == "proven-structure")));
+    }
+
+    #[test]
+    fn identical_source_relative_import_into_node_modules_is_not_proven() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let source = "import { run as target } from './node_modules/runtime-fixture/index.js'; export function caller(){ return target(); }";
+        for (root, asset) in [(left.path(), "1"), (right.path(), "2")] {
+            fs::write(root.join("main.js"), source).unwrap();
+            write_runtime_package(root, "1.0.0", "export const run = () => require('./data.json');");
+            fs::write(root.join("node_modules/runtime-fixture/data.json"), asset).unwrap();
+        }
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(!report["matches"].as_array().is_some_and(|matches| matches.iter().any(|record| record["left"]["name"] == "caller" && record["confidence"] == "proven-structure")));
+    }
+
+    #[test]
+    fn identical_source_tsconfig_alias_into_node_modules_is_not_proven() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let source = "import { run as target } from '@fixture'; export function caller(){ return target(); }";
+        for (root, asset) in [(left.path(), "1"), (right.path(), "2")] {
+            fs::write(root.join("main.ts"), source).unwrap();
+            fs::write(root.join("tsconfig.json"), r#"{"compilerOptions":{"baseUrl":".","paths":{"@fixture":["node_modules/runtime-fixture/index.js"]}}}"#).unwrap();
+            write_runtime_package(root, "1.0.0", "export const run = () => require('./data.json');");
+            fs::write(root.join("node_modules/runtime-fixture/data.json"), asset).unwrap();
+        }
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(!report["matches"].as_array().is_some_and(|matches| matches.iter().any(|record| record["left"]["name"] == "caller" && record["confidence"] == "proven-structure")));
     }
 
     #[test]
