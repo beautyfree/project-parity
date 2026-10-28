@@ -2567,8 +2567,10 @@ type DependencyContextIndex = HashMap<String, Vec<DependencyContextEntry>>;
 
 // A local entry's bytes do not prove its runtime imports. Include every
 // statically indexed import in its closure; unknown packages and cycles fail closed.
-fn local_dependency_closure_indexed(provenance: &HashMap<&str, Vec<&DependencyProvenance>>, file: &str, visiting: &mut BTreeSet<String>) -> Option<BTreeSet<String>> {
+fn local_dependency_closure_indexed(provenance: &HashMap<&str, Vec<&DependencyProvenance>>, file: &str, visiting: &mut BTreeSet<String>, cache: &mut HashMap<String, Option<BTreeSet<String>>>) -> Option<BTreeSet<String>> {
+    if let Some(result) = cache.get(file) { return result.clone(); }
     if !visiting.insert(file.to_owned()) { return None; }
+    let result = (|| {
     let mut entries = BTreeSet::new();
     for row in provenance.get(file).into_iter().flatten() {
         if !matches!(row.resolution, "resolved-local-source" | "resolved-tsconfig-path" | "resolved-package-import-map") { return None; }
@@ -2576,10 +2578,13 @@ fn local_dependency_closure_indexed(provenance: &HashMap<&str, Vec<&DependencyPr
         if path.split(['/', '\\']).any(|part| part == "node_modules") { return None; }
         let hash = row.entry_sha256.as_deref()?;
         entries.insert(format!("{}\0{}\0{}\0{}", row.specifier, row.imported_export, path, hash));
-        entries.extend(local_dependency_closure_indexed(provenance, path, visiting)?);
+        entries.extend(local_dependency_closure_indexed(provenance, path, visiting, cache)?);
     }
-    visiting.remove(file);
     Some(entries)
+    })();
+    visiting.remove(file);
+    cache.insert(file.to_owned(), result.clone());
+    result
 }
 
 fn dependency_adjacency(provenance: &[DependencyProvenance]) -> HashMap<&str, Vec<&DependencyProvenance>> {
@@ -2592,7 +2597,7 @@ fn dependency_adjacency(provenance: &[DependencyProvenance]) -> HashMap<&str, Ve
 
 #[cfg(test)]
 fn local_dependency_closure(provenance: &[DependencyProvenance], file: &str, visiting: &mut BTreeSet<String>) -> Option<BTreeSet<String>> {
-    local_dependency_closure_indexed(&dependency_adjacency(provenance), file, visiting)
+    local_dependency_closure_indexed(&dependency_adjacency(provenance), file, visiting, &mut HashMap::new())
 }
 
 fn build_dependency_context_index(
@@ -2617,7 +2622,7 @@ fn build_dependency_context_index(
         if !matches!(binding.resolution, "resolved-local-source" | "resolved-tsconfig-path" | "resolved-package-import-map") || binding.entry_resolution.is_none() || binding.entry_sha256.is_none() { return None; }
         let path = binding.resolved_path.as_deref()?;
         if path.split(['/', '\\']).any(|part| part == "node_modules") { return None; }
-        let closure = closure_cache.entry(path.to_owned()).or_insert_with(|| local_dependency_closure_indexed(&adjacency, path, &mut BTreeSet::new())).clone()?;
+        let closure = local_dependency_closure_indexed(&adjacency, path, &mut BTreeSet::new(), &mut closure_cache)?;
         Some(format!("{}\0{}\0{}\0{}\0{}\0{}\0{}", binding.resolution, binding.specifier, binding.imported_export, path, binding.entry_resolution.unwrap_or(""), binding.entry_sha256.as_deref().unwrap_or(""), closure.into_iter().collect::<Vec<_>>().join("\n")))
     };
     for row in provenance.iter().filter(|row| row.binding_symbol_id.is_none() && !row.edge_kind.starts_with("Type")) {
@@ -13027,6 +13032,29 @@ mod tests {
         assert!(local_dependency_closure(&rows, "wrapper.js", &mut BTreeSet::new()).is_none());
         rows[1] = row("inner.js", "resolved-local-source", "wrapper.js");
         assert!(local_dependency_closure(&rows, "wrapper.js", &mut BTreeSet::new()).is_none());
+        let rows = vec![row("a.js", "resolved-local-source", "shared.js"), row("b.js", "resolved-local-source", "shared.js"), row("shared.js", "resolved-local-source", "leaf.js")];
+        let adjacency = dependency_adjacency(&rows);
+        let mut cache = HashMap::new();
+        assert!(local_dependency_closure_indexed(&adjacency, "a.js", &mut BTreeSet::new(), &mut cache).is_some());
+        assert!(local_dependency_closure_indexed(&adjacency, "b.js", &mut BTreeSet::new(), &mut cache).is_some());
+        assert!(cache.get("shared.js").is_some_and(Option::is_some));
+        for file in ["a.js", "b.js", "shared.js", "leaf.js"] {
+            assert_eq!(local_dependency_closure_indexed(&adjacency, file, &mut BTreeSet::new(), &mut cache), local_dependency_closure(&rows, file, &mut BTreeSet::new()));
+        }
+        let rows = vec![row("a.js", "resolved-local-source", "b.js"), row("b.js", "resolved-local-source", "a.js"), row("c.js", "resolved-local-source", "b.js")];
+        let adjacency = dependency_adjacency(&rows);
+        let mut cache = HashMap::new();
+        assert!(local_dependency_closure_indexed(&adjacency, "a.js", &mut BTreeSet::new(), &mut cache).is_none());
+        assert!(local_dependency_closure_indexed(&adjacency, "c.js", &mut BTreeSet::new(), &mut cache).is_none());
+        for file in ["a.js", "b.js", "c.js"] {
+            assert_eq!(local_dependency_closure_indexed(&adjacency, file, &mut BTreeSet::new(), &mut cache), local_dependency_closure(&rows, file, &mut BTreeSet::new()));
+        }
+        let rows = vec![row("a.js", "resolved-local-source", "b.js"), row("b.js", "unresolved", "external")];
+        let adjacency = dependency_adjacency(&rows);
+        let mut cache = HashMap::new();
+        for file in ["a.js", "b.js"] {
+            assert_eq!(local_dependency_closure_indexed(&adjacency, file, &mut BTreeSet::new(), &mut cache), local_dependency_closure(&rows, file, &mut BTreeSet::new()));
+        }
     }
 
     #[test]
