@@ -3806,12 +3806,19 @@ fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
     } = discovery;
     let cache_dir = cache_root();
     let _ = fs::create_dir_all(&cache_dir);
-    let graph_artifact = cache_dir.join(format!(
-        "project-graph-{}-{side}.jsonl.zst",
-        sha256(root.to_string_lossy().as_bytes())
-    ));
-    let graph_file = fs::File::create(&graph_artifact)
-        .with_context(|| format!("create {}", graph_artifact.display()))?;
+    // Dependency graph records are retained in memory but are not published or read downstream.
+    let graph_artifact = (side != "dependency").then(|| {
+        cache_dir.join(format!(
+            "project-graph-{}-{side}.jsonl.zst",
+            sha256(root.to_string_lossy().as_bytes())
+        ))
+    });
+    let graph_file: Box<dyn Write> = match graph_artifact.as_ref() {
+        Some(path) => Box::new(
+            fs::File::create(path).with_context(|| format!("create {}", path.display()))?,
+        ),
+        None => Box::new(io::sink()),
+    };
     // This is an intermediate lossless stream consumed once by the report
     // writer below.  Keep it compressed while indexing: the upstream bundle
     // produces multi-gigabyte JSONL graphs, and retaining an uncompressed copy
@@ -3867,7 +3874,7 @@ fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
                     cache_misses += 1;
                 }
                 files.push(indexed.record);
-                if !graph_streamed {
+                if side != "dependency" && !graph_streamed {
                     for node in &indexed.graph.nodes {
                         project_cache::write_graph_record(&mut graph_output, side, node)?;
                     }
@@ -3979,7 +3986,7 @@ fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
         units,
         graph_nodes,
         graph_edges,
-        graph_artifact: Some(graph_artifact),
+        graph_artifact,
         failures,
         skipped,
     };
@@ -13216,6 +13223,22 @@ mod tests {
         fs::write(package.join("dist/runtime.js"), "module.exports = x => x >= 2;").unwrap();
         let discovery = discover_dependencies(project.path(), Some(&indexed)).unwrap().unwrap();
         assert!(discovery.files.iter().any(|(_, relative)| relative.ends_with("/dist/runtime.js")));
+    }
+
+    #[test]
+    fn dependency_index_keeps_graph_evidence_without_spilling_unused_artifact() {
+        let project = tempdir().unwrap();
+        fs::write(
+            project.path().join("main.js"),
+            "export function outer(x) { return x.value; }\n",
+        )
+        .unwrap();
+
+        let dependencies = index_project(project.path(), "dependency").unwrap();
+
+        assert!(dependencies.graph_artifact.is_none());
+        assert!(!dependencies.graph_nodes.is_empty());
+        assert!(!dependencies.graph_edges.is_empty());
     }
 
     #[test]
