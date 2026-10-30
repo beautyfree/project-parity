@@ -6418,6 +6418,80 @@ fn nearest_executable_owner<'a>(
     }
 }
 
+fn executable_context<'a>(
+    node: &'a GraphNode,
+    nodes: &HashMap<&'a str, &'a GraphNode>,
+    parents: &HashMap<String, String>,
+    outgoing: &HashMap<&str, Vec<&GraphEdge>>,
+) -> Option<&'a GraphNode> {
+    if matches!(node.kind.as_str(), "Function" | "Class") {
+        return Some(node);
+    }
+    let direct_children = outgoing
+        .get(node.id.as_str())
+        .into_iter()
+        .flatten()
+        .filter(|edge| edge.kind == "Contains")
+        .filter_map(|edge| nodes.get(edge.target.as_str()).copied())
+        .collect::<Vec<_>>();
+    if let Some(owner) = direct_children.iter().copied().find(|child| {
+        matches!(child.kind.as_str(), "Function" | "Class") && child.label == "declaration"
+    }) {
+        return Some(owner);
+    }
+    for declaration in std::iter::once(node)
+        .chain(direct_children.iter().copied())
+        .filter(|child| child.kind == "Statement" && child.label == "VariableDeclarator")
+    {
+        if let Some(owner) = outgoing
+            .get(declaration.id.as_str())
+            .into_iter()
+            .flatten()
+            .filter(|edge| edge.kind == "Contains")
+            .filter_map(|edge| nodes.get(edge.target.as_str()).copied())
+            .find(|child| {
+                matches!(child.kind.as_str(), "Function" | "Class")
+                    && child.end == declaration.end
+            })
+        {
+            return Some(owner);
+        }
+    }
+    nearest_executable_owner(&node.id, nodes, parents)
+}
+
+fn next_statement_pair_is_safe(
+    left_source: &GraphNode,
+    left_target: &GraphNode,
+    right_source: &GraphNode,
+    right_target: &GraphNode,
+    left_nodes: &HashMap<&str, &GraphNode>,
+    right_nodes: &HashMap<&str, &GraphNode>,
+    left_parents: &HashMap<String, String>,
+    right_parents: &HashMap<String, String>,
+    left_outgoing: &HashMap<&str, Vec<&GraphEdge>>,
+    right_outgoing: &HashMap<&str, Vec<&GraphEdge>>,
+    left_to_right: &HashMap<String, String>,
+    right_to_left: &HashMap<String, String>,
+) -> bool {
+    let contexts = (
+        executable_context(left_source, left_nodes, left_parents, left_outgoing),
+        executable_context(left_target, left_nodes, left_parents, left_outgoing),
+        executable_context(right_source, right_nodes, right_parents, right_outgoing),
+        executable_context(right_target, right_nodes, right_parents, right_outgoing),
+    );
+    match contexts {
+        (None, None, None, None) => true,
+        (Some(left_source), Some(left_target), Some(right_source), Some(right_target)) => {
+            left_source.id == left_target.id
+                && right_source.id == right_target.id
+                && left_to_right.get(&left_source.id) == Some(&right_source.id)
+                && right_to_left.get(&right_source.id) == Some(&left_source.id)
+        }
+        _ => false,
+    }
+}
+
 fn owner_context_is_proven(
     left_node: &GraphNode,
     right_node: &GraphNode,
@@ -6784,6 +6858,39 @@ fn analyze_semantic_graph(
             let Some(left_target) = left_nodes.get(left_edge.target.as_str()) else {
                 continue;
             };
+            let right_neighbor_edges = right_edges
+                .iter()
+                .copied()
+                .filter(|right_edge| {
+                    if left_edge.kind != "NextStatement" && right_edge.kind != "NextStatement" {
+                        return true;
+                    }
+                    if left_edge.kind != "NextStatement" || right_edge.kind != "NextStatement" {
+                        return false;
+                    }
+                    let (Some(left_source), Some(right_source), Some(right_target)) = (
+                        left_nodes.get(left_id.as_str()),
+                        right_nodes.get(right_id.as_str()),
+                        right_nodes.get(right_edge.target.as_str()),
+                    ) else {
+                        return false;
+                    };
+                    next_statement_pair_is_safe(
+                        left_source,
+                        left_target,
+                        right_source,
+                        right_target,
+                        &left_nodes,
+                        &right_nodes,
+                        &left_contains_parents,
+                        &right_contains_parents,
+                        &left_outgoing,
+                        &right_outgoing,
+                        &left_to_right,
+                        &right_to_left,
+                    )
+                })
+                .collect::<Vec<_>>();
             if left_edge.kind == "Contains" {
                 if let Some(right_target_id) = positional_scope_symbols.get(&left_target.id) {
                     proposed.push((
@@ -6822,7 +6929,7 @@ fn analyze_semantic_graph(
             // target is still the same owner even if the immediate edge
             // contract differs.  Keep the fallback bounded to one-to-one
             // exact structural hashes; ambiguous duplicates remain queued.
-            let structural_exact = right_edges
+            let structural_exact = right_neighbor_edges
                 .iter()
                 .filter_map(|right_edge| {
                     let right_target = right_nodes.get(right_edge.target.as_str())?;
@@ -6848,7 +6955,7 @@ fn analyze_semantic_graph(
                 ));
                 continue;
             }
-            let exact = right_edges
+            let exact = right_neighbor_edges
                 .iter()
                 .filter(|right_edge| same_graph_edge_contract(left_edge, right_edge))
                 .filter_map(|right_edge| {
@@ -6878,7 +6985,7 @@ fn analyze_semantic_graph(
                 ));
                 continue;
             }
-            let mut scored = right_edges
+            let mut scored = right_neighbor_edges
                 .iter()
                 .filter(|right_edge| same_graph_edge_contract(left_edge, right_edge))
                 .filter_map(|right_edge| {
@@ -6926,7 +7033,40 @@ fn analyze_semantic_graph(
             {
                 continue;
             }
-            let mut scored = right_parent_edges
+            let right_parent_candidates = right_parent_edges
+                .iter()
+                .copied()
+                .filter(|right_edge| {
+                    if left_edge.kind != "NextStatement" && right_edge.kind != "NextStatement" {
+                        return true;
+                    }
+                    if left_edge.kind != "NextStatement" || right_edge.kind != "NextStatement" {
+                        return false;
+                    }
+                    let (Some(left_source), Some(right_source), Some(right_parent)) = (
+                        left_nodes.get(left_id.as_str()),
+                        right_nodes.get(right_id.as_str()),
+                        right_nodes.get(right_edge.source.as_str()),
+                    ) else {
+                        return false;
+                    };
+                    next_statement_pair_is_safe(
+                        left_source,
+                        left_parent,
+                        right_source,
+                        right_parent,
+                        &left_nodes,
+                        &right_nodes,
+                        &left_contains_parents,
+                        &right_contains_parents,
+                        &left_outgoing,
+                        &right_outgoing,
+                        &left_to_right,
+                        &right_to_left,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut scored = right_parent_candidates
                 .iter()
                 .filter(|right_edge| same_graph_edge_contract(left_edge, right_edge))
                 .filter_map(|right_edge| {
@@ -11059,6 +11199,85 @@ mod tests {
         assert!(work.iter().any(|item| item["upstream"].as_array().is_some_and(|owners|
             owners.iter().any(|owner| owner["start"] == upstream_ref))),
             "changed ref initializer has no exact upstream locator in the queue");
+    }
+
+    #[test]
+    fn semantic_graph_next_statement_stays_within_paired_executable_owner() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let local = include_str!("../fixtures/next-statement-owner-boundary/local.js");
+        let upstream = include_str!("../fixtures/next-statement-owner-boundary/upstream.js");
+        fs::write(left.path().join("local.js"), local).unwrap();
+        fs::write(right.path().join("upstream.js"), upstream).unwrap();
+
+        let (_, _, graph) = canonicalize(local, SourceType::mjs(), "local.js", "left").unwrap();
+        let nodes = graph
+            .nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node))
+            .collect::<HashMap<_, _>>();
+        let mut outgoing = HashMap::<&str, Vec<&GraphEdge>>::new();
+        for edge in &graph.edges {
+            outgoing.entry(edge.source.as_str()).or_default().push(edge);
+        }
+        let parents = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "Contains")
+            .map(|edge| (edge.target.as_ref().clone(), edge.source.as_ref().clone()))
+            .collect::<HashMap<_, _>>();
+        let wrapper = |name| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.kind == "Statement"
+                        && node.start == source_offset(local, &format!("export const {name}")) as u32
+                })
+                .unwrap()
+        };
+        let first_context = executable_context(wrapper("first"), &nodes, &parents, &outgoing).unwrap();
+        let second_context = executable_context(wrapper("second"), &nodes, &parents, &outgoing).unwrap();
+        assert_eq!(first_context.kind, "Function");
+        assert_eq!(second_context.kind, "Function");
+        assert_ne!(first_context.id, second_context.id);
+
+        run(left.path(), right.path(), output.path()).unwrap();
+
+        let relations = read_json_lines(&output.path().join("graph-relations.jsonl")).unwrap();
+        assert!(
+            !relations
+                .iter()
+                .any(|relation| relation["viaEdge"].as_str().is_some_and(|edge| {
+                    edge.ends_with("NextStatement")
+                })),
+            "sibling executable owners must not be linked through statement order: {relations:?}"
+        );
+        let local_first = source_offset(local, "() => normalize('same')");
+        let upstream_first = source_offset(upstream, "() => normalize('same')");
+        assert!(relations.iter().any(|relation| {
+            relation["basis"] == "seed-unit"
+                && relation["left"]["kind"] == "Function"
+                && relation["left"]["start"] == local_first
+                && relation["right"]["kind"] == "Function"
+                && relation["right"]["start"] == upstream_first
+        }), "the first declaration owner must seed correspondence: {relations:?}");
+        let work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
+        let upstream_second = source_offset(upstream, "second = () => sanitize");
+        assert!(
+            work.iter().any(|item| item["upstream"].as_array().is_some_and(|owners| {
+                owners.iter().any(|owner| {
+                    owner["start"].as_u64().is_some_and(|start| {
+                        start <= upstream_second
+                            && owner["end"]
+                                .as_u64()
+                                .is_some_and(|end| end > upstream_second)
+                    })
+                })
+            })),
+            "the divergent sibling owner must remain reviewable: {work:?}"
+        );
     }
 
     #[test]
