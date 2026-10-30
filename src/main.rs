@@ -45,11 +45,11 @@ mod visualize;
 use semantic_graph::{share_graph_edge_ids, GraphEdge, GraphNode, SemanticGraph};
 
 const CODE_EXTENSIONS: &[&str] = &["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"];
-const ENGINE_VERSION: &str = "rust-oxc-0.126.0/v74";
+const ENGINE_VERSION: &str = "rust-oxc-0.126.0/v75";
 // Graph extraction is cache material: change this whenever semantic nodes or
 // edges change, otherwise an old cache silently erases newly added ownership
 // links from a report.
-const INDEX_CACHE_VERSION: &str = "rust-oxc-0.126.0/v38";
+const INDEX_CACHE_VERSION: &str = "rust-oxc-0.126.0/v49";
 thread_local! {
     // Graph similarity compares many pairs that reuse the same finite token
     // vocabulary. Cache the pure token normalization, not pair scores, so
@@ -162,6 +162,8 @@ struct FileRecord {
     file: String,
     bytes: usize,
     source_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    type_surface_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_map_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -797,6 +799,8 @@ fn record_ast_feature(features: &mut FeatureChannels, source: &str, kind: AstKin
     let protocol = match kind {
         AstKind::AwaitExpression(_) => Some("Await"),
         AstKind::CallExpression(call) if call.optional => Some("OptionalCall"),
+        AstKind::StaticMemberExpression(member) if member.optional => Some("OptionalMember"),
+        AstKind::ComputedMemberExpression(member) if member.optional => Some("OptionalMember"),
         AstKind::Function(function) if function.r#async && function.generator => Some("AsyncGeneratorFunction"),
         AstKind::Function(function) if function.r#async => Some("AsyncFunction"),
         AstKind::Function(function) if function.generator => Some("GeneratorFunction"),
@@ -893,6 +897,24 @@ fn record_ast_feature(features: &mut FeatureChannels, source: &str, kind: AstKin
     }
 }
 
+// A string-literal property lookup has the same runtime key as a dot lookup.
+// Record the same events in the same order without rewriting the input AST.
+fn record_static_member_start(features: &mut FeatureChannels, optional: bool) {
+    FeatureChannels::increment(&mut features.shape, "StaticMemberExpression");
+    features.record_event("node:StaticMemberExpression");
+    if optional {
+        FeatureChannels::increment(&mut features.operators, "OptionalMember");
+        features.record_event("operator:OptionalMember");
+    }
+}
+
+fn record_static_member_property(features: &mut FeatureChannels, property: &str) {
+    FeatureChannels::increment(&mut features.shape, "IdentifierName");
+    features.record_event("node:IdentifierName");
+    FeatureChannels::increment(&mut features.properties, property);
+    features.record_event(format!("property:{property}"));
+}
+
 #[derive(Debug)]
 struct CanonicalUnit {
     span: Span,
@@ -955,6 +977,20 @@ impl<'a> Visit<'a> for CanonicalUnitCollector<'_> {
 
     fn visit_parenthesized_expression(&mut self, expression: &ParenthesizedExpression<'a>) {
         self.visit_expression(&expression.expression);
+    }
+
+    fn visit_computed_member_expression(&mut self, expression: &oxc_ast::ast::ComputedMemberExpression<'a>) {
+        if let oxc_ast::ast::Expression::StringLiteral(property) = &expression.expression {
+            for index in self.active_units.iter().copied() {
+                record_static_member_start(&mut self.units[index].features, expression.optional);
+            }
+            self.visit_expression(&expression.object);
+            for index in self.active_units.iter().copied() {
+                record_static_member_property(&mut self.units[index].features, property.value.as_str());
+            }
+        } else {
+            walk::walk_computed_member_expression(self, expression);
+        }
     }
 
     // TypeScript syntax has no runtime behavior. Local sources are TS,
@@ -1038,6 +1074,184 @@ fn source_origin(
         column: token.get_src_col(),
         name: token.get_name().map(str::to_string),
     })
+}
+
+// Type annotations are indexed separately from the runtime signature.
+fn type_surface_fingerprint(source: &str, source_type: SourceType) -> Result<Option<String>> {
+    if source_type.is_javascript() { return Ok(None); }
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+    if !parsed.errors.is_empty() { bail!("type surface parse failed"); }
+    let built = SemanticBuilder::new().build(&parsed.program);
+    fn module_name<'a>(name: &'a oxc_ast::ast::ModuleExportName<'_>) -> &'a str {
+        use oxc_ast::ast::ModuleExportName;
+        match name {
+            ModuleExportName::IdentifierName(name) => name.name.as_str(),
+            ModuleExportName::IdentifierReference(name) => name.name.as_str(),
+            ModuleExportName::StringLiteral(name) => name.value.as_str(),
+        }
+    }
+    struct TypeCollector<'s> {
+        source: &'s str,
+        events: Vec<String>,
+        depth: usize,
+        scoping: &'s Scoping,
+        parameters: HashMap<SymbolId, usize>,
+        imported_types: HashMap<SymbolId, String>,
+    }
+    impl<'a> Visit<'a> for TypeCollector<'_> {
+        fn visit_import_declaration(&mut self, declaration: &oxc_ast::ast::ImportDeclaration<'a>) {
+            use oxc_ast::ast::ImportDeclarationSpecifier;
+            for specifier in declaration.specifiers.iter().flatten() {
+                let (imported, symbol, is_type) = match specifier {
+                    ImportDeclarationSpecifier::ImportSpecifier(specifier) => (
+                        module_name(&specifier.imported),
+                        specifier.local.symbol_id.get(),
+                        specifier.import_kind.is_type(),
+                    ),
+                    ImportDeclarationSpecifier::ImportDefaultSpecifier(specifier) => (
+                        "default",
+                        specifier.local.symbol_id.get(),
+                        false,
+                    ),
+                    ImportDeclarationSpecifier::ImportNamespaceSpecifier(specifier) => (
+                        "*",
+                        specifier.local.symbol_id.get(),
+                        false,
+                    ),
+                };
+                if declaration.import_kind.is_type() || is_type {
+                    let identity = format!("{:?}", (declaration.source.value.as_str(), imported));
+                    if let Some(symbol) = symbol {
+                        self.imported_types.insert(symbol, identity);
+                    }
+                    self.events.push(format!("type-import:{:?}", (declaration.source.value.as_str(), imported)));
+                }
+            }
+            walk::walk_import_declaration(self, declaration);
+        }
+        fn visit_export_named_declaration(&mut self, declaration: &oxc_ast::ast::ExportNamedDeclaration<'a>) {
+            for specifier in &declaration.specifiers {
+                if declaration.export_kind.is_type() || specifier.export_kind.is_type() {
+                    let imported = match (&declaration.source, &specifier.local) {
+                        (None, oxc_ast::ast::ModuleExportName::IdentifierReference(reference)) => reference.reference_id.get()
+                            .and_then(|id| self.scoping.get_reference(id).symbol_id())
+                            .and_then(|id| self.imported_types.get(&id).map(String::as_str)),
+                        _ => None,
+                    };
+                    let local = imported.map(|identity| ("import", identity))
+                        .unwrap_or(("local", module_name(&specifier.local)));
+                    self.events.push(format!("type-export:{:?}", (declaration.source.as_ref().map(|source| source.value.as_str()), local, module_name(&specifier.exported))));
+                }
+            }
+            walk::walk_export_named_declaration(self, declaration);
+        }
+        fn visit_export_all_declaration(&mut self, declaration: &oxc_ast::ast::ExportAllDeclaration<'a>) {
+            if declaration.export_kind.is_type() {
+                self.events.push(format!("type-export-all:{:?}", (declaration.source.value.as_str(), declaration.exported.as_ref().map(module_name))));
+            }
+            walk::walk_export_all_declaration(self, declaration);
+        }
+        fn enter_node(&mut self, kind: AstKind<'a>) {
+            if self.depth > 0 {
+                let symbol = match kind {
+                    AstKind::BindingIdentifier(identifier) => identifier.symbol_id.get(),
+                    AstKind::IdentifierReference(identifier) => identifier
+                        .reference_id
+                        .get()
+                        .and_then(|id| self.scoping.get_reference(id).symbol_id()),
+                    _ => None,
+                };
+                if let Some(symbol) = symbol {
+                    if let Some(slot) = self.parameters.get(&symbol) {
+                        self.events.push(format!("type-parameter:{:?}:{slot}", kind.ty()));
+                        return;
+                    }
+                    if let Some(identity) = self.imported_types.get(&symbol) {
+                        self.events.push(format!("type-import-binding:{:?}:{identity}", kind.ty()));
+                        return;
+                    }
+                }
+                let mut features = FeatureChannels::default();
+                record_ast_feature(&mut features, self.source, kind);
+                self.events.push(features.signature(true));
+                match kind {
+                    AstKind::BindingIdentifier(identifier) => self.events.push(format!("type-binding:{}", identifier.name)),
+                    AstKind::IdentifierReference(identifier) => self.events.push(format!("type-reference:{}", identifier.name)),
+                    _ => {}
+                }
+            }
+        }
+        fn visit_ts_type_annotation(&mut self, annotation: &TSTypeAnnotation<'a>) {
+            self.depth += 1;
+            walk::walk_ts_type_annotation(self, annotation);
+            self.depth -= 1;
+        }
+        fn visit_ts_type_parameter_instantiation(&mut self, parameters: &TSTypeParameterInstantiation<'a>) {
+            self.depth += 1;
+            walk::walk_ts_type_parameter_instantiation(self, parameters);
+            self.depth -= 1;
+        }
+        fn visit_ts_as_expression(&mut self, expression: &TSAsExpression<'a>) {
+            self.visit_expression(&expression.expression);
+            self.depth += 1;
+            self.visit_ts_type(&expression.type_annotation);
+            self.depth -= 1;
+        }
+        fn visit_ts_satisfies_expression(&mut self, expression: &TSSatisfiesExpression<'a>) {
+            self.visit_expression(&expression.expression);
+            self.depth += 1;
+            self.visit_ts_type(&expression.type_annotation);
+            self.depth -= 1;
+        }
+        fn visit_ts_type_assertion(&mut self, expression: &TSTypeAssertion<'a>) {
+            self.depth += 1;
+            self.visit_ts_type(&expression.type_annotation);
+            self.depth -= 1;
+            self.visit_expression(&expression.expression);
+        }
+        fn visit_formal_parameter(&mut self, parameter: &oxc_ast::ast::FormalParameter<'a>) {
+            if parameter.type_annotation.is_some() || parameter.optional {
+                self.events.push(format!("parameter-optional:{}", parameter.optional));
+            }
+            walk::walk_formal_parameter(self, parameter);
+        }
+        fn visit_ts_property_signature(&mut self, property: &oxc_ast::ast::TSPropertySignature<'a>) {
+            self.events.push(format!("property-modifiers:{}:{}:{}", property.optional, property.readonly, property.computed));
+            walk::walk_ts_property_signature(self, property);
+        }
+        fn visit_ts_type_parameter_declaration(&mut self, parameters: &TSTypeParameterDeclaration<'a>) {
+            for parameter in &parameters.params {
+                if let Some(id) = parameter.name.symbol_id.get() {
+                    let slot = self.parameters.len();
+                    self.parameters.entry(id).or_insert(slot);
+                }
+            }
+            self.depth += 1;
+            walk::walk_ts_type_parameter_declaration(self, parameters);
+            self.depth -= 1;
+        }
+        fn visit_ts_type_alias_declaration(&mut self, declaration: &oxc_ast::ast::TSTypeAliasDeclaration<'a>) {
+            self.depth += 1;
+            walk::walk_ts_type_alias_declaration(self, declaration);
+            self.depth -= 1;
+        }
+        fn visit_ts_interface_declaration(&mut self, declaration: &oxc_ast::ast::TSInterfaceDeclaration<'a>) {
+            self.depth += 1;
+            walk::walk_ts_interface_declaration(self, declaration);
+            self.depth -= 1;
+        }
+    }
+    let mut collector = TypeCollector {
+        source,
+        events: Vec::new(),
+        depth: 0,
+        scoping: built.semantic.scoping(),
+        parameters: HashMap::new(),
+        imported_types: HashMap::new(),
+    };
+    collector.visit_program(&parsed.program);
+    Ok(Some(sha256(serde_json::to_string(&collector.events)?)))
 }
 
 fn collect_units(
@@ -3506,6 +3720,7 @@ fn index_file(
             file: relative.to_string(),
             bytes: source.len(),
             source_sha256,
+            type_surface_sha256: type_surface_fingerprint(&source, source_type)?,
             source_map_sha256: source_map
                 .as_ref()
                 .and_then(|source_map| source_map.sha256.clone()),
@@ -3902,6 +4117,7 @@ fn index_dependency_evidence(
             file: relative,
             bytes: source.len(),
             source_sha256: sha256(&source),
+            type_surface_sha256: None,
             source_map_sha256: None,
             source_map_error: None,
             units: 0,
@@ -11413,6 +11629,357 @@ mod tests {
             .iter()
             .any(|edge| { edge.kind == "Calls" && member_ids.contains(edge.target.as_str()) }));
         assert!(graph.edges.iter().any(|edge| edge.kind == "Accesses"));
+    }
+
+    #[test]
+    fn literal_member_keys_match_dot_access_without_hiding_runtime_differences() {
+        fn signatures(source: &str) -> (String, String, Vec<(String, bool, Option<String>)>) {
+            let (canonical, originals, graph) = canonicalize(source, SourceType::mjs(), "fixture.js", "left").unwrap();
+            let units = collect_units(&canonical, source, SourceType::mjs(), "fixture.js", "left", originals, None).unwrap();
+            let function = graph.nodes.iter().find(|node| node.kind == "Function").unwrap();
+            let calls = graph.edges.iter().filter(|edge| edge.kind == "Calls").map(|edge| {
+                let target = graph.nodes.iter().find(|node| node.id == *edge.target).unwrap();
+                (target.label.clone(), edge.dynamic, edge.label.clone())
+            }).collect();
+            (units[0].linked_sha256.clone(), function.linked_sha256.clone(), calls)
+        }
+
+        let dot = signatures("function run(api, key) { return api.send(); }");
+        assert_eq!(dot, signatures("function run(api, key) { return api['send'](); }"));
+        assert_eq!(dot, signatures("function run(api, key) { return api[\"s\\u0065nd\"](); }"));
+        assert_ne!(dot, signatures("function run(api, key) { return api[key](); }"));
+        assert_ne!(dot, signatures("function run(api, key) { return api.other(); }"));
+        assert_ne!(dot, signatures("function run(api, key) { return api?.send(); }"));
+        assert_eq!(signatures("function run(api, key) { return api?.send(); }"), signatures("function run(api, key) { return api?.['send'](); }"));
+        assert_ne!(dot, signatures("function run(api, key) { return api.send?.(); }"));
+        for (dot_access, bracket_access) in [
+            ("api.send = 3", "api['send'] = 3"),
+            ("api.send++", "api['send']++"),
+            ("api.send.next('value')", "api['send'].next('value')"),
+            ("api?.send?.('value')", "api?.['send']?.('value')"),
+        ] {
+            assert_eq!(signatures(&format!("function run(api, key) {{ {dot_access}; }}")), signatures(&format!("function run(api, key) {{ {bracket_access}; }}")), "{dot_access}");
+        }
+        assert_ne!(signatures("function run(api, key) { api.send('first'); }"), signatures("function run(api, key) { api['send']('second'); }"));
+    }
+
+    #[test]
+    fn literal_member_key_report_keeps_real_property_drift() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        for (left_expression, expression, equivalent) in [
+            ("api.send()", "api['send']()", true),
+            ("api.send()", "api.receive()", false),
+            ("api.send()", "api[api.key]()", false),
+            ("api.send()", "api?.send()", false),
+            ("api.send = 3", "api['send'] = 3", true),
+            ("api.send++", "api['send']++", true),
+            ("api.send.next('value')", "api['send'].next('value')", true),
+            ("api.send('first')", "api['send']('second')", false),
+            ("api?.send?.('value')", "api?.['send']?.('value')", true),
+        ] {
+            fs::write(left.path().join("owner.js"), format!("export function run(api) {{ return {left_expression}; }}")).unwrap();
+            fs::write(right.path().join("owner.js"), format!("export function run(api) {{ return {expression}; }}")).unwrap();
+            let output = tempdir().unwrap();
+            run(left.path(), right.path(), output.path()).unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+            let proven = report["matches"].as_array().unwrap().iter().any(|item| {
+                item["left"]["name"] == "run" && item["confidence"] == "proven-structure"
+            });
+            assert_eq!(proven, equivalent, "{expression}");
+            if equivalent {
+                let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+                for item in work.lines() {
+                    let item: serde_json::Value = serde_json::from_str(item).unwrap();
+                    assert_eq!(item["confidence"], "unknown", "unproved file context must stay reviewable: {item}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn literal_member_graph_is_identical_on_cold_and_warm_cache() {
+        let root = tempdir().unwrap();
+        let cache = root.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        let source = root.path().join("module.js");
+        fs::write(&source, "export function run(api, key) { api['send']('value'); return api[key]; }").unwrap();
+        let (cold, cold_hit) = index_file(&source, "module.js", "left", &cache).unwrap();
+        let (warm, warm_hit) = index_file(&source, "module.js", "left", &cache).unwrap();
+        assert!(!cold_hit && warm_hit);
+        assert_eq!(serde_json::to_value(&cold).unwrap(), serde_json::to_value(&warm).unwrap());
+    }
+
+    #[test]
+    fn type_surface_fingerprint_detects_annotation_changes() {
+        let ty = SourceType::from_path("api.ts").unwrap();
+        let a = type_surface_fingerprint("function f(value: string): string { return value }", ty).unwrap();
+        let spaced = type_surface_fingerprint("function f(value : string) : string { return value }", ty).unwrap();
+        let changed = type_surface_fingerprint("function f(value: number): number { return value }", ty).unwrap();
+        assert_eq!(a, spaced);
+        assert_eq!(
+            type_surface_fingerprint("export function id<T>(value: T): T { return value }", ty).unwrap(),
+            type_surface_fingerprint("export function id<U>(value: U): U { return value }", ty).unwrap()
+        );
+        assert_ne!(
+            type_surface_fingerprint("export function f<T, U>(a: T, b: U): T { return a }", ty).unwrap(),
+            type_surface_fingerprint("export function f<T, U>(a: T, b: U): U { return b }", ty).unwrap()
+        );
+        assert_ne!(
+            type_surface_fingerprint("export function f<T>(a: T): T { return a }", ty).unwrap(),
+            type_surface_fingerprint("export function f<T>(a: External): T { return a as T }", ty).unwrap()
+        );
+        assert_ne!(
+            type_surface_fingerprint("export type F<T> = <T>(x: T) => T", ty).unwrap(),
+            type_surface_fingerprint("export type F<T> = <U>(x: T) => U", ty).unwrap()
+        );
+        assert_ne!(a, changed);
+        assert_eq!(type_surface_fingerprint("function f(value) { return value }", SourceType::mjs()).unwrap(), None);
+        for (left, right) in [
+            ("export type Value = string", "export type Value = number"),
+            ("export interface Value { item: string }", "export interface Value { item: number }"),
+            ("export interface Value { item?: string }", "export interface Value { item: string }"),
+            ("export interface Value { readonly item: string }", "export interface Value { item: string }"),
+            ("export function f(value: string): string; export function f(value: unknown): unknown { return value }", "export function f(value: number): number; export function f(value: unknown): unknown { return value }"),
+            ("export function f(value?: string) { return value }", "export function f(value: string) { return value }"),
+            ("export type Value = First", "export type Value = Second"),
+            ("export interface First { item: string }", "export interface Second { item: string }"),
+            ("declare const raw: unknown; export const value = raw as string", "declare const raw: unknown; export const value = raw as number"),
+            ("declare const raw: unknown; export const value = raw satisfies string", "declare const raw: unknown; export const value = raw satisfies number"),
+        ] {
+            assert_ne!(type_surface_fingerprint(left, ty).unwrap(), type_surface_fingerprint(right, ty).unwrap(), "{left} vs {right}");
+        }
+        assert_eq!(
+            type_surface_fingerprint("import type { Value } from './one'", ty).unwrap(),
+            type_surface_fingerprint("import { type Value } from './one'", ty).unwrap()
+        );
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        for (local, upstream) in [
+            ("export type { Value } from './one'", "export type { Value } from './two'"),
+            ("export type { Value } from './one'", "export type { Other } from './one'"),
+        ] {
+            fs::write(left.path().join("api.ts"), local).unwrap();
+            fs::write(right.path().join("api.ts"), upstream).unwrap();
+            let output = tempdir().unwrap();
+            run(left.path(), right.path(), output.path()).unwrap();
+            let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+            assert!(work.contains("different TypeScript type syntax"), "missing type re-export candidate: {work}");
+        }
+    }
+
+    #[test]
+    fn type_surface_fingerprint_distinguishes_types_moved_between_owners() {
+        let ty = SourceType::from_path("api.ts").unwrap();
+        let left = "export function first(value: string) {} export function second(value: number) {}";
+        let right = "export function first(value: number) {} export function second(value: string) {}";
+        assert_ne!(type_surface_fingerprint(left, ty).unwrap(), type_surface_fingerprint(right, ty).unwrap());
+    }
+
+    #[test]
+    fn type_surface_tracks_type_only_module_bindings() {
+        let ty = SourceType::from_path("api.ts").unwrap();
+        for (left, right) in [
+            ("import type { Value } from './one'; export function f(v: Value) {}", "import type { Value } from './two'; export function f(v: Value) {}"),
+            ("import { type Value } from './one'; export function f(v: Value) {}", "import { type Value } from './two'; export function f(v: Value) {}"),
+            ("export type { Value } from './one'", "export type { Value } from './two'"),
+            ("export { type Value } from './one'", "export { type Other as Value } from './one'"),
+            ("export type * from './one'", "export type * from './two'"),
+        ] {
+            assert_ne!(type_surface_fingerprint(left, ty).unwrap(), type_surface_fingerprint(right, ty).unwrap(), "{left} vs {right}");
+        }
+    }
+
+    #[test]
+    fn generic_call_type_arguments_remain_actionable() {
+        let ty = SourceType::from_path("api.ts").unwrap();
+        let left = "declare function build<T>(): T; export const value = build<string>();";
+        let right = "declare function build<T>(): T; export const value = build<number>();";
+        assert_ne!(type_surface_fingerprint(left, ty).unwrap(), type_surface_fingerprint(right, ty).unwrap());
+        let local = tempdir().unwrap();
+        let upstream = tempdir().unwrap();
+        fs::write(local.path().join("api.ts"), left).unwrap();
+        fs::write(upstream.path().join("api.ts"), right).unwrap();
+        let output = tempdir().unwrap();
+        run(local.path(), upstream.path(), output.path()).unwrap();
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(work.contains("different TypeScript type syntax"));
+    }
+
+    #[test]
+    fn imported_type_identity_keeps_module_and_export_name_distinct() {
+        let ty = SourceType::from_path("api.ts").unwrap();
+        let imports = "import type { B as First } from 'pkg:a'; import type { 'a:B' as Second } from 'pkg'; ";
+        let first = format!("{imports}export type Value = First;");
+        let second = format!("{imports}export type Value = Second;");
+        assert_ne!(type_surface_fingerprint(&first, ty).unwrap(), type_surface_fingerprint(&second, ty).unwrap());
+    }
+
+    #[test]
+    fn renamed_import_alias_keeps_reexported_type_contract() {
+        let ty = SourceType::from_path("api.ts").unwrap();
+        let left = "import type { Model as Local } from './types'; export type { Local as Public };";
+        let right = "import type { Model as Renamed } from './types'; export type { Renamed as Public };";
+        assert_eq!(type_surface_fingerprint(left, ty).unwrap(), type_surface_fingerprint(right, ty).unwrap());
+        let changed = "import type { Other as Renamed } from './types'; export type { Renamed as Public };";
+        assert_ne!(type_surface_fingerprint(left, ty).unwrap(), type_surface_fingerprint(changed, ty).unwrap());
+        let local = tempdir().unwrap();
+        let upstream = tempdir().unwrap();
+        fs::write(local.path().join("api.ts"), left).unwrap();
+        fs::write(upstream.path().join("api.ts"), right).unwrap();
+        let output = tempdir().unwrap();
+        run(local.path(), upstream.path(), output.path()).unwrap();
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(!work.contains("different TypeScript type syntax"), "alias rename produced a type candidate: {work}");
+    }
+
+    #[test]
+    fn changed_exported_typescript_signature_remains_actionable() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        for (local, upstream) in [
+            ("export function f(value: string): string { return value }", "export function f(value: number): number { return value }"),
+            ("export type Value = string", "export type Value = number"),
+            ("export interface Value { item: string }", "export interface Value { item: number }"),
+        ] {
+            fs::write(left.path().join("api.ts"), local).unwrap();
+            fs::write(right.path().join("api.ts"), upstream).unwrap();
+            let output = tempdir().unwrap();
+            run(left.path(), right.path(), output.path()).unwrap();
+            let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+            assert!(work.contains("different TypeScript type syntax"), "missing type candidate for {upstream}: {work}");
+        }
+        fs::write(left.path().join("api.ts"), "export interface Value { item: string }").unwrap();
+        fs::write(right.path().join("api.ts"), "export interface Value {\n  item : string;\n}").unwrap();
+        let output = tempdir().unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(!work.contains("different TypeScript type syntax"), "formatting produced a type candidate: {work}");
+    }
+
+    #[test]
+    fn exported_assertion_type_change_remains_actionable() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        fs::write(
+            left.path().join("api.ts"),
+            "declare const raw: unknown; export const value = raw as string",
+        )
+        .unwrap();
+        fs::write(
+            right.path().join("api.ts"),
+            "declare const raw: unknown; export const value = raw as number",
+        )
+        .unwrap();
+        let output = tempdir().unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(work.contains("different TypeScript type syntax"), "missing assertion type candidate: {work}");
+    }
+
+    #[test]
+    fn private_type_change_is_an_unproven_review_candidate() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        fs::write(left.path().join("api.ts"), "function helper(value: string) { return value } export function api() { return 1 }").unwrap();
+        fs::write(right.path().join("api.ts"), "function helper(value: number) { return value } export function api() { return 1 }").unwrap();
+        let output = tempdir().unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        let candidate = work.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|item| item["reason"].as_str().is_some_and(|reason| reason.contains("different TypeScript type syntax")))
+            .expect("a changed private type must remain reviewable without claiming public API drift");
+        assert_eq!(candidate["priority"], "P2");
+        assert_eq!(candidate["confidence"], "unknown");
+    }
+
+    #[test]
+    fn imported_type_change_remains_visible_in_report() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        for root in [left.path(), right.path()] {
+            fs::write(root.join("api.ts"), "import type { Value } from './public'; export function f(value: Value): Value { return value }").unwrap();
+            fs::write(root.join("public.ts"), "export type { Value } from './types';").unwrap();
+        }
+        fs::write(left.path().join("types.ts"), "export interface Value { item: string }").unwrap();
+        fs::write(right.path().join("types.ts"), "export interface Value { item: number }").unwrap();
+        let index = index_project(right.path(), "right").unwrap();
+        let nodes = index.graph_nodes.iter().map(|node| (node.id.as_str(), node)).collect::<HashMap<_, _>>();
+        assert!(index.graph_edges.iter().any(|edge| edge.kind == "TypeBindsTo"
+            && nodes.get(edge.source.as_str()).is_some_and(|node| node.file == "api.ts")
+            && nodes.get(edge.target.as_str()).is_some_and(|node| node.file == "types.ts")));
+        assert!(index.graph_edges.iter().any(|edge| edge.kind == "TypeReExportsTo"
+            && nodes.get(edge.source.as_str()).is_some_and(|node| node.file == "public.ts")
+            && nodes.get(edge.target.as_str()).is_some_and(|node| node.file == "types.ts")));
+        let output = tempdir().unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(work.contains("different TypeScript type syntax") && work.contains("types.ts"), "missing imported type change: {work}");
+    }
+
+    #[test]
+    fn typescript_annotations_do_not_prevent_matching_runtime_javascript() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        fs::write(left.path().join("api.ts"), "export function f(value: string): string { return value }").unwrap();
+        fs::write(right.path().join("api.js"), "export function f(value) { return value }").unwrap();
+        let output = tempdir().unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(report["matches"].as_array().unwrap().iter().any(|item| item["left"]["name"] == "f" && item["confidence"] == "proven-structure"));
+    }
+
+    #[test]
+    fn moved_module_export_is_not_claimed_absent_by_path() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        fs::write(left.path().join("local.js"), "export function run() { return 1; }").unwrap();
+        fs::write(right.path().join("upstream.js"), "export function run() { return 1; }").unwrap();
+        let output = tempdir().unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(!work.contains("export contract absent from the upstream module"), "path alone cannot prove an absent export: {work}");
+        assert!(work.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()).any(|item| {
+            item["action"] == "remove-or-justify-extra-local" && item["confidence"] == "unknown"
+                && item["reason"].as_str().is_some_and(|reason| reason.contains("other possible owners"))
+        }), "unresolved exports should remain reviewable: {work}");
+    }
+
+    #[test]
+    fn renamed_default_function_with_observable_name_remains_actionable() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        fs::write(left.path().join("api.js"), "export default function LocalImplementation() { return 1; }").unwrap();
+        fs::write(right.path().join("api.js"), "export default function UpstreamImplementation() { return 1; }").unwrap();
+        let output = tempdir().unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(!work.trim().is_empty(), "observable function name change was suppressed");
+    }
+
+    #[test]
+    fn module_wrapper_changes_remain_in_the_action_queue() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        fs::write(left.path().join("owner.js"), "export function run(api) { return api.send(); }").unwrap();
+        for changed in [
+            "function run(api) { return api['send'](); }",
+            "function run(api) { return api['send'](); } export { run as other };",
+            "export function run(api) { return api['send'](); } boot();",
+            "export function run(api) { return api['receive'](); }",
+            "export function run(api) { return api['send']?.(); }",
+        ] {
+            fs::write(right.path().join("owner.js"), changed).unwrap();
+            let output = tempdir().unwrap();
+            run(left.path(), right.path(), output.path()).unwrap();
+            let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+            assert!(!work.trim().is_empty(), "missing change: {changed}");
+        }
+        fs::write(left.path().join("owner.js"), "function run(api) { return api.send(); }").unwrap();
+        fs::write(right.path().join("owner.js"), "export function run(api) { return api['send'](); }").unwrap();
+        let output = tempdir().unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        assert!(!fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap().trim().is_empty(), "missing upstream export");
     }
 
     #[test]

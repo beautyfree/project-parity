@@ -21,7 +21,7 @@ use oxc_span::{GetSpan, Span};
 use oxc_syntax::{scope::ScopeId, symbol::SymbolId};
 use serde::{Deserialize, Serialize};
 
-use super::{line_at, record_ast_feature, sha256, FeatureChannels};
+use super::{line_at, record_ast_feature, record_static_member_property, record_static_member_start, sha256, FeatureChannels};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -305,6 +305,11 @@ impl<'a, 's> GraphCollector<'a, 's> {
                 return (target, false, Some(member.property.name.to_string()));
             }
             oxc_ast::ast::Expression::ComputedMemberExpression(member) => {
+                if let Expression::StringLiteral(property) = &member.expression {
+                    let name = property.value.to_string();
+                    let target = self.member_access_node(member.span, &member.object, &name, member.optional);
+                    return (target, false, Some(name));
+                }
                 let property = self
                     .source
                     .get(
@@ -825,6 +830,17 @@ impl<'a> Visit<'a> for GraphCollector<'a, '_> {
     }
 
     fn visit_computed_member_expression(&mut self, expression: &ComputedMemberExpression<'a>) {
+        if let Expression::StringLiteral(property) = &expression.expression {
+            self.member_access_node(expression.span, &expression.object, property.value.as_str(), expression.optional);
+            if let Some(index) = self.active_feature_nodes.last().copied() {
+                record_static_member_start(&mut self.nodes[index].features, expression.optional);
+            }
+            self.visit_expression(&expression.object);
+            if let Some(index) = self.active_feature_nodes.last().copied() {
+                record_static_member_property(&mut self.nodes[index].features, property.value.as_str());
+            }
+            return;
+        }
         let property = self
             .source
             .get(
