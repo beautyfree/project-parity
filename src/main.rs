@@ -1380,7 +1380,7 @@ fn is_derivative_duplicate(path: &Path) -> bool {
 
 fn is_conventionally_filtered_source(relative: &str) -> bool {
     relative.contains("/__tests__/")
-        || [".test.", ".spec.", ".stories."]
+        || [".test.", ".spec.", ".stories.", ".node-test."]
             .iter()
             .any(|needle| relative.contains(needle))
 }
@@ -16088,7 +16088,7 @@ mod tests {
     }
 
     #[test]
-    fn node_test_named_modules_are_discovered_from_project_root() {
+    fn node_test_named_modules_are_filtered_from_project_root() {
         let root = tempdir().unwrap();
         fs::create_dir_all(root.path().join("src")).unwrap();
         for file in [
@@ -16108,15 +16108,7 @@ mod tests {
         let discovery = discover(root.path()).unwrap();
         assert_eq!(
             discovery.files.iter().map(|(_, file)| file.as_str()).collect::<Vec<_>>(),
-            [
-                "src/capture.node-test.mjs",
-                "src/capture.ts",
-                "src/device.mjs",
-                "src/device.node-test.mjs",
-                "src/editor.node-test.mjs",
-                "src/filter.node-test.mjs",
-                "src/node-test-runner.mjs",
-            ]
+            ["src/capture.ts", "src/device.mjs", "src/node-test-runner.mjs"]
         );
     }
 
@@ -16126,11 +16118,11 @@ mod tests {
         fs::create_dir_all(root.path().join("src")).unwrap();
         fs::write(
             root.path().join("src/app.js"),
-            "import { runtime } from './runtime.test.js'; export const result = runtime();",
+            "import { runtime } from './runtime.node-test.js'; export const result = runtime();",
         )
         .unwrap();
         fs::write(
-            root.path().join("src/runtime.test.js"),
+            root.path().join("src/runtime.node-test.js"),
             "import { bridge } from './bridge.spec.js'; export const runtime = () => bridge();",
         )
         .unwrap();
@@ -16144,20 +16136,26 @@ mod tests {
             "export const story = () => 1;",
         )
         .unwrap();
+        fs::write(
+            root.path().join("src/orphan.node-test.js"),
+            "export const testOnly = () => 1;",
+        )
+        .unwrap();
 
         let index = index_project(root.path(), "left").unwrap();
         let files = index.files.iter().map(|file| file.file.as_str()).collect::<Vec<_>>();
         assert_eq!(
             files,
-            ["src/app.js", "src/bridge.spec.js", "src/runtime.test.js"]
+            ["src/app.js", "src/bridge.spec.js", "src/runtime.node-test.js"]
         );
-        assert!(index.graph_nodes.iter().any(|node| node.file == "src/runtime.test.js"));
+        assert!(index.graph_nodes.iter().any(|node| node.file == "src/runtime.node-test.js"));
         assert!(index.graph_nodes.iter().any(|node| node.file == "src/bridge.spec.js"));
         assert!(!index.graph_nodes.iter().any(|node| node.file == "src/orphan.stories.js"));
+        assert!(!index.graph_nodes.iter().any(|node| node.file == "src/orphan.node-test.js"));
     }
 
     #[test]
-    fn node_test_named_modules_are_discovered_from_dependencies() {
+    fn node_test_named_modules_are_filtered_from_dependencies() {
         let project = tempdir().unwrap();
         let package = project.path().join("node_modules/source-oracle-package");
         fs::create_dir_all(&package).unwrap();
@@ -16175,18 +16173,15 @@ mod tests {
         }
         let indexed = index_project(project.path(), "left").unwrap();
         let discovery = discover_dependencies(project.path(), Some(&indexed)).unwrap().unwrap();
-        assert_eq!(discovery.files.len(), 7);
+        assert_eq!(discovery.files.len(), 3);
         for file in [
             "index.js",
             "runtime.mjs",
             "node-test-runner.mjs",
-            "capture.node-test.mjs",
-            "device.node-test.mjs",
-            "filter.node-test.mjs",
-            "editor.node-test.mjs",
         ] {
             assert!(discovery.files.iter().any(|(_, relative)| relative.ends_with(&format!("/{file}"))));
         }
+        assert!(!discovery.files.iter().any(|(_, relative)| relative.contains(".node-test.")));
     }
 
     #[test]
@@ -16397,7 +16392,7 @@ mod tests {
     }
 
     #[test]
-    fn node_test_named_modules_participate_in_mjs_divergence() {
+    fn node_test_files_do_not_create_project_divergence() {
         let left = tempdir().unwrap();
         let right = tempdir().unwrap();
         let output = tempdir().unwrap();
@@ -16405,8 +16400,6 @@ mod tests {
         let oracle = "export function stable(x){return x+1}export function x(value){base();if(value){extra()}return 1}";
         fs::write(left.path().join("src/owner.mjs"),
             "export function anchor(v){return v+1}export function render(flag){base();return 1}").unwrap();
-        fs::write(left.path().join("src/node-test-runner.mjs"),
-            "export function runtimeNeighbor(){return 17}").unwrap();
         for file in [
             "capture.node-test.mjs",
             "device.node-test.mjs",
@@ -16419,21 +16412,14 @@ mod tests {
         let discovery = discover(left.path()).unwrap();
         assert_eq!(
             discovery.files.iter().map(|(_, file)| file.as_str()).collect::<Vec<_>>(),
-            [
-                "src/capture.node-test.mjs",
-                "src/device.node-test.mjs",
-                "src/editor.node-test.mjs",
-                "src/filter.node-test.mjs",
-                "src/node-test-runner.mjs",
-                "src/owner.mjs",
-            ]
+            ["src/owner.mjs"]
         );
         run(left.path(), right.path(), output.path()).unwrap();
         let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
         assert_eq!(report["left"]["failures"], serde_json::json!([]));
-        assert_eq!(report["left"]["files"].as_array().unwrap().len(), 6);
+        assert_eq!(report["left"]["files"].as_array().unwrap().len(), 1);
         let graph = zstd::stream::decode_all(fs::File::open(output.path().join("semantic-graph.jsonl.zst")).unwrap()).unwrap();
-        assert!(String::from_utf8(graph).unwrap().contains(".node-test.mjs"));
+        assert!(!String::from_utf8(graph).unwrap().contains(".node-test.mjs"));
     }
 
     #[test]
