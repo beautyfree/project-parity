@@ -164,6 +164,8 @@ struct FileRecord {
     bytes: usize,
     source_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    type_surface_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     source_map_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_map_error: Option<String>,
@@ -814,6 +816,8 @@ fn record_ast_feature(features: &mut FeatureChannels, source: &str, kind: AstKin
     let protocol = match kind {
         AstKind::AwaitExpression(_) => Some("Await"),
         AstKind::CallExpression(call) if call.optional => Some("OptionalCall"),
+        AstKind::StaticMemberExpression(member) if member.optional => Some("OptionalMember"),
+        AstKind::ComputedMemberExpression(member) if member.optional => Some("OptionalMember"),
         AstKind::Function(function) if function.r#async && function.generator => Some("AsyncGeneratorFunction"),
         AstKind::Function(function) if function.r#async => Some("AsyncFunction"),
         AstKind::Function(function) if function.generator => Some("GeneratorFunction"),
@@ -910,6 +914,24 @@ fn record_ast_feature(features: &mut FeatureChannels, source: &str, kind: AstKin
     }
 }
 
+// A string-literal property lookup has the same runtime key as a dot lookup.
+// Record the same events in the same order without rewriting the input AST.
+fn record_static_member_start(features: &mut FeatureChannels, optional: bool) {
+    FeatureChannels::increment(&mut features.shape, "StaticMemberExpression");
+    features.record_event("node:StaticMemberExpression");
+    if optional {
+        FeatureChannels::increment(&mut features.operators, "OptionalMember");
+        features.record_event("operator:OptionalMember");
+    }
+}
+
+fn record_static_member_property(features: &mut FeatureChannels, property: &str) {
+    FeatureChannels::increment(&mut features.shape, "IdentifierName");
+    features.record_event("node:IdentifierName");
+    FeatureChannels::increment(&mut features.properties, property);
+    features.record_event(format!("property:{property}"));
+}
+
 #[derive(Debug)]
 struct CanonicalUnit {
     span: Span,
@@ -981,6 +1003,20 @@ impl<'a> Visit<'a> for CanonicalUnitCollector<'_> {
 
     fn visit_parenthesized_expression(&mut self, expression: &ParenthesizedExpression<'a>) {
         self.visit_expression(&expression.expression);
+    }
+
+    fn visit_computed_member_expression(&mut self, expression: &oxc_ast::ast::ComputedMemberExpression<'a>) {
+        if let oxc_ast::ast::Expression::StringLiteral(property) = &expression.expression {
+            for index in self.active_units.iter().copied() {
+                record_static_member_start(&mut self.units[index].features, expression.optional);
+            }
+            self.visit_expression(&expression.object);
+            for index in self.active_units.iter().copied() {
+                record_static_member_property(&mut self.units[index].features, property.value.as_str());
+            }
+        } else {
+            walk::walk_computed_member_expression(self, expression);
+        }
     }
 
     // TypeScript syntax has no runtime behavior. Local sources are TS,
@@ -1064,6 +1100,184 @@ fn source_origin(
         column: token.get_src_col(),
         name: token.get_name().map(str::to_string),
     })
+}
+
+// Type annotations are indexed separately from the runtime signature.
+fn type_surface_fingerprint(source: &str, source_type: SourceType) -> Result<Option<String>> {
+    if source_type.is_javascript() { return Ok(None); }
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+    if !parsed.errors.is_empty() { bail!("type surface parse failed"); }
+    let built = SemanticBuilder::new().build(&parsed.program);
+    fn module_name<'a>(name: &'a oxc_ast::ast::ModuleExportName<'_>) -> &'a str {
+        use oxc_ast::ast::ModuleExportName;
+        match name {
+            ModuleExportName::IdentifierName(name) => name.name.as_str(),
+            ModuleExportName::IdentifierReference(name) => name.name.as_str(),
+            ModuleExportName::StringLiteral(name) => name.value.as_str(),
+        }
+    }
+    struct TypeCollector<'s> {
+        source: &'s str,
+        events: Vec<String>,
+        depth: usize,
+        scoping: &'s Scoping,
+        parameters: HashMap<SymbolId, usize>,
+        imported_types: HashMap<SymbolId, String>,
+    }
+    impl<'a> Visit<'a> for TypeCollector<'_> {
+        fn visit_import_declaration(&mut self, declaration: &oxc_ast::ast::ImportDeclaration<'a>) {
+            use oxc_ast::ast::ImportDeclarationSpecifier;
+            for specifier in declaration.specifiers.iter().flatten() {
+                let (imported, symbol, is_type) = match specifier {
+                    ImportDeclarationSpecifier::ImportSpecifier(specifier) => (
+                        module_name(&specifier.imported),
+                        specifier.local.symbol_id.get(),
+                        specifier.import_kind.is_type(),
+                    ),
+                    ImportDeclarationSpecifier::ImportDefaultSpecifier(specifier) => (
+                        "default",
+                        specifier.local.symbol_id.get(),
+                        false,
+                    ),
+                    ImportDeclarationSpecifier::ImportNamespaceSpecifier(specifier) => (
+                        "*",
+                        specifier.local.symbol_id.get(),
+                        false,
+                    ),
+                };
+                if declaration.import_kind.is_type() || is_type {
+                    let identity = format!("{:?}", (declaration.source.value.as_str(), imported));
+                    if let Some(symbol) = symbol {
+                        self.imported_types.insert(symbol, identity);
+                    }
+                    self.events.push(format!("type-import:{:?}", (declaration.source.value.as_str(), imported)));
+                }
+            }
+            walk::walk_import_declaration(self, declaration);
+        }
+        fn visit_export_named_declaration(&mut self, declaration: &oxc_ast::ast::ExportNamedDeclaration<'a>) {
+            for specifier in &declaration.specifiers {
+                if declaration.export_kind.is_type() || specifier.export_kind.is_type() {
+                    let imported = match (&declaration.source, &specifier.local) {
+                        (None, oxc_ast::ast::ModuleExportName::IdentifierReference(reference)) => reference.reference_id.get()
+                            .and_then(|id| self.scoping.get_reference(id).symbol_id())
+                            .and_then(|id| self.imported_types.get(&id).map(String::as_str)),
+                        _ => None,
+                    };
+                    let local = imported.map(|identity| ("import", identity))
+                        .unwrap_or(("local", module_name(&specifier.local)));
+                    self.events.push(format!("type-export:{:?}", (declaration.source.as_ref().map(|source| source.value.as_str()), local, module_name(&specifier.exported))));
+                }
+            }
+            walk::walk_export_named_declaration(self, declaration);
+        }
+        fn visit_export_all_declaration(&mut self, declaration: &oxc_ast::ast::ExportAllDeclaration<'a>) {
+            if declaration.export_kind.is_type() {
+                self.events.push(format!("type-export-all:{:?}", (declaration.source.value.as_str(), declaration.exported.as_ref().map(module_name))));
+            }
+            walk::walk_export_all_declaration(self, declaration);
+        }
+        fn enter_node(&mut self, kind: AstKind<'a>) {
+            if self.depth > 0 {
+                let symbol = match kind {
+                    AstKind::BindingIdentifier(identifier) => identifier.symbol_id.get(),
+                    AstKind::IdentifierReference(identifier) => identifier
+                        .reference_id
+                        .get()
+                        .and_then(|id| self.scoping.get_reference(id).symbol_id()),
+                    _ => None,
+                };
+                if let Some(symbol) = symbol {
+                    if let Some(slot) = self.parameters.get(&symbol) {
+                        self.events.push(format!("type-parameter:{:?}:{slot}", kind.ty()));
+                        return;
+                    }
+                    if let Some(identity) = self.imported_types.get(&symbol) {
+                        self.events.push(format!("type-import-binding:{:?}:{identity}", kind.ty()));
+                        return;
+                    }
+                }
+                let mut features = FeatureChannels::default();
+                record_ast_feature(&mut features, self.source, kind);
+                self.events.push(features.signature(true));
+                match kind {
+                    AstKind::BindingIdentifier(identifier) => self.events.push(format!("type-binding:{}", identifier.name)),
+                    AstKind::IdentifierReference(identifier) => self.events.push(format!("type-reference:{}", identifier.name)),
+                    _ => {}
+                }
+            }
+        }
+        fn visit_ts_type_annotation(&mut self, annotation: &TSTypeAnnotation<'a>) {
+            self.depth += 1;
+            walk::walk_ts_type_annotation(self, annotation);
+            self.depth -= 1;
+        }
+        fn visit_ts_type_parameter_instantiation(&mut self, parameters: &TSTypeParameterInstantiation<'a>) {
+            self.depth += 1;
+            walk::walk_ts_type_parameter_instantiation(self, parameters);
+            self.depth -= 1;
+        }
+        fn visit_ts_as_expression(&mut self, expression: &TSAsExpression<'a>) {
+            self.visit_expression(&expression.expression);
+            self.depth += 1;
+            self.visit_ts_type(&expression.type_annotation);
+            self.depth -= 1;
+        }
+        fn visit_ts_satisfies_expression(&mut self, expression: &TSSatisfiesExpression<'a>) {
+            self.visit_expression(&expression.expression);
+            self.depth += 1;
+            self.visit_ts_type(&expression.type_annotation);
+            self.depth -= 1;
+        }
+        fn visit_ts_type_assertion(&mut self, expression: &TSTypeAssertion<'a>) {
+            self.depth += 1;
+            self.visit_ts_type(&expression.type_annotation);
+            self.depth -= 1;
+            self.visit_expression(&expression.expression);
+        }
+        fn visit_formal_parameter(&mut self, parameter: &oxc_ast::ast::FormalParameter<'a>) {
+            if parameter.type_annotation.is_some() || parameter.optional {
+                self.events.push(format!("parameter-optional:{}", parameter.optional));
+            }
+            walk::walk_formal_parameter(self, parameter);
+        }
+        fn visit_ts_property_signature(&mut self, property: &oxc_ast::ast::TSPropertySignature<'a>) {
+            self.events.push(format!("property-modifiers:{}:{}:{}", property.optional, property.readonly, property.computed));
+            walk::walk_ts_property_signature(self, property);
+        }
+        fn visit_ts_type_parameter_declaration(&mut self, parameters: &TSTypeParameterDeclaration<'a>) {
+            for parameter in &parameters.params {
+                if let Some(id) = parameter.name.symbol_id.get() {
+                    let slot = self.parameters.len();
+                    self.parameters.entry(id).or_insert(slot);
+                }
+            }
+            self.depth += 1;
+            walk::walk_ts_type_parameter_declaration(self, parameters);
+            self.depth -= 1;
+        }
+        fn visit_ts_type_alias_declaration(&mut self, declaration: &oxc_ast::ast::TSTypeAliasDeclaration<'a>) {
+            self.depth += 1;
+            walk::walk_ts_type_alias_declaration(self, declaration);
+            self.depth -= 1;
+        }
+        fn visit_ts_interface_declaration(&mut self, declaration: &oxc_ast::ast::TSInterfaceDeclaration<'a>) {
+            self.depth += 1;
+            walk::walk_ts_interface_declaration(self, declaration);
+            self.depth -= 1;
+        }
+    }
+    let mut collector = TypeCollector {
+        source,
+        events: Vec::new(),
+        depth: 0,
+        scoping: built.semantic.scoping(),
+        parameters: HashMap::new(),
+        imported_types: HashMap::new(),
+    };
+    collector.visit_program(&parsed.program);
+    Ok(Some(sha256(serde_json::to_string(&collector.events)?)))
 }
 
 fn collect_units(
@@ -3714,6 +3928,7 @@ fn index_file_with_edges(
             file: relative.to_string(),
             bytes: source.len(),
             source_sha256,
+            type_surface_sha256: type_surface_fingerprint(&source, source_type)?,
             source_map_sha256: source_map
                 .as_ref()
                 .and_then(|source_map| source_map.sha256.clone()),
@@ -3814,12 +4029,19 @@ fn index_discovery_with_limit(discovery: Discovery, side: &str, dependency_limit
     } = discovery;
     let cache_dir = cache_root();
     let _ = fs::create_dir_all(&cache_dir);
-    let graph_artifact = cache_dir.join(format!(
-        "project-graph-{}-{side}.jsonl.zst",
-        sha256(root.to_string_lossy().as_bytes())
-    ));
-    let graph_file = fs::File::create(&graph_artifact)
-        .with_context(|| format!("create {}", graph_artifact.display()))?;
+    // Dependency graph records are retained in memory but are not published or read downstream.
+    let graph_artifact = (side != "dependency").then(|| {
+        cache_dir.join(format!(
+            "project-graph-{}-{side}.jsonl.zst",
+            sha256(root.to_string_lossy().as_bytes())
+        ))
+    });
+    let graph_file: Box<dyn Write> = match graph_artifact.as_ref() {
+        Some(path) => Box::new(
+            fs::File::create(path).with_context(|| format!("create {}", path.display()))?,
+        ),
+        None => Box::new(io::sink()),
+    };
     // This is an intermediate lossless stream consumed once by the report
     // writer below.  Keep it compressed while indexing: the upstream bundle
     // produces multi-gigabyte JSONL graphs, and retaining an uncompressed copy
@@ -3876,7 +4098,7 @@ fn index_discovery_with_limit(discovery: Discovery, side: &str, dependency_limit
                     cache_misses += 1;
                 }
                 files.push(indexed.record);
-                if !graph_streamed {
+                if side != "dependency" && !graph_streamed {
                     for node in &indexed.graph.nodes {
                         project_cache::write_graph_record(&mut graph_output, side, node)?;
                     }
@@ -3998,7 +4220,7 @@ fn index_discovery_with_limit(discovery: Discovery, side: &str, dependency_limit
         graph_nodes,
         graph_node_count,
         graph_edges,
-        graph_artifact: Some(graph_artifact),
+        graph_artifact,
         failures,
         skipped,
     };
@@ -4139,6 +4361,7 @@ fn index_dependency_evidence(
             file: relative,
             bytes: source.len(),
             source_sha256: sha256(&source),
+            type_surface_sha256: None,
             source_map_sha256: None,
             source_map_error: None,
             units: 0,
@@ -6444,6 +6667,80 @@ fn nearest_executable_owner<'a>(
     }
 }
 
+fn executable_context<'a>(
+    node: &'a GraphNode,
+    nodes: &HashMap<&'a str, &'a GraphNode>,
+    parents: &HashMap<String, String>,
+    outgoing: &HashMap<&str, Vec<&GraphEdge>>,
+) -> Option<&'a GraphNode> {
+    if matches!(node.kind.as_str(), "Function" | "Class") {
+        return Some(node);
+    }
+    let direct_children = outgoing
+        .get(node.id.as_str())
+        .into_iter()
+        .flatten()
+        .filter(|edge| edge.kind == "Contains")
+        .filter_map(|edge| nodes.get(edge.target.as_str()).copied())
+        .collect::<Vec<_>>();
+    if let Some(owner) = direct_children.iter().copied().find(|child| {
+        matches!(child.kind.as_str(), "Function" | "Class") && child.label == "declaration"
+    }) {
+        return Some(owner);
+    }
+    for declaration in std::iter::once(node)
+        .chain(direct_children.iter().copied())
+        .filter(|child| child.kind == "Statement" && child.label == "VariableDeclarator")
+    {
+        if let Some(owner) = outgoing
+            .get(declaration.id.as_str())
+            .into_iter()
+            .flatten()
+            .filter(|edge| edge.kind == "Contains")
+            .filter_map(|edge| nodes.get(edge.target.as_str()).copied())
+            .find(|child| {
+                matches!(child.kind.as_str(), "Function" | "Class")
+                    && child.end == declaration.end
+            })
+        {
+            return Some(owner);
+        }
+    }
+    nearest_executable_owner(&node.id, nodes, parents)
+}
+
+fn next_statement_pair_is_safe(
+    left_source: &GraphNode,
+    left_target: &GraphNode,
+    right_source: &GraphNode,
+    right_target: &GraphNode,
+    left_nodes: &HashMap<&str, &GraphNode>,
+    right_nodes: &HashMap<&str, &GraphNode>,
+    left_parents: &HashMap<String, String>,
+    right_parents: &HashMap<String, String>,
+    left_outgoing: &HashMap<&str, Vec<&GraphEdge>>,
+    right_outgoing: &HashMap<&str, Vec<&GraphEdge>>,
+    left_to_right: &HashMap<String, String>,
+    right_to_left: &HashMap<String, String>,
+) -> bool {
+    let contexts = (
+        executable_context(left_source, left_nodes, left_parents, left_outgoing),
+        executable_context(left_target, left_nodes, left_parents, left_outgoing),
+        executable_context(right_source, right_nodes, right_parents, right_outgoing),
+        executable_context(right_target, right_nodes, right_parents, right_outgoing),
+    );
+    match contexts {
+        (None, None, None, None) => true,
+        (Some(left_source), Some(left_target), Some(right_source), Some(right_target)) => {
+            left_source.id == left_target.id
+                && right_source.id == right_target.id
+                && left_to_right.get(&left_source.id) == Some(&right_source.id)
+                && right_to_left.get(&right_source.id) == Some(&left_source.id)
+        }
+        _ => false,
+    }
+}
+
 fn owner_context_is_proven(
     left_node: &GraphNode,
     right_node: &GraphNode,
@@ -6810,6 +7107,39 @@ fn analyze_semantic_graph(
             let Some(left_target) = left_nodes.get(left_edge.target.as_str()) else {
                 continue;
             };
+            let right_neighbor_edges = right_edges
+                .iter()
+                .copied()
+                .filter(|right_edge| {
+                    if left_edge.kind != "NextStatement" && right_edge.kind != "NextStatement" {
+                        return true;
+                    }
+                    if left_edge.kind != "NextStatement" || right_edge.kind != "NextStatement" {
+                        return false;
+                    }
+                    let (Some(left_source), Some(right_source), Some(right_target)) = (
+                        left_nodes.get(left_id.as_str()),
+                        right_nodes.get(right_id.as_str()),
+                        right_nodes.get(right_edge.target.as_str()),
+                    ) else {
+                        return false;
+                    };
+                    next_statement_pair_is_safe(
+                        left_source,
+                        left_target,
+                        right_source,
+                        right_target,
+                        &left_nodes,
+                        &right_nodes,
+                        &left_contains_parents,
+                        &right_contains_parents,
+                        &left_outgoing,
+                        &right_outgoing,
+                        &left_to_right,
+                        &right_to_left,
+                    )
+                })
+                .collect::<Vec<_>>();
             if left_edge.kind == "Contains" {
                 if let Some(right_target_id) = positional_scope_symbols.get(&left_target.id) {
                     proposed.push((
@@ -6848,7 +7178,7 @@ fn analyze_semantic_graph(
             // target is still the same owner even if the immediate edge
             // contract differs.  Keep the fallback bounded to one-to-one
             // exact structural hashes; ambiguous duplicates remain queued.
-            let structural_exact = right_edges
+            let structural_exact = right_neighbor_edges
                 .iter()
                 .filter_map(|right_edge| {
                     let right_target = right_nodes.get(right_edge.target.as_str())?;
@@ -6874,7 +7204,7 @@ fn analyze_semantic_graph(
                 ));
                 continue;
             }
-            let exact = right_edges
+            let exact = right_neighbor_edges
                 .iter()
                 .filter(|right_edge| same_graph_edge_contract(left_edge, right_edge))
                 .filter_map(|right_edge| {
@@ -6904,7 +7234,7 @@ fn analyze_semantic_graph(
                 ));
                 continue;
             }
-            let mut scored = right_edges
+            let mut scored = right_neighbor_edges
                 .iter()
                 .filter(|right_edge| same_graph_edge_contract(left_edge, right_edge))
                 .filter_map(|right_edge| {
@@ -6952,7 +7282,40 @@ fn analyze_semantic_graph(
             {
                 continue;
             }
-            let mut scored = right_parent_edges
+            let right_parent_candidates = right_parent_edges
+                .iter()
+                .copied()
+                .filter(|right_edge| {
+                    if left_edge.kind != "NextStatement" && right_edge.kind != "NextStatement" {
+                        return true;
+                    }
+                    if left_edge.kind != "NextStatement" || right_edge.kind != "NextStatement" {
+                        return false;
+                    }
+                    let (Some(left_source), Some(right_source), Some(right_parent)) = (
+                        left_nodes.get(left_id.as_str()),
+                        right_nodes.get(right_id.as_str()),
+                        right_nodes.get(right_edge.source.as_str()),
+                    ) else {
+                        return false;
+                    };
+                    next_statement_pair_is_safe(
+                        left_source,
+                        left_parent,
+                        right_source,
+                        right_parent,
+                        &left_nodes,
+                        &right_nodes,
+                        &left_contains_parents,
+                        &right_contains_parents,
+                        &left_outgoing,
+                        &right_outgoing,
+                        &left_to_right,
+                        &right_to_left,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut scored = right_parent_candidates
                 .iter()
                 .filter(|right_edge| same_graph_edge_contract(left_edge, right_edge))
                 .filter_map(|right_edge| {
@@ -11803,6 +12166,85 @@ mod tests {
     }
 
     #[test]
+    fn semantic_graph_next_statement_stays_within_paired_executable_owner() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let local = include_str!("../fixtures/next-statement-owner-boundary/local.js");
+        let upstream = include_str!("../fixtures/next-statement-owner-boundary/upstream.js");
+        fs::write(left.path().join("local.js"), local).unwrap();
+        fs::write(right.path().join("upstream.js"), upstream).unwrap();
+
+        let (_, _, graph) = canonicalize(local, SourceType::mjs(), "local.js", "left").unwrap();
+        let nodes = graph
+            .nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node))
+            .collect::<HashMap<_, _>>();
+        let mut outgoing = HashMap::<&str, Vec<&GraphEdge>>::new();
+        for edge in &graph.edges {
+            outgoing.entry(edge.source.as_str()).or_default().push(edge);
+        }
+        let parents = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "Contains")
+            .map(|edge| (edge.target.as_ref().clone(), edge.source.as_ref().clone()))
+            .collect::<HashMap<_, _>>();
+        let wrapper = |name| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.kind == "Statement"
+                        && node.start == source_offset(local, &format!("export const {name}")) as u32
+                })
+                .unwrap()
+        };
+        let first_context = executable_context(wrapper("first"), &nodes, &parents, &outgoing).unwrap();
+        let second_context = executable_context(wrapper("second"), &nodes, &parents, &outgoing).unwrap();
+        assert_eq!(first_context.kind, "Function");
+        assert_eq!(second_context.kind, "Function");
+        assert_ne!(first_context.id, second_context.id);
+
+        run(left.path(), right.path(), output.path()).unwrap();
+
+        let relations = read_json_lines(&output.path().join("graph-relations.jsonl")).unwrap();
+        assert!(
+            !relations
+                .iter()
+                .any(|relation| relation["viaEdge"].as_str().is_some_and(|edge| {
+                    edge.ends_with("NextStatement")
+                })),
+            "sibling executable owners must not be linked through statement order: {relations:?}"
+        );
+        let local_first = source_offset(local, "() => normalize('same')");
+        let upstream_first = source_offset(upstream, "() => normalize('same')");
+        assert!(relations.iter().any(|relation| {
+            relation["basis"] == "seed-unit"
+                && relation["left"]["kind"] == "Function"
+                && relation["left"]["start"] == local_first
+                && relation["right"]["kind"] == "Function"
+                && relation["right"]["start"] == upstream_first
+        }), "the first declaration owner must seed correspondence: {relations:?}");
+        let work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
+        let upstream_second = source_offset(upstream, "second = () => sanitize");
+        assert!(
+            work.iter().any(|item| item["upstream"].as_array().is_some_and(|owners| {
+                owners.iter().any(|owner| {
+                    owner["start"].as_u64().is_some_and(|start| {
+                        start <= upstream_second
+                            && owner["end"]
+                                .as_u64()
+                                .is_some_and(|end| end > upstream_second)
+                    })
+                })
+            })),
+            "the divergent sibling owner must remain reviewable: {work:?}"
+        );
+    }
+
+    #[test]
     fn semantic_graph_cleanup_siblings_do_not_cross_match_after_ts_erasure() {
         let left = tempdir().unwrap();
         let right = tempdir().unwrap();
@@ -12402,6 +12844,357 @@ mod tests {
             .iter()
             .any(|edge| { edge.kind == "Calls" && member_ids.contains(edge.target.as_str()) }));
         assert!(graph.edges.iter().any(|edge| edge.kind == "Accesses"));
+    }
+
+    #[test]
+    fn literal_member_keys_match_dot_access_without_hiding_runtime_differences() {
+        fn signatures(source: &str) -> (String, String, Vec<(String, bool, Option<String>)>) {
+            let (canonical, originals, graph) = canonicalize(source, SourceType::mjs(), "fixture.js", "left").unwrap();
+            let units = collect_units(&canonical, source, SourceType::mjs(), "fixture.js", "left", originals, None).unwrap();
+            let function = graph.nodes.iter().find(|node| node.kind == "Function").unwrap();
+            let calls = graph.edges.iter().filter(|edge| edge.kind == "Calls").map(|edge| {
+                let target = graph.nodes.iter().find(|node| node.id == *edge.target).unwrap();
+                (target.label.clone(), edge.dynamic, edge.label.clone())
+            }).collect();
+            (units[0].linked_sha256.clone(), function.linked_sha256.clone(), calls)
+        }
+
+        let dot = signatures("function run(api, key) { return api.send(); }");
+        assert_eq!(dot, signatures("function run(api, key) { return api['send'](); }"));
+        assert_eq!(dot, signatures("function run(api, key) { return api[\"s\\u0065nd\"](); }"));
+        assert_ne!(dot, signatures("function run(api, key) { return api[key](); }"));
+        assert_ne!(dot, signatures("function run(api, key) { return api.other(); }"));
+        assert_ne!(dot, signatures("function run(api, key) { return api?.send(); }"));
+        assert_eq!(signatures("function run(api, key) { return api?.send(); }"), signatures("function run(api, key) { return api?.['send'](); }"));
+        assert_ne!(dot, signatures("function run(api, key) { return api.send?.(); }"));
+        for (dot_access, bracket_access) in [
+            ("api.send = 3", "api['send'] = 3"),
+            ("api.send++", "api['send']++"),
+            ("api.send.next('value')", "api['send'].next('value')"),
+            ("api?.send?.('value')", "api?.['send']?.('value')"),
+        ] {
+            assert_eq!(signatures(&format!("function run(api, key) {{ {dot_access}; }}")), signatures(&format!("function run(api, key) {{ {bracket_access}; }}")), "{dot_access}");
+        }
+        assert_ne!(signatures("function run(api, key) { api.send('first'); }"), signatures("function run(api, key) { api['send']('second'); }"));
+    }
+
+    #[test]
+    fn literal_member_key_report_keeps_real_property_drift() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        for (left_expression, expression, equivalent) in [
+            ("api.send()", "api['send']()", true),
+            ("api.send()", "api.receive()", false),
+            ("api.send()", "api[api.key]()", false),
+            ("api.send()", "api?.send()", false),
+            ("api.send = 3", "api['send'] = 3", true),
+            ("api.send++", "api['send']++", true),
+            ("api.send.next('value')", "api['send'].next('value')", true),
+            ("api.send('first')", "api['send']('second')", false),
+            ("api?.send?.('value')", "api?.['send']?.('value')", true),
+        ] {
+            fs::write(left.path().join("owner.js"), format!("export function run(api) {{ return {left_expression}; }}")).unwrap();
+            fs::write(right.path().join("owner.js"), format!("export function run(api) {{ return {expression}; }}")).unwrap();
+            let output = tempdir().unwrap();
+            run(left.path(), right.path(), output.path()).unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+            let proven = report["matches"].as_array().unwrap().iter().any(|item| {
+                item["left"]["name"] == "run" && item["confidence"] == "proven-structure"
+            });
+            assert_eq!(proven, equivalent, "{expression}");
+            if equivalent {
+                let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+                for item in work.lines() {
+                    let item: serde_json::Value = serde_json::from_str(item).unwrap();
+                    assert_eq!(item["confidence"], "unknown", "unproved file context must stay reviewable: {item}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn literal_member_graph_is_identical_on_cold_and_warm_cache() {
+        let root = tempdir().unwrap();
+        let cache = root.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        let source = root.path().join("module.js");
+        fs::write(&source, "export function run(api, key) { api['send']('value'); return api[key]; }").unwrap();
+        let (cold, cold_hit) = index_file(&source, "module.js", "left", &cache).unwrap();
+        let (warm, warm_hit) = index_file(&source, "module.js", "left", &cache).unwrap();
+        assert!(!cold_hit && warm_hit);
+        assert_eq!(serde_json::to_value(&cold).unwrap(), serde_json::to_value(&warm).unwrap());
+    }
+
+    #[test]
+    fn type_surface_fingerprint_detects_annotation_changes() {
+        let ty = SourceType::from_path("api.ts").unwrap();
+        let a = type_surface_fingerprint("function f(value: string): string { return value }", ty).unwrap();
+        let spaced = type_surface_fingerprint("function f(value : string) : string { return value }", ty).unwrap();
+        let changed = type_surface_fingerprint("function f(value: number): number { return value }", ty).unwrap();
+        assert_eq!(a, spaced);
+        assert_eq!(
+            type_surface_fingerprint("export function id<T>(value: T): T { return value }", ty).unwrap(),
+            type_surface_fingerprint("export function id<U>(value: U): U { return value }", ty).unwrap()
+        );
+        assert_ne!(
+            type_surface_fingerprint("export function f<T, U>(a: T, b: U): T { return a }", ty).unwrap(),
+            type_surface_fingerprint("export function f<T, U>(a: T, b: U): U { return b }", ty).unwrap()
+        );
+        assert_ne!(
+            type_surface_fingerprint("export function f<T>(a: T): T { return a }", ty).unwrap(),
+            type_surface_fingerprint("export function f<T>(a: External): T { return a as T }", ty).unwrap()
+        );
+        assert_ne!(
+            type_surface_fingerprint("export type F<T> = <T>(x: T) => T", ty).unwrap(),
+            type_surface_fingerprint("export type F<T> = <U>(x: T) => U", ty).unwrap()
+        );
+        assert_ne!(a, changed);
+        assert_eq!(type_surface_fingerprint("function f(value) { return value }", SourceType::mjs()).unwrap(), None);
+        for (left, right) in [
+            ("export type Value = string", "export type Value = number"),
+            ("export interface Value { item: string }", "export interface Value { item: number }"),
+            ("export interface Value { item?: string }", "export interface Value { item: string }"),
+            ("export interface Value { readonly item: string }", "export interface Value { item: string }"),
+            ("export function f(value: string): string; export function f(value: unknown): unknown { return value }", "export function f(value: number): number; export function f(value: unknown): unknown { return value }"),
+            ("export function f(value?: string) { return value }", "export function f(value: string) { return value }"),
+            ("export type Value = First", "export type Value = Second"),
+            ("export interface First { item: string }", "export interface Second { item: string }"),
+            ("declare const raw: unknown; export const value = raw as string", "declare const raw: unknown; export const value = raw as number"),
+            ("declare const raw: unknown; export const value = raw satisfies string", "declare const raw: unknown; export const value = raw satisfies number"),
+        ] {
+            assert_ne!(type_surface_fingerprint(left, ty).unwrap(), type_surface_fingerprint(right, ty).unwrap(), "{left} vs {right}");
+        }
+        assert_eq!(
+            type_surface_fingerprint("import type { Value } from './one'", ty).unwrap(),
+            type_surface_fingerprint("import { type Value } from './one'", ty).unwrap()
+        );
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        for (local, upstream) in [
+            ("export type { Value } from './one'", "export type { Value } from './two'"),
+            ("export type { Value } from './one'", "export type { Other } from './one'"),
+        ] {
+            fs::write(left.path().join("api.ts"), local).unwrap();
+            fs::write(right.path().join("api.ts"), upstream).unwrap();
+            let output = tempdir().unwrap();
+            run(left.path(), right.path(), output.path()).unwrap();
+            let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+            assert!(work.contains("different TypeScript type syntax"), "missing type re-export candidate: {work}");
+        }
+    }
+
+    #[test]
+    fn type_surface_fingerprint_distinguishes_types_moved_between_owners() {
+        let ty = SourceType::from_path("api.ts").unwrap();
+        let left = "export function first(value: string) {} export function second(value: number) {}";
+        let right = "export function first(value: number) {} export function second(value: string) {}";
+        assert_ne!(type_surface_fingerprint(left, ty).unwrap(), type_surface_fingerprint(right, ty).unwrap());
+    }
+
+    #[test]
+    fn type_surface_tracks_type_only_module_bindings() {
+        let ty = SourceType::from_path("api.ts").unwrap();
+        for (left, right) in [
+            ("import type { Value } from './one'; export function f(v: Value) {}", "import type { Value } from './two'; export function f(v: Value) {}"),
+            ("import { type Value } from './one'; export function f(v: Value) {}", "import { type Value } from './two'; export function f(v: Value) {}"),
+            ("export type { Value } from './one'", "export type { Value } from './two'"),
+            ("export { type Value } from './one'", "export { type Other as Value } from './one'"),
+            ("export type * from './one'", "export type * from './two'"),
+        ] {
+            assert_ne!(type_surface_fingerprint(left, ty).unwrap(), type_surface_fingerprint(right, ty).unwrap(), "{left} vs {right}");
+        }
+    }
+
+    #[test]
+    fn generic_call_type_arguments_remain_actionable() {
+        let ty = SourceType::from_path("api.ts").unwrap();
+        let left = "declare function build<T>(): T; export const value = build<string>();";
+        let right = "declare function build<T>(): T; export const value = build<number>();";
+        assert_ne!(type_surface_fingerprint(left, ty).unwrap(), type_surface_fingerprint(right, ty).unwrap());
+        let local = tempdir().unwrap();
+        let upstream = tempdir().unwrap();
+        fs::write(local.path().join("api.ts"), left).unwrap();
+        fs::write(upstream.path().join("api.ts"), right).unwrap();
+        let output = tempdir().unwrap();
+        run(local.path(), upstream.path(), output.path()).unwrap();
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(work.contains("different TypeScript type syntax"));
+    }
+
+    #[test]
+    fn imported_type_identity_keeps_module_and_export_name_distinct() {
+        let ty = SourceType::from_path("api.ts").unwrap();
+        let imports = "import type { B as First } from 'pkg:a'; import type { 'a:B' as Second } from 'pkg'; ";
+        let first = format!("{imports}export type Value = First;");
+        let second = format!("{imports}export type Value = Second;");
+        assert_ne!(type_surface_fingerprint(&first, ty).unwrap(), type_surface_fingerprint(&second, ty).unwrap());
+    }
+
+    #[test]
+    fn renamed_import_alias_keeps_reexported_type_contract() {
+        let ty = SourceType::from_path("api.ts").unwrap();
+        let left = "import type { Model as Local } from './types'; export type { Local as Public };";
+        let right = "import type { Model as Renamed } from './types'; export type { Renamed as Public };";
+        assert_eq!(type_surface_fingerprint(left, ty).unwrap(), type_surface_fingerprint(right, ty).unwrap());
+        let changed = "import type { Other as Renamed } from './types'; export type { Renamed as Public };";
+        assert_ne!(type_surface_fingerprint(left, ty).unwrap(), type_surface_fingerprint(changed, ty).unwrap());
+        let local = tempdir().unwrap();
+        let upstream = tempdir().unwrap();
+        fs::write(local.path().join("api.ts"), left).unwrap();
+        fs::write(upstream.path().join("api.ts"), right).unwrap();
+        let output = tempdir().unwrap();
+        run(local.path(), upstream.path(), output.path()).unwrap();
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(!work.contains("different TypeScript type syntax"), "alias rename produced a type candidate: {work}");
+    }
+
+    #[test]
+    fn changed_exported_typescript_signature_remains_actionable() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        for (local, upstream) in [
+            ("export function f(value: string): string { return value }", "export function f(value: number): number { return value }"),
+            ("export type Value = string", "export type Value = number"),
+            ("export interface Value { item: string }", "export interface Value { item: number }"),
+        ] {
+            fs::write(left.path().join("api.ts"), local).unwrap();
+            fs::write(right.path().join("api.ts"), upstream).unwrap();
+            let output = tempdir().unwrap();
+            run(left.path(), right.path(), output.path()).unwrap();
+            let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+            assert!(work.contains("different TypeScript type syntax"), "missing type candidate for {upstream}: {work}");
+        }
+        fs::write(left.path().join("api.ts"), "export interface Value { item: string }").unwrap();
+        fs::write(right.path().join("api.ts"), "export interface Value {\n  item : string;\n}").unwrap();
+        let output = tempdir().unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(!work.contains("different TypeScript type syntax"), "formatting produced a type candidate: {work}");
+    }
+
+    #[test]
+    fn exported_assertion_type_change_remains_actionable() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        fs::write(
+            left.path().join("api.ts"),
+            "declare const raw: unknown; export const value = raw as string",
+        )
+        .unwrap();
+        fs::write(
+            right.path().join("api.ts"),
+            "declare const raw: unknown; export const value = raw as number",
+        )
+        .unwrap();
+        let output = tempdir().unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(work.contains("different TypeScript type syntax"), "missing assertion type candidate: {work}");
+    }
+
+    #[test]
+    fn private_type_change_is_an_unproven_review_candidate() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        fs::write(left.path().join("api.ts"), "function helper(value: string) { return value } export function api() { return 1 }").unwrap();
+        fs::write(right.path().join("api.ts"), "function helper(value: number) { return value } export function api() { return 1 }").unwrap();
+        let output = tempdir().unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        let candidate = work.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|item| item["reason"].as_str().is_some_and(|reason| reason.contains("different TypeScript type syntax")))
+            .expect("a changed private type must remain reviewable without claiming public API drift");
+        assert_eq!(candidate["priority"], "P2");
+        assert_eq!(candidate["confidence"], "unknown");
+    }
+
+    #[test]
+    fn imported_type_change_remains_visible_in_report() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        for root in [left.path(), right.path()] {
+            fs::write(root.join("api.ts"), "import type { Value } from './public'; export function f(value: Value): Value { return value }").unwrap();
+            fs::write(root.join("public.ts"), "export type { Value } from './types';").unwrap();
+        }
+        fs::write(left.path().join("types.ts"), "export interface Value { item: string }").unwrap();
+        fs::write(right.path().join("types.ts"), "export interface Value { item: number }").unwrap();
+        let index = index_project(right.path(), "right").unwrap();
+        let nodes = index.graph_nodes.iter().map(|node| (node.id.as_str(), node)).collect::<HashMap<_, _>>();
+        assert!(index.graph_edges.iter().any(|edge| edge.kind == "TypeBindsTo"
+            && nodes.get(edge.source.as_str()).is_some_and(|node| node.file == "api.ts")
+            && nodes.get(edge.target.as_str()).is_some_and(|node| node.file == "types.ts")));
+        assert!(index.graph_edges.iter().any(|edge| edge.kind == "TypeReExportsTo"
+            && nodes.get(edge.source.as_str()).is_some_and(|node| node.file == "public.ts")
+            && nodes.get(edge.target.as_str()).is_some_and(|node| node.file == "types.ts")));
+        let output = tempdir().unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(work.contains("different TypeScript type syntax") && work.contains("types.ts"), "missing imported type change: {work}");
+    }
+
+    #[test]
+    fn typescript_annotations_do_not_prevent_matching_runtime_javascript() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        fs::write(left.path().join("api.ts"), "export function f(value: string): string { return value }").unwrap();
+        fs::write(right.path().join("api.js"), "export function f(value) { return value }").unwrap();
+        let output = tempdir().unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(report["matches"].as_array().unwrap().iter().any(|item| item["left"]["name"] == "f" && item["confidence"] == "proven-structure"));
+    }
+
+    #[test]
+    fn moved_module_export_is_not_claimed_absent_by_path() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        fs::write(left.path().join("local.js"), "export function run() { return 1; }").unwrap();
+        fs::write(right.path().join("upstream.js"), "export function run() { return 1; }").unwrap();
+        let output = tempdir().unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(!work.contains("export contract absent from the upstream module"), "path alone cannot prove an absent export: {work}");
+        assert!(work.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()).any(|item| {
+            item["action"] == "remove-or-justify-extra-local" && item["confidence"] == "unknown"
+                && item["reason"].as_str().is_some_and(|reason| reason.contains("other possible owners"))
+        }), "unresolved exports should remain reviewable: {work}");
+    }
+
+    #[test]
+    fn renamed_default_function_with_observable_name_remains_actionable() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        fs::write(left.path().join("api.js"), "export default function LocalImplementation() { return 1; }").unwrap();
+        fs::write(right.path().join("api.js"), "export default function UpstreamImplementation() { return 1; }").unwrap();
+        let output = tempdir().unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(!work.trim().is_empty(), "observable function name change was suppressed");
+    }
+
+    #[test]
+    fn module_wrapper_changes_remain_in_the_action_queue() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        fs::write(left.path().join("owner.js"), "export function run(api) { return api.send(); }").unwrap();
+        for changed in [
+            "function run(api) { return api['send'](); }",
+            "function run(api) { return api['send'](); } export { run as other };",
+            "export function run(api) { return api['send'](); } boot();",
+            "export function run(api) { return api['receive'](); }",
+            "export function run(api) { return api['send']?.(); }",
+        ] {
+            fs::write(right.path().join("owner.js"), changed).unwrap();
+            let output = tempdir().unwrap();
+            run(left.path(), right.path(), output.path()).unwrap();
+            let work = fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap();
+            assert!(!work.trim().is_empty(), "missing change: {changed}");
+        }
+        fs::write(left.path().join("owner.js"), "function run(api) { return api.send(); }").unwrap();
+        fs::write(right.path().join("owner.js"), "export function run(api) { return api['send'](); }").unwrap();
+        let output = tempdir().unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        assert!(!fs::read_to_string(output.path().join("llm-work-items.jsonl")).unwrap().trim().is_empty(), "missing upstream export");
     }
 
     #[test]
@@ -13494,6 +14287,22 @@ mod tests {
         fs::write(package.join("dist/runtime.js"), "module.exports = x => x >= 2;").unwrap();
         let discovery = discover_dependencies(project.path(), Some(&indexed)).unwrap().unwrap();
         assert!(discovery.files.iter().any(|(_, relative)| relative.ends_with("/dist/runtime.js")));
+    }
+
+    #[test]
+    fn dependency_index_keeps_graph_evidence_without_spilling_unused_artifact() {
+        let project = tempdir().unwrap();
+        fs::write(
+            project.path().join("main.js"),
+            "export function outer(x) { return x.value; }\n",
+        )
+        .unwrap();
+
+        let dependencies = index_project(project.path(), "dependency").unwrap();
+
+        assert!(dependencies.graph_artifact.is_none());
+        assert!(!dependencies.graph_nodes.is_empty());
+        assert!(!dependencies.graph_edges.is_empty());
     }
 
     #[test]

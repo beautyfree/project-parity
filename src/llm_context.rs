@@ -983,17 +983,35 @@ pub(crate) fn write_llm_context(
     let mut upstream_work_by_node = HashMap::<String, String>::new();
     let mut ambiguous_left_ids = HashSet::<String>::new();
     let mut ambiguous_right_confidence = HashMap::<String, &'static str>::new();
+    let mut local_files = HashMap::<&str, Vec<&crate::FileRecord>>::with_capacity(left.files.len());
+    for file in &left.files {
+        local_files.entry(file.file.as_str()).or_default().push(file);
+    }
     let identical_files = right
         .files
         .iter()
         .filter_map(|right_file| {
-            left.files
-                .iter()
-                .find(|left_file| same_file_identity(left_file, right_file))
+            local_files.get(right_file.file.as_str())
+                .filter(|files| files.iter().any(|left_file| same_file_identity(left_file, right_file)))
                 .map(|_| right_file.file.as_str())
         })
         .collect::<HashSet<_>>();
     let identical_location = |location: &Location| identical_files.contains(location.file.as_str());
+
+    for upstream in &right.files {
+        if let Some(local) = local_files.get(upstream.file.as_str()).and_then(|files| files.first()) {
+            if let (Some(local_types), Some(upstream_types)) = (&local.type_surface_sha256, &upstream.type_surface_sha256) {
+                if local_types != upstream_types {
+                    push_work_item(&mut work_items, WorkItemDraft {
+                        action: "reconcile-changed-branch", priority: "P2", confidence: "unknown",
+                        reason: "The files have different TypeScript type syntax; inspect the public contract and its dependencies.".to_string(),
+                        local: vec![json!({"file": local.file})], upstream: vec![json!({"file": upstream.file})],
+                        evidence_path: Vec::new(), identities: vec![format!("type-surface:{}", upstream.file)],
+                    });
+                }
+            }
+        }
+    }
 
     for failure in &right.failures {
         push_work_item(
@@ -1241,6 +1259,47 @@ pub(crate) fn write_llm_context(
                     .collect(),
             },
         );
+    }
+
+    // Matched function bodies do not establish the enclosing module's exports.
+    // Compare both directions so an extra local public binding remains visible.
+    let module_contract = |project: &ProjectIndex| {
+        let nodes = project.graph_nodes.iter().map(|node| (node.id.as_str(), node)).collect::<HashMap<_, _>>();
+        let mut contract = BTreeMap::<String, BTreeMap<(String, Option<String>, bool, String), GraphNode>>::new();
+        for edge in &project.graph_edges {
+            if !matches!(edge.kind.as_str(), "Exports" | "ExportsBinding" | "ReExportsBinding" | "TypeExports" | "TypeExportsBinding" | "TypeReExportsBinding") { continue; }
+            let (Some(source), Some(target)) = (nodes.get(edge.source.as_str()), nodes.get(edge.target.as_str())) else { continue; };
+            contract.entry(source.file.clone()).or_default().insert(
+                (edge.kind.clone(), edge.label.clone(), edge.dynamic, target.label.clone()), (*source).clone()
+            );
+        }
+        contract
+    };
+    let left_contract = module_contract(left);
+    let right_contract = module_contract(right);
+    for (file, local_edges) in &left_contract {
+        let Some(upstream_edges) = right_contract.get(file) else {
+            for node in local_edges.values() {
+                let location = graph_node_ref(node);
+                push_work_item(&mut work_items, WorkItemDraft {
+                    action: "remove-or-justify-extra-local", priority: "P2", confidence: "unknown",
+                    reason: "No upstream module at the same path has a comparable export; inspect other possible owners before deciding whether this local export is extra.".to_string(),
+                    local: vec![graph_node_value(&location)], upstream: Vec::new(), evidence_path: Vec::new(),
+                    identities: vec![node.id.clone()],
+                });
+            }
+            continue;
+        };
+        for (key, node) in local_edges {
+            if upstream_edges.contains_key(key) { continue; }
+            let location = graph_node_ref(node);
+            push_work_item(&mut work_items, WorkItemDraft {
+                action: "remove-or-justify-extra-local", priority: "P2", confidence: "unknown",
+                reason: "The local export has no matching edge in the same-path upstream graph; inspect graph coverage and possible other owners before deciding whether it is extra.".to_string(),
+                local: vec![graph_node_value(&location)], upstream: Vec::new(), evidence_path: Vec::new(),
+                identities: vec![node.id.clone()],
+            });
+        }
     }
 
     let units_by_file =
@@ -1881,8 +1940,7 @@ pub(crate) fn write_llm_context(
                 // A child is covered only by an actual structural proof. A
                 // candidate may inherit its owner's work route, but is never
                 // silently classified as covered graph context.
-                return disposition.status == "structurally-equal"
-                    || disposition.work_item_id.is_some();
+                return owner_context_needs_work(disposition.status, disposition.work_item_id.is_some());
             }
         }
         let mut cursor = node.id.as_str();
@@ -2408,6 +2466,10 @@ Edit only local sources. Treat the upstream input as read-only. After each coher
     Ok(summary)
 }
 
+fn owner_context_needs_work(status: &str, has_work_route: bool) -> bool {
+    status != "structurally-equal" && !has_work_route
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2479,6 +2541,7 @@ mod tests {
             file: file.to_string(),
             bytes: 0,
             source_sha256: source_sha256.to_string(),
+            type_surface_sha256: None,
             source_map_sha256: source_map_sha256.map(str::to_string),
             source_map_error: None,
             units: 0,
