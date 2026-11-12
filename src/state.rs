@@ -1226,7 +1226,8 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
 /// A report can be regenerated independently of the SQLite queue (for example,
 /// by a watcher or a failed/interrupted sync). Do not hand out IDs from that
 /// stale queue: the corresponding evidence may no longer exist in the report.
-/// Check that the report was synced against the current source fingerprints.
+/// Local source edits are expected while reviewed decisions accumulate; sync
+/// compares each saved payload with the next report before making it durable.
 fn resolve_report_path(db_path: &Path, report: &str) -> PathBuf {
     let report_path = PathBuf::from(report);
     if report_path.is_absolute() {
@@ -1316,6 +1317,15 @@ fn ensure_report_is_synced(db_path: &Path, conn: &Connection) -> Result<()> {
             );
         }
     }
+    let has_pending_sync = if table_exists(conn, "work_item_decisions")? {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_item_decisions d JOIN work_items w ON w.id=d.work_item_id WHERE d.status='pending_sync' AND w.resolved_at IS NULL)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?
+    } else {
+        false
+    };
     for (side, root, expected_hash) in [
         (
             "local",
@@ -1349,7 +1359,7 @@ fn ensure_report_is_synced(db_path: &Path, conn: &Connection) -> Result<()> {
         )
         .context(format!("manifest has no {side} input files"))?;
         let current_hash = crate::fingerprint_input(Path::new(root), &selected_files)?;
-        if current_hash != expected_hash {
+        if current_hash != expected_hash && !(side == "local" && has_pending_sync) {
             bail!(
                 "parity report {side} source inputs changed since report generation (root: {root}). Regenerate the report, then run `project-parity sync` before requesting the next item"
             );
@@ -2054,7 +2064,7 @@ mod tests {
         let manifest = serde_json::json!({
             "schema":"project-parity/llm-manifest-v3",
             "engine":ENGINE_VERSION,
-            "engineArtifact":{"executableSha256":super::sha256_file(&std::env::current_exe().unwrap()).unwrap()},
+            "engineArtifact":{"executableSha256":crate::sha256_file(&std::env::current_exe().unwrap()).unwrap()},
             "localRoot":local,
             "analysisProjection":upstream,
             "workItemsIntegrity":{
@@ -2279,7 +2289,7 @@ mod tests {
         let mut manifest = serde_json::json!({
             "schema":"project-parity/llm-manifest-v3",
             "engine":ENGINE_VERSION,
-            "engineArtifact":{"executableSha256":super::sha256_file(&std::env::current_exe().unwrap()).unwrap()},
+            "engineArtifact":{"executableSha256":crate::sha256_file(&std::env::current_exe().unwrap()).unwrap()},
             "localRoot":local,
             "analysisProjection":missing,
         });
@@ -2320,7 +2330,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("engineArtifact.executableSha256"));
-        manifest["engineArtifact"] = serde_json::json!({"executableSha256":super::sha256_file(&std::env::current_exe().unwrap()).unwrap()});
+        manifest["engineArtifact"] = serde_json::json!({"executableSha256":crate::sha256_file(&std::env::current_exe().unwrap()).unwrap()});
         assert!(validate_report_roots(&manifest).is_ok());
         manifest["engineArtifact"]["executableSha256"] = "b".repeat(64).into();
         assert!(validate_report_roots(&manifest)
@@ -2348,7 +2358,7 @@ mod tests {
     }
 
     #[test]
-    fn next_refuses_to_issue_ids_when_current_input_hashes_differ_from_report() {
+    fn next_refuses_local_edits_without_pending_sync_decisions() {
         let root = tempdir().unwrap();
         let db = root.path().join("state.sqlite");
         let report_dir = root.path().join("report");
@@ -2387,13 +2397,11 @@ mod tests {
         let error = next(&db, 10).unwrap_err();
         assert!(error
             .to_string()
-            .contains("source inputs changed since report generation"));
-        assert!(error.to_string().contains("local"));
-        assert!(error.to_string().contains("Regenerate the report"));
+            .contains("local source inputs changed since report generation"));
     }
 
     #[test]
-    fn next_detects_added_removed_and_source_map_input_changes() {
+    fn next_keeps_the_synced_snapshot_after_local_edits_during_checkpoint() {
         let root = tempdir().unwrap();
         let db = root.path().join("state.sqlite");
         let report_dir = root.path().join("report");
@@ -2408,7 +2416,7 @@ mod tests {
         fs::write(&local_file, "export const value = 1\n").unwrap();
         fs::write(&upstream_file, "export const value = 1\n").unwrap();
         fs::write(&unrelated_test, "export const testValue = 1\n").unwrap();
-        report(&report_dir, &["a"]);
+        report(&report_dir, &["a", "b"]);
         let manifest = serde_json::json!({
             "engine": ENGINE_VERSION,
             "localRoot": local.display().to_string(),
@@ -2431,34 +2439,36 @@ mod tests {
         )
         .unwrap();
         sync(&db, &report_dir).unwrap();
+        mark_pending_sync(&db, "a", "reviewed patch awaiting checkpoint").unwrap();
         fs::write(&unrelated_test, "export const testValue = 2\n").unwrap();
         assert_eq!(next(&db, 10).unwrap()["count"], 1);
-        let changed_error = || next(&db, 10).unwrap_err().to_string();
-
         let added_file = local.join("src/added.ts");
         fs::write(&added_file, "export const added = true\n").unwrap();
-        assert!(changed_error().contains("source inputs changed since report generation"));
+        assert_eq!(next(&db, 10).unwrap()["count"], 1);
         fs::remove_file(&added_file).unwrap();
 
         fs::write(&upstream_file, "export const value = 2\n").unwrap();
-        assert!(changed_error().contains("source inputs changed since report generation"));
+        let error = next(&db, 10).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("upstream source inputs changed since report generation"));
 
         fs::write(&upstream_file, "export const value = 1\n").unwrap();
         fs::remove_file(&local_file).unwrap();
-        assert!(changed_error().contains("source inputs changed since report generation"));
+        assert_eq!(next(&db, 10).unwrap()["count"], 1);
 
         fs::write(&local_file, "export const value = 1\n").unwrap();
         fs::write(local.join("src/index.ts.map"), "{}\n").unwrap();
-        assert!(changed_error().contains("source inputs changed since report generation"));
+        assert_eq!(next(&db, 10).unwrap()["count"], 1);
 
         fs::remove_file(local.join("src/index.ts.map")).unwrap();
         fs::write(local.join("tsconfig.json"), r#"{"compilerOptions":{"paths":{}}}"#)
             .unwrap();
-        assert!(changed_error().contains("source inputs changed since report generation"));
+        assert_eq!(next(&db, 10).unwrap()["count"], 1);
 
         fs::remove_file(local.join("tsconfig.json")).unwrap();
         fs::write(local.join("package.json"), r#"{"name":"fixture"}"#).unwrap();
-        assert!(changed_error().contains("source inputs changed since report generation"));
+        assert_eq!(next(&db, 10).unwrap()["count"], 1);
     }
 
     #[test]

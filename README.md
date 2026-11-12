@@ -85,6 +85,10 @@ with `state-done-batch`; run one serialized `sync` when `pendingSync` reaches
 1,000 (or at the end if fewer remain). Never mark unseen work just to reach the
 threshold. The command validates every ID before writing any decision and
 preserves each payload snapshot, so a later sync reopens only changed evidence.
+During an active `pending_sync` checkpoint, local source edits do not invalidate
+the last synced queue snapshot; continue reviewing that snapshot until the
+checkpoint. Upstream and dependency inputs must stay unchanged. If the report
+itself is regenerated or the engine changes, sync it before requesting more IDs.
 
 Queue reads default to 100 items. The normal routing form avoids sending full
 evidence before the relevant shared batch is selected. Use `--summary` only when
