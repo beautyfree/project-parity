@@ -11,9 +11,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::{
-    graph_behavior_hashes, graph_similarity, location, normalized_graph_token, sha256,
-    AmbiguousGroup, DivergenceFrontier, GraphNode, GraphNodeRef, GraphRelation, GroupCandidate,
-    Location, MatchRecord, ProjectIndex, Unit, Unmatched,
+    global_behavior_seeding_is_safe, graph_behavior_hashes, graph_similarity, location,
+    normalized_graph_token, sha256, AmbiguousGroup, DivergenceFrontier, GraphNode, GraphNodeRef,
+    GraphRelation, GroupCandidate, Location, MatchRecord, ProjectIndex, Unit, Unmatched,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -1473,16 +1473,20 @@ pub(crate) fn write_llm_context(
             },
         );
         let dependency_behavior = graph_behavior_hashes(dependencies);
+        let upstream_behavior = graph_behavior_hashes(right);
+        let allow_behavior_hash_evidence =
+            global_behavior_seeding_is_safe(&dependency_behavior, &upstream_behavior);
         let dependency_nodes_by_hash = dependencies.graph_nodes.iter().fold(
             HashMap::<&str, Vec<&GraphNode>>::new(),
             |mut by_hash, node| {
-                if let Some(hash) = dependency_behavior.get(&node.id) {
-                    by_hash.entry(hash.as_str()).or_default().push(node);
+                if allow_behavior_hash_evidence {
+                    if let Some(hash) = dependency_behavior.get(&node.id) {
+                        by_hash.entry(hash.as_str()).or_default().push(node);
+                    }
                 }
                 by_hash
             },
         );
-        let upstream_behavior = graph_behavior_hashes(right);
         // Normalized graph matching must not scan the entire dependency AST
         // for every unmatched upstream node.  Build an inverted index on
         // (kind, normalized-token) and start each lookup from its rarest
