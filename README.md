@@ -176,6 +176,12 @@ lossless compressed graph/ledger artifacts, source-hash-checked inspectors,
 `llm-manifest.json`, and `llm-work-items.jsonl`/`llm-batches.jsonl`. Work items
 are prioritized P0/P1/P2 and retain missing, changed, ambiguous, candidate,
 dependency, caller, scope, import, export, and package provenance evidence.
+The manifest records `engineArtifact.executableSha256`, the SHA-256 of the
+exact analyzer executable that generated the report. Current-engine state sync
+refuses reports without a valid executable fingerprint. It also records
+`workItemsIntegrity` with the exact JSONL record count and SHA-256. State sync
+checks both while reading the queue and rolls back the run if the artifact is
+truncated or altered, so missing rows cannot silently resolve earlier work.
 
 Group candidates require every member to explain additional target feature
 counts and score better together than the best individual member. Repeated
@@ -203,6 +209,12 @@ against the same two roots. An item is resolved only when
 its stable id disappears or its disposition is explicitly covered by fresh
 evidence.
 
+The sync result counts queue entries that appeared (`new`) and disappeared
+(`resolved`) independently, so both can be nonzero in the same run. `new`
+includes reviewed items reopened after their evidence changed; `reopened`
+reports that subset. Before reopening, sync preserves the prior decision and
+both evidence snapshots in SQLite's `work_item_decision_history` table.
+
 `watch` takes content-hash snapshots, debounces save bursts, skips no-op
 cycles, writes `change-set.json`, reuses the per-file Oxc cache for unchanged
 files, and runs `state-sync` after each settled change. The correspondence
@@ -220,12 +232,13 @@ transport facade over the same parity engine; it cannot edit either input.
 ## Discovery and trust boundaries
 
 Discovery is recursive and build-system agnostic. Common generated and vendor
-directories (`node_modules`, `target`, `coverage`, reports, and build output)
-are skipped to avoid duplicate owners. One deliberate exception is a root
-`dist/` in a distribution-only input with no root `src/`, `source/`, or `lib/`:
-that directory is treated as the authoritative executable surface, while
-nested build directories remain excluded. This covers unpacked releases whose
-renderer exists only as shipped chunks. Upstream is read-only by convention.
+directories (`node_modules`, `target`, `coverage`, reports, build output, and
+test fixture directories such as `fixtures` and `__fixtures__`) are skipped to
+avoid treating non-production code as runtime owners. One deliberate exception
+is a root `dist/` in a distribution-only input without root `src/`, `source/`,
+or `lib/`: that directory is treated as the authoritative executable surface,
+while nested build directories remain excluded. This covers unpacked releases
+whose renderer exists only as shipped chunks. Upstream is read-only by convention.
 AST/graph correspondence is source evidence, not a claim of runtime, native,
 asset, or pixel equivalence.
 

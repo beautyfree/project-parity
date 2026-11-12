@@ -44,11 +44,11 @@ mod visualize;
 use semantic_graph::{share_graph_edge_ids, GraphEdge, GraphNode, SemanticGraph};
 
 const CODE_EXTENSIONS: &[&str] = &["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"];
-const ENGINE_VERSION: &str = "rust-oxc-0.126.0/v74";
+const ENGINE_VERSION: &str = "rust-oxc-0.126.0/v79";
 // Graph extraction is cache material: change this whenever semantic nodes or
 // edges change, otherwise an old cache silently erases newly added ownership
 // links from a report.
-const INDEX_CACHE_VERSION: &str = "rust-oxc-0.126.0/v39";
+const INDEX_CACHE_VERSION: &str = "rust-oxc-0.126.0/v51";
 thread_local! {
     // Graph similarity compares many pairs that reuse the same finite token
     // vocabulary. Cache the pure token normalization, not pair scores, so
@@ -66,6 +66,8 @@ const SKIP_DIRECTORIES: &[&str] = &[
     "build",
     "coverage",
     "dist",
+    "__fixtures__",
+    "fixtures",
     "node_modules",
     "out",
     "reports",
@@ -213,6 +215,8 @@ struct ProjectIndex {
     units: Vec<Unit>,
     #[serde(skip_serializing)]
     graph_nodes: Vec<GraphNode>,
+    #[serde(skip_serializing)]
+    graph_node_count: usize,
     #[serde(skip_serializing)]
     graph_edges: Vec<GraphEdge>,
     /// Complete per-file graph stream. The in-memory graph may be compacted
@@ -596,11 +600,22 @@ fn collision_free_prefix(scoping: &Scoping) -> String {
     prefix
 }
 
+#[cfg(test)]
 fn canonicalize(
     source: &str,
     source_type: SourceType,
     file: &str,
     side: &str,
+) -> Result<(String, Vec<RawUnit>, SemanticGraph)> {
+    canonicalize_with_edges(source, source_type, file, side, true)
+}
+
+fn canonicalize_with_edges(
+    source: &str,
+    source_type: SourceType,
+    file: &str,
+    side: &str,
+    emit_edges: bool,
 ) -> Result<(String, Vec<RawUnit>, SemanticGraph)> {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
@@ -634,7 +649,7 @@ fn canonicalize(
         );
     }
     let mut semantic = built.semantic;
-    let graph = semantic_graph::extract(&program, &semantic, source, file, side);
+    let graph = semantic_graph::extract_with_edges(&program, &semantic, source, file, side, emit_edges);
     let prefix = collision_free_prefix(semantic.scoping());
     let mut by_scope = BTreeMap::<usize, Vec<SymbolId>>::new();
     for symbol_id in semantic.scoping().symbol_ids() {
@@ -688,6 +703,9 @@ struct UnitCollector {
 
 impl<'a> Visit<'a> for UnitCollector {
     fn visit_function(&mut self, function: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
+        if function.body.is_none() {
+            return;
+        }
         self.units.push(RawUnit {
             span: function.span(),
             kind: "Function",
@@ -934,7 +952,16 @@ impl<'a> Visit<'a> for CanonicalUnitCollector<'_> {
         }
     }
 
+    fn visit_method_definition(&mut self, method: &oxc_ast::ast::MethodDefinition<'a>) {
+        if method.value.body.is_some() {
+            walk::walk_method_definition(self, method);
+        }
+    }
+
     fn visit_function(&mut self, function: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
+        if function.body.is_none() {
+            return;
+        }
         self.begin_unit(function.span());
         walk::walk_function(self, function, flags);
         self.end_unit();
@@ -3617,15 +3644,26 @@ fn index_project_file(
             }
         }
     }
-    let (indexed, hit) = index_file(path, relative, side, cache_dir)?;
+    let (indexed, hit) = index_file_with_edges(path, relative, side, cache_dir, side != "dependency" || retain_edges)?;
     Ok((indexed, hit, false))
 }
 
+#[cfg(test)]
 fn index_file(
     path: &Path,
     relative: &str,
     side: &str,
     cache_dir: &Path,
+) -> Result<(IndexedFile, bool)> {
+    index_file_with_edges(path, relative, side, cache_dir, true)
+}
+
+fn index_file_with_edges(
+    path: &Path,
+    relative: &str,
+    side: &str,
+    cache_dir: &Path,
+    emit_edges: bool,
 ) -> Result<(IndexedFile, bool)> {
     let source = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let source_sha256 = sha256(&source);
@@ -3642,14 +3680,16 @@ fn index_file(
         &source_sha256,
         source_map_fingerprint,
     );
-    if let Ok(cached) = fs::File::open(&cache_path) {
-        if let Ok(decoded) = zstd::stream::read::Decoder::new(cached) {
-            // Large package bundles have gigabyte-scale expanded caches.
-            // Deserialize from the decoder instead of retaining compressed
-            // bytes plus the complete expanded JSON alongside its AST.
-            if let Ok(indexed) = serde_json::from_reader::<_, IndexedFile>(BufReader::new(decoded))
-            {
-                return Ok((indexed, true));
+    if emit_edges {
+        if let Ok(cached) = fs::File::open(&cache_path) {
+            if let Ok(decoded) = zstd::stream::read::Decoder::new(cached) {
+                // Large package bundles have gigabyte-scale expanded caches.
+                // Deserialize from the decoder instead of retaining compressed
+                // bytes plus the complete expanded JSON alongside its AST.
+                if let Ok(indexed) = serde_json::from_reader::<_, IndexedFile>(BufReader::new(decoded))
+                {
+                    return Ok((indexed, true));
+                }
             }
         }
     }
@@ -3657,7 +3697,7 @@ fn index_file(
         SourceType::from_path(path).map_err(|error| anyhow::anyhow!(error.to_string()))?;
     // Unpackers recover JSX inside shipped .js files; keep TypeScript's filename semantics.
     let source_type = if source_type.is_javascript() { source_type.with_jsx(true) } else { source_type };
-    let (canonical, original_units, graph) = canonicalize(&source, source_type, relative, side)?;
+    let (canonical, original_units, graph) = canonicalize_with_edges(&source, source_type, relative, side, emit_edges)?;
     let units = collect_units(
         &canonical,
         &source,
@@ -3685,6 +3725,7 @@ fn index_file(
         units,
         graph,
     };
+    if !emit_edges { return Ok((indexed, false)); }
     // Serialize directly into compression: large bundle graphs must not also
     // allocate their complete expanded JSON and compressed byte buffers.
     // Publish only a finished stream; a failed cache write remains optional.
@@ -3730,12 +3771,18 @@ fn compact_semantic_graph(graph: &mut SemanticGraph) {
 
 const DEPENDENCY_FULL_GRAPH_LIMIT: usize = 250_000;
 
+// File nodes are needed to connect package entries before the large-corpus
+// projection discards them; executable nodes remain available for matching.
+fn retain_large_dependency_nodes(nodes: &mut Vec<GraphNode>) {
+    nodes.retain(|node| matches!(node.kind.as_str(), "File" | "Statement" | "Function" | "Class"));
+}
+
 // The large-dependency summary already discards all edges. Release them as
 // soon as that outcome is certain, after the lossless per-file stream is
 // written. Node count only increases during indexing, so this is irreversible
 // within a run without changing the eventual projection.
-fn keep_project_graph_edges(side: &str, node_count: usize) -> bool {
-    side != "dependency" || node_count <= DEPENDENCY_FULL_GRAPH_LIMIT
+fn keep_project_graph_edges(side: &str, node_count: usize, limit: usize) -> bool {
+    side != "dependency" || node_count <= limit
 }
 
 // Dependency Unit ownership uses only exact hashes and source locations.
@@ -3749,6 +3796,10 @@ fn release_dependency_unit_features(units: &mut [Unit]) {
 }
 
 fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
+    index_discovery_with_limit(discovery, side, DEPENDENCY_FULL_GRAPH_LIMIT)
+}
+
+fn index_discovery_with_limit(discovery: Discovery, side: &str, dependency_limit: usize) -> Result<ProjectIndex> {
     let _resolution_generation = ResolutionGeneration::enter();
     let config_failures = tsconfig_failures(&discovery);
     let input_fingerprint = fingerprint_discovery(&discovery)?;
@@ -3779,6 +3830,7 @@ fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
     let mut files = Vec::new();
     let mut units = Vec::new();
     let mut graph_nodes = Vec::new();
+    let mut graph_node_count = 0;
     let mut graph_edges = Vec::new();
     let mut failures = config_failures;
     let mut cache_hits = 0;
@@ -3806,7 +3858,7 @@ fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
     // report to be killed by the OS before publication.
     for (path, relative) in discovered {
         let file = relative.clone();
-        let retain_edges = keep_project_graph_edges(side, graph_nodes.len());
+        let retain_edges = keep_project_graph_edges(side, graph_node_count, dependency_limit);
         let result = index_project_file(
             &path,
             &relative,
@@ -3838,6 +3890,15 @@ fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
                 if !retain_edges { indexed.graph.edges = Vec::new(); }
                 if compact_large_graph && !graph_streamed {
                     compact_semantic_graph(&mut indexed.graph);
+                }
+                let previous_graph_node_count = graph_node_count;
+                graph_node_count += indexed.graph.nodes.len();
+                if side == "dependency" && graph_node_count > dependency_limit {
+                    if previous_graph_node_count <= dependency_limit {
+                        retain_large_dependency_nodes(&mut graph_nodes);
+                        graph_nodes.shrink_to_fit();
+                    }
+                    retain_large_dependency_nodes(&mut indexed.graph.nodes);
                 }
                 if side == "dependency" {
                     release_dependency_unit_features(&mut indexed.units);
@@ -3877,7 +3938,7 @@ fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
                 }
                 units.extend(indexed.units);
                 graph_nodes.extend(indexed.graph.nodes);
-                if keep_project_graph_edges(side, graph_nodes.len()) {
+                if keep_project_graph_edges(side, graph_node_count, dependency_limit) {
                     share_graph_edge_ids(&mut indexed.graph.edges, &mut graph_ids);
                     graph_edges.extend(indexed.graph.edges);
                 } else {
@@ -3935,12 +3996,13 @@ fn index_discovery(discovery: Discovery, side: &str) -> Result<ProjectIndex> {
         files,
         units,
         graph_nodes,
+        graph_node_count,
         graph_edges,
         graph_artifact: Some(graph_artifact),
         failures,
         skipped,
     };
-    if keep_project_graph_edges(side, project.graph_nodes.len()) {
+    if keep_project_graph_edges(side, project.graph_node_count, dependency_limit) {
         link_relative_module_owners(&mut project);
     }
     Ok(project)
@@ -4107,6 +4169,7 @@ fn index_dependency_evidence(
         files: Vec::new(),
         units: Vec::new(),
         graph_nodes: Vec::new(),
+        graph_node_count: 0,
         graph_edges: Vec::new(),
         graph_artifact: None,
         failures: Vec::new(),
@@ -4128,6 +4191,7 @@ fn index_dependency_evidence(
         files,
         units: indexed_package_index.units,
         graph_nodes: indexed_package_index.graph_nodes,
+        graph_node_count: indexed_package_index.graph_node_count,
         graph_edges: indexed_package_index.graph_edges,
         graph_artifact: indexed_package_index.graph_artifact,
         failures: indexed_package_index.failures,
@@ -6257,6 +6321,8 @@ struct BehaviorHashes {
     converged: bool,
 }
 
+const LARGE_BEHAVIOR_GRAPH_LIMIT: usize = 100_000;
+
 impl BehaviorHashes {
     fn get(&self, node_id: &str) -> Option<&String> {
         self.hashes.get(node_id)
@@ -6274,10 +6340,6 @@ fn graph_behavior_hashes(project: &ProjectIndex) -> BehaviorHashes {
             )
         })
         .collect::<HashMap<_, _>>();
-    let mut outgoing = HashMap::<&str, Vec<&GraphEdge>>::new();
-    for edge in &project.graph_edges {
-        outgoing.entry(edge.source.as_str()).or_default().push(edge);
-    }
     // Weisfeiler-Lehman refinement can need more than six hops in a real
     // module/call graph. Refine up to 64 hops (or the graph size for smaller
     // inputs) before the explicit resource bound; this routine only seeds
@@ -6286,12 +6348,16 @@ fn graph_behavior_hashes(project: &ProjectIndex) -> BehaviorHashes {
     // each round allocates one hash per node.  Keep deep refinement for
     // ordinary projects, but bound production-scale graphs and report
     // `converged: false` when the budget is exhausted.
-    if project.graph_nodes.len() > 100_000 {
+    if project.graph_nodes.len() > LARGE_BEHAVIOR_GRAPH_LIMIT {
         return BehaviorHashes {
             hashes,
             iterations: 0,
             converged: false,
         };
+    }
+    let mut outgoing = HashMap::<&str, Vec<&GraphEdge>>::new();
+    for edge in &project.graph_edges {
+        outgoing.entry(edge.source.as_str()).or_default().push(edge);
     }
     let max_iterations = project.graph_nodes.len().clamp(1, 64);
     let mut iterations = 0;
@@ -7338,6 +7404,15 @@ fn upstream_mentioned_packages<'a>(
     Ok(mentioned)
 }
 
+pub(crate) fn ensure_separate_nested_roots(left: &Path, right: &Path) -> Result<()> {
+    let left = left.canonicalize()?;
+    let right = right.canonicalize()?;
+    if left != right && (left.starts_with(&right) || right.starts_with(&left)) {
+        anyhow::bail!("project roots overlap: {} and {}; move the nested input outside the other root", left.display(), right.display());
+    }
+    Ok(())
+}
+
 // Call only while a SyncGuard holds the report and optional state writer locks.
 fn generate_report(
     guard: &state::SyncGuard,
@@ -7345,6 +7420,7 @@ fn generate_report(
 ) -> Result<Summary> {
     let _resolution_generation = ResolutionGeneration::enter();
     let (left_path, right_path, output) = guard.paths();
+    ensure_separate_nested_roots(left_path, right_path)?;
     let stage_started = Instant::now();
     eprintln!("[project-parity] indexing local project");
     let mut left = index_project(left_path, "left")?;
@@ -7501,7 +7577,7 @@ fn generate_report(
         // leaving only file-level provenance and manufacturing P0 owners.
         // This remains bounded by the configured graph limit and the matcher
         // uses a bounded worker pool.
-        if index.graph_nodes.len() <= DEPENDENCY_FULL_GRAPH_LIMIT {
+        if index.graph_node_count <= DEPENDENCY_FULL_GRAPH_LIMIT {
             return index;
         }
         // For a large dependency corpus, retain nodes whose exact structural
@@ -10453,6 +10529,18 @@ mod tests {
     }
 
     #[test]
+    fn nested_input_roots_are_rejected_in_both_directions() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("reference");
+        std::fs::create_dir(&nested).unwrap();
+        assert!(ensure_separate_nested_roots(root.path(), &nested).is_err());
+        assert!(ensure_separate_nested_roots(&nested, root.path()).is_err());
+        assert!(ensure_separate_nested_roots(root.path(), root.path()).is_ok());
+        let sibling = tempfile::tempdir().unwrap();
+        assert!(ensure_separate_nested_roots(root.path(), sibling.path()).is_ok());
+    }
+
+    #[test]
     fn graph_edge_id_sharing_preserves_wire_values_and_distinct_identifiers() {
         let wire = r#"[
             {"source":"owner/x","target":"owner/y","kind":"Calls","dynamic":false},
@@ -10563,14 +10651,109 @@ mod tests {
     #[test]
     fn dependency_edge_release_matches_the_final_projection_boundary() {
         for side in ["left", "right"] {
-            assert!(keep_project_graph_edges(side, DEPENDENCY_FULL_GRAPH_LIMIT + 1));
-            assert!(keep_project_graph_edges(side, usize::MAX));
+            assert!(keep_project_graph_edges(side, DEPENDENCY_FULL_GRAPH_LIMIT + 1, DEPENDENCY_FULL_GRAPH_LIMIT));
+            assert!(keep_project_graph_edges(side, usize::MAX, DEPENDENCY_FULL_GRAPH_LIMIT));
         }
-        assert!(keep_project_graph_edges("dependency", DEPENDENCY_FULL_GRAPH_LIMIT));
-        assert!(!keep_project_graph_edges("dependency", DEPENDENCY_FULL_GRAPH_LIMIT + 1));
+        assert!(keep_project_graph_edges("dependency", DEPENDENCY_FULL_GRAPH_LIMIT, DEPENDENCY_FULL_GRAPH_LIMIT));
+        assert!(!keep_project_graph_edges("dependency", DEPENDENCY_FULL_GRAPH_LIMIT + 1, DEPENDENCY_FULL_GRAPH_LIMIT));
         // A later file can never make a discarded dependency edge relevant:
         // the accumulated node count cannot return below the summary limit.
-        assert!(!keep_project_graph_edges("dependency", usize::MAX));
+        assert!(!keep_project_graph_edges("dependency", usize::MAX, DEPENDENCY_FULL_GRAPH_LIMIT));
+    }
+
+    #[test]
+    fn discarded_dependency_edges_do_not_poison_full_index_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("module.js");
+        let cache = directory.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(&source, "import { x } from 'pkg'; export function f(a) { return x(a); }").unwrap();
+        let (without_edges, hit) = index_file_with_edges(&source, "module.js", "dependency", &cache, false).unwrap();
+        assert!(!hit);
+        assert!(without_edges.graph.edges.is_empty());
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 0);
+        let (full, hit) = index_file_with_edges(&source, "module.js", "dependency", &cache, true).unwrap();
+        assert!(!hit);
+        assert!(!full.graph.edges.is_empty());
+        assert_eq!(serde_json::to_value(&without_edges.graph.nodes).unwrap(), serde_json::to_value(&full.graph.nodes).unwrap());
+        assert_eq!(serde_json::to_value(&without_edges.units).unwrap(), serde_json::to_value(&full.units).unwrap());
+        let cache_file = fs::read_dir(&cache).unwrap().next().unwrap().unwrap().path();
+        let bytes = fs::read(&cache_file).unwrap();
+        let (warm, hit) = index_file_with_edges(&source, "module.js", "dependency", &cache, true).unwrap();
+        assert!(hit);
+        assert_eq!(serde_json::to_value(&warm).unwrap(), serde_json::to_value(&full).unwrap());
+        let mut stream = Vec::new();
+        let (bounded, hit, streamed) = index_project_file(&source, "module.js", "dependency", &cache, &mut stream, true, false).unwrap();
+        assert!(hit && streamed);
+        assert!(bounded.graph.edges.is_empty());
+        let mut expected = full.graph.clone();
+        compact_semantic_graph(&mut expected);
+        assert_eq!(serde_json::to_value(&bounded.graph.nodes).unwrap(), serde_json::to_value(&expected.nodes).unwrap());
+        assert_eq!(fs::read(cache_file).unwrap(), bytes);
+    }
+
+    #[test]
+    fn early_dependency_node_release_preserves_entry_and_final_owner_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("entry.js"), "export function owner(x) { return x + 1; }").unwrap();
+        let index = index_project(directory.path(), "dependency").unwrap();
+        let mut early = index.graph_nodes.clone();
+        let expected_owners = index.graph_nodes.iter()
+            .filter(|node| matches!(node.kind.as_str(), "Statement" | "Function" | "Class"))
+            .collect::<Vec<_>>();
+        let expected_files = index.graph_nodes.iter()
+            .filter(|node| node.kind == "File")
+            .collect::<Vec<_>>();
+        assert!(!expected_files.is_empty());
+        assert!(!expected_owners.is_empty());
+        retain_large_dependency_nodes(&mut early);
+        assert_eq!(serde_json::to_value(early.iter().filter(|node| node.kind == "File").collect::<Vec<_>>()).unwrap(),
+            serde_json::to_value(expected_files).unwrap());
+        early.retain(|node| matches!(node.kind.as_str(), "Statement" | "Function" | "Class"));
+        assert_eq!(serde_json::to_value(early).unwrap(), serde_json::to_value(expected_owners).unwrap());
+    }
+
+    #[test]
+    fn dependency_index_preserves_evidence_across_early_release_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("first.js"), "export function first(x) { return x + 1; }").unwrap();
+        fs::write(directory.path().join("second.js"), "export function second(x) { return x * 2; }").unwrap();
+        let full = index_discovery(discover(directory.path()).unwrap(), "dependency").unwrap();
+        let limit = full.graph_nodes.iter().filter(|node| node.file == "first.js").count();
+        assert!(limit > 0);
+        assert!(limit < full.graph_node_count);
+        let compact = index_discovery_with_limit(discover(directory.path()).unwrap(), "dependency", limit).unwrap();
+        let expected_nodes = full.graph_nodes.iter()
+            .filter(|node| matches!(node.kind.as_str(), "File" | "Statement" | "Function" | "Class"))
+            .collect::<Vec<_>>();
+        assert_eq!(compact.graph_node_count, full.graph_node_count);
+        assert_eq!(serde_json::to_value(&compact.graph_nodes).unwrap(), serde_json::to_value(expected_nodes).unwrap());
+        assert_eq!(serde_json::to_value(&compact.units).unwrap(), serde_json::to_value(&full.units).unwrap());
+        assert_eq!(serde_json::to_value(&compact.files).unwrap(), serde_json::to_value(&full.files).unwrap());
+        assert!(compact.graph_edges.is_empty());
+    }
+
+    #[test]
+    fn large_behavior_graph_uses_structural_seeds_without_edge_refinement() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("entry.js"), "export function owner(x) { return x + 1; }").unwrap();
+        let mut project = index_project(directory.path(), "right").unwrap();
+        assert!(!project.graph_edges.is_empty());
+        let template = project.graph_nodes[0].clone();
+        project.graph_nodes.clear();
+        for id in 0..100_001 {
+            let mut node = template.clone();
+            node.id = format!("fixture:{id}");
+            if id % 2 == 0 { node.kind = "Statement".to_string(); }
+            project.graph_nodes.push(node);
+        }
+        let hashes = graph_behavior_hashes(&project);
+        assert_eq!(hashes.iterations, 0);
+        assert!(!hashes.converged);
+        assert_eq!(hashes.hashes.len(), project.graph_nodes.len());
+        for node in &project.graph_nodes {
+            assert_eq!(hashes.hashes.get(&node.id), Some(&sha256(format!("{}\0{}", node.kind, node.linked_sha256))));
+        }
     }
 
     #[test]
@@ -11648,6 +11831,28 @@ mod tests {
     }
 
     #[test]
+    fn bodyless_typescript_functions_are_not_executable_work() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let local = "export abstract class Base { abstract get missing(): number; value(): number; value(): number { return 1 } }";
+        fs::write(left.path().join("owner.ts"), local).unwrap();
+        fs::write(right.path().join("owner.js"), "export class Base { value() { return 1 } }").unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let bodyless = local.match_indices("(): number;").map(|(start, _)| start as u64).collect::<Vec<_>>();
+        assert_eq!(bodyless.len(), 2);
+        let unmatched = read_json_lines(&output.path().join("unmatched-left.jsonl")).unwrap();
+        assert!(!unmatched.iter().any(|item| item["location"]["kind"] == "Function" && item["location"]["start"].as_u64().is_some_and(|start| bodyless.contains(&start))));
+        let graph = zstd::stream::decode_all(fs::File::open(output.path().join("semantic-graph.jsonl.zst")).unwrap()).unwrap();
+        let graph = std::str::from_utf8(&graph).unwrap();
+        assert!(!graph.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).any(|row| {
+            row["node"]["file"] == "owner.ts" && row["node"]["kind"] == "Function" && row["node"]["start"].as_u64().is_some_and(|start| bodyless.contains(&start))
+        }));
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(output.path().join("report.json")).unwrap()).unwrap();
+        assert!(report["matches"].as_array().unwrap().iter().any(|record| record["left"]["kind"] == "Class" && record["status"] == "alpha-equal"), "type-only declarations must not change executable class identity: {}", report["matches"]);
+    }
+
+    #[test]
     fn semantic_graph_does_not_promote_nested_callbacks_across_unpaired_owners() {
         let left = tempdir().unwrap();
         let right = tempdir().unwrap();
@@ -11668,6 +11873,16 @@ mod tests {
                 && relation["right"]["kind"] == "Function"
                 && relation["right"]["start"] == upstream_callback
         }), "an identical inner callback must not seed a relation across unrelated owners");
+        let work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(work.iter().any(|item| {
+            item["action"] == "reconcile-changed-owner"
+                && item["local"][0]["start"] == local_callback
+                && item["upstream"][0]["start"] == upstream_callback
+                && item["confidence"] == "weak-candidate"
+        }), "an unproven callback pair must stay visible as a weak candidate");
+        let ledger = read_json_lines(&output.path().join("upstream-executable-ledger.jsonl")).unwrap();
+        let callback = ledger.iter().find(|row| row["upstream"]["start"] == upstream_callback).unwrap();
+        assert_ne!(callback["disposition"], "structurally-equal", "an unpaired parent must not establish callback coverage: {callback}");
     }
 
     #[test]
@@ -14114,6 +14329,10 @@ mod tests {
             serde_json::from_slice(&fs::read(output.path().join("llm-manifest.json")).unwrap())
                 .unwrap();
         assert_eq!(manifest["orientation"], "upstream-led");
+        assert_eq!(
+            manifest["engineArtifact"]["executableSha256"],
+            sha256_file(&std::env::current_exe().unwrap()).unwrap()
+        );
         assert!(manifest["summary"]["upstreamExecutableNodes"]
             .as_u64()
             .is_some_and(|count| count > 0));
@@ -14918,6 +15137,36 @@ mod tests {
             ["src/a.js", "src/contracts.d.ts"]
         );
         assert_eq!(discovery.corpus.mode, "recursive-source-project");
+    }
+
+    #[test]
+    fn fixture_directories_are_not_discovered_as_production_owners() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::create_dir_all(root.path().join("src/__fixtures__")).unwrap();
+        fs::create_dir_all(root.path().join("test/fixtures")).unwrap();
+        fs::write(root.path().join("src/app.js"), "export const app=1").unwrap();
+        fs::write(
+            root.path().join("src/__fixtures__/harness.cjs"),
+            "module.exports = async () => {}",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("test/fixtures/project.js"),
+            "export const fixture=1",
+        )
+        .unwrap();
+
+        let discovery = discover(root.path()).unwrap();
+
+        assert_eq!(
+            discovery
+                .files
+                .iter()
+                .map(|(_, relative)| relative.as_str())
+                .collect::<Vec<_>>(),
+            ["src/app.js"]
+        );
     }
 
     #[test]

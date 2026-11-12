@@ -21,7 +21,7 @@ use oxc_span::{GetSpan, Span};
 use oxc_syntax::{scope::ScopeId, symbol::SymbolId};
 use serde::{Deserialize, Serialize};
 
-use super::{line_at, record_ast_feature, sha256, FeatureChannels};
+use super::{record_ast_feature, record_static_member_property, record_static_member_start, sha256, FeatureChannels};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -80,11 +80,13 @@ struct PendingNode {
 
 struct GraphCollector<'a, 's> {
     source: &'s str,
+    newline_offsets: Vec<usize>,
     file: &'s str,
     side: &'s str,
     semantic: &'a Semantic<'a>,
     nodes: Vec<PendingNode>,
     edges: BTreeSet<GraphEdge>,
+    emit_edges: bool,
     edge_ids: HashSet<Arc<String>>,
     scope_stack: Vec<String>,
     owner_stack: Vec<String>,
@@ -104,14 +106,25 @@ struct GraphCollector<'a, 's> {
 }
 
 impl<'a, 's> GraphCollector<'a, 's> {
+    #[cfg(test)]
     fn new(source: &'s str, file: &'s str, side: &'s str, semantic: &'a Semantic<'a>) -> Self {
+        Self::new_with_edges(source, file, side, semantic, true)
+    }
+
+    fn new_with_edges(source: &'s str, file: &'s str, side: &'s str, semantic: &'a Semantic<'a>, emit_edges: bool) -> Self {
         let mut collector = Self {
             source,
+            newline_offsets: source
+                .bytes()
+                .enumerate()
+                .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset))
+                .collect(),
             file,
             side,
             semantic,
             nodes: Vec::new(),
             edges: BTreeSet::new(),
+            emit_edges,
             edge_ids: HashSet::new(),
             scope_stack: Vec::new(),
             owner_stack: Vec::new(),
@@ -139,6 +152,10 @@ impl<'a, 's> GraphCollector<'a, 's> {
             .clone()
     }
 
+    fn line_at(&self, offset: usize) -> usize {
+        self.newline_offsets.partition_point(|newline| *newline < offset) + 1
+    }
+
     fn add_node(&mut self, kind: &str, label: &str, span: Span, scope: Option<String>) -> String {
         let ordinal = self.ordinal;
         self.ordinal += 1;
@@ -154,7 +171,7 @@ impl<'a, 's> GraphCollector<'a, 's> {
                 label: label.to_string(),
                 start: span.start,
                 end: span.end,
-                line: line_at(self.source, span.start as usize),
+                line: self.line_at(span.start as usize),
                 scope,
                 linked_sha256: String::new(),
                 tokens: BTreeSet::new(),
@@ -174,6 +191,7 @@ impl<'a, 's> GraphCollector<'a, 's> {
         dynamic: bool,
         label: Option<String>,
     ) {
+        if !self.emit_edges { return; }
         let mut edge = GraphEdge {
             source: Arc::new(source.into()),
             target: Arc::new(target.into()),
@@ -762,7 +780,16 @@ impl<'a> Visit<'a> for GraphCollector<'a, '_> {
         }
     }
 
+    fn visit_method_definition(&mut self, method: &oxc_ast::ast::MethodDefinition<'a>) {
+        if method.value.body.is_some() {
+            walk::walk_method_definition(self, method);
+        }
+    }
+
     fn visit_function(&mut self, function: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
+        if function.body.is_none() {
+            return;
+        }
         let label = if function.is_declaration() {
             "declaration"
         } else {
@@ -1414,6 +1441,7 @@ impl<'s> Visit<'s> for RuntimeModuleSpecifierCollector<'_, 's> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn extract(
     program: &Program<'_>,
     semantic: &Semantic<'_>,
@@ -1421,8 +1449,65 @@ pub(crate) fn extract(
     file: &str,
     side: &str,
 ) -> SemanticGraph {
-    let mut collector = GraphCollector::new(source, file, side, semantic);
+    extract_with_edges(program, semantic, source, file, side, true)
+}
+
+pub(crate) fn extract_with_edges(
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    source: &str,
+    file: &str,
+    side: &str,
+    emit_edges: bool,
+) -> SemanticGraph {
+    let mut collector = GraphCollector::new_with_edges(source, file, side, semantic, emit_edges);
     collector.visit_program(program);
     collector.owner_stack.pop();
     collector.finish()
+}
+
+#[cfg(test)]
+mod line_index_tests {
+    use super::{extract, GraphCollector};
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_semantic::SemanticBuilder;
+    use oxc_span::SourceType;
+
+    fn check_lines(source: &str, cases: &[(usize, usize)]) {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, "", SourceType::mjs()).parse();
+        let semantic = SemanticBuilder::new().build(&parsed.program).semantic;
+        let collector = GraphCollector::new(source, "fixture.js", "left", &semantic);
+        for &(offset, line) in cases {
+            assert_eq!(collector.line_at(offset), line, "offset {offset} in {source:?}");
+        }
+    }
+
+    #[test]
+    fn indexed_line_numbers_preserve_boundaries_and_utf8_offsets() {
+        check_lines("", &[(0, 1), (10, 1)]);
+        check_lines("a\nβ\r\n終\n", &[(0, 1), (1, 1), (2, 2), (4, 2), (5, 2), (6, 3), (9, 3), (10, 4), (20, 4)]);
+    }
+
+    #[test]
+    fn indexed_line_numbers_handle_large_minified_sources() {
+        let source = "x".repeat(1_000_000);
+        check_lines(&source, &[(0, 1), (500_000, 1), (1_000_000, 1), (1_000_001, 1)]);
+    }
+
+    #[test]
+    fn graph_node_lines_match_the_original_prefix_count() {
+        let source = "const α = 1;\r\nfunction next() {\n  return α;\n}\n";
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
+        assert!(parsed.errors.is_empty());
+        let built = SemanticBuilder::new().build(&parsed.program);
+        assert!(built.errors.is_empty());
+        let graph = extract(&parsed.program, &built.semantic, source, "fixture.js", "left");
+        assert!(graph.nodes.len() > 1);
+        for node in graph.nodes {
+            assert_eq!(node.line, crate::line_at(source, node.start as usize), "{}", node.id);
+        }
+    }
 }

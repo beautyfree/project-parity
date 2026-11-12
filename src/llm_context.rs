@@ -8,6 +8,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use super::{
     graph_behavior_hashes, graph_similarity, location, normalized_graph_token, sha256,
@@ -89,9 +90,10 @@ fn candidate_owner_triage(record: &MatchRecord) -> (&'static str, &'static str) 
     }
 }
 
-fn write_json_lines(path: &Path, values: &[Value]) -> Result<()> {
+fn write_json_lines(path: &Path, values: &[Value]) -> Result<String> {
     let file = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
     let mut output = BufWriter::new(file);
+    let mut digest = Sha256::new();
     // Keep the seek index compact while writing.  Storing one serde_json::Value
     // per record here used several hundred MB for the parity work queue and
     // made the final report appear hung on large upstream bundles.
@@ -102,6 +104,8 @@ fn write_json_lines(path: &Path, values: &[Value]) -> Result<()> {
         let offset = output.stream_position()?;
         output.write_all(&line)?;
         output.write_all(b"\n")?;
+        digest.update(&line);
+        digest.update(b"\n");
         if let Some(id) = value["id"].as_str() {
             records.push((id.to_string(), offset, line.len() + 1));
         }
@@ -153,7 +157,8 @@ fn write_json_lines(path: &Path, values: &[Value]) -> Result<()> {
     writeln!(index, "}}}}")?;
     index
         .flush()
-        .with_context(|| format!("write {}", index_path.display()))
+        .with_context(|| format!("write {}", index_path.display()))?;
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 /// Intern only the repeated, large candidate arrays. This is a storage
@@ -969,6 +974,9 @@ pub(crate) fn write_llm_context(
     unmatched_right: &[Unmatched],
     dependencies: Option<&ProjectIndex>,
 ) -> Result<LlmSummary> {
+    let engine_executable = std::env::current_exe()
+        .context("resolve Project Parity executable for report provenance")?;
+    let engine_executable_sha256 = crate::sha256_file(&engine_executable)?;
     let mut work_items = Vec::<Value>::new();
     let shared_work_evidence = HashMap::new();
     let mut unit_dispositions = HashMap::<String, UnitDisposition>::new();
@@ -1021,6 +1029,23 @@ pub(crate) fn write_llm_context(
         );
     }
 
+    let left_nodes = left.graph_nodes.iter().map(|node| (node.id.as_str(), node)).collect::<HashMap<_, _>>();
+    let right_nodes = right.graph_nodes.iter().map(|node| (node.id.as_str(), node)).collect::<HashMap<_, _>>();
+    let left_locations = left.graph_nodes.iter().map(|node| (
+        (node.file.as_str(), node.kind.as_str(), node.start, node.end), node
+    )).collect::<HashMap<_, _>>();
+    let right_locations = right.graph_nodes.iter().map(|node| (
+        (node.file.as_str(), node.kind.as_str(), node.start, node.end), node
+    )).collect::<HashMap<_, _>>();
+    let left_parents = super::graph_contains_parents(left);
+    let right_parents = super::graph_contains_parents(right);
+    let owner_pairs = matches.iter().filter(|record| record.confidence.starts_with("proven-"))
+        .filter_map(|record| {
+            let left_node = left_locations.get(&(record.left.file.as_str(), record.left.kind.as_str(), record.left.start, record.left.end))?;
+            let right_node = right_locations.get(&(record.right.file.as_str(), record.right.kind.as_str(), record.right.start, record.right.end))?;
+            (matches!(left_node.kind.as_str(), "Function" | "Class") && matches!(right_node.kind.as_str(), "Function" | "Class"))
+                .then(|| (left_node.id.clone(), right_node.id.clone()))
+        }).collect::<HashSet<_>>();
     for record in matches {
         if identical_location(&record.right) {
             unit_dispositions.insert(
@@ -1033,10 +1058,21 @@ pub(crate) fn write_llm_context(
             );
             continue;
         }
-        if matches!(
+        let proven_fingerprint = matches!(
             record.confidence,
             "proven-structure" | "proven-bundle-normalized"
-        ) {
+        );
+        let owner_pair_verified = !matches!(record.left.kind.as_str(), "Function" | "Class")
+            || match (
+                left_locations.get(&(record.left.file.as_str(), record.left.kind.as_str(), record.left.start, record.left.end)),
+                right_locations.get(&(record.right.file.as_str(), record.right.kind.as_str(), record.right.start, record.right.end)),
+            ) {
+                (Some(left_node), Some(right_node)) => super::owner_context_is_proven(
+                    left_node, right_node, &left_nodes, &right_nodes, &left_parents, &right_parents, &owner_pairs,
+                ),
+                _ => false,
+            };
+        if proven_fingerprint && owner_pair_verified {
             unit_dispositions.insert(
                 record.right.id.clone(),
                 UnitDisposition {
@@ -1049,17 +1085,23 @@ pub(crate) fn write_llm_context(
         }
         let local = vec![location_value(&record.left)];
         let upstream = vec![location_value(&record.right)];
-        let (priority, confidence) = candidate_owner_triage(record);
+        let (priority, confidence) = if proven_fingerprint {
+            ("P2", "weak-candidate")
+        } else {
+            candidate_owner_triage(record)
+        };
         let id = push_work_item(
             &mut work_items,
             WorkItemDraft {
                 action: "reconcile-changed-owner",
                 priority,
                 confidence,
-                reason: format!(
+                reason: if proven_fingerprint {
+                    "The owner fingerprint matches, but graph correspondence is not established; inspect before treating it as covered.".to_string()
+                } else { format!(
                     "The best owner correspondence is {}, but normalized structure is not proven equal (basis {}, score {:.4}).",
                     record.status, record.basis, record.score
-                ),
+                ) },
                local: local.clone(),
                 upstream,
                 evidence_path: Vec::new(),
@@ -1076,6 +1118,7 @@ pub(crate) fn write_llm_context(
         );
     }
 
+    drop((left_nodes, right_nodes, left_locations, right_locations, left_parents, right_parents, owner_pairs));
     for group in ambiguous {
         if group.right.iter().all(identical_location) {
             continue;
@@ -1827,7 +1870,7 @@ pub(crate) fn write_llm_context(
         .map(|node| node.id.as_str())
         .collect::<HashSet<_>>();
     let context_needs_work = |node: &GraphNode| {
-        if identical_files.contains(node.file.as_str()) {
+        if node.kind == "File" || identical_files.contains(node.file.as_str()) {
             return false;
         }
         if executable_ids.contains(node.id.as_str()) {
@@ -2042,7 +2085,7 @@ pub(crate) fn write_llm_context(
         })
         .collect::<Vec<_>>();
     compact_work_evidence(output, &mut work_items, shared_work_evidence)?;
-    write_json_lines(&output.join("llm-work-items.jsonl"), &work_items)?;
+    let work_items_sha256 = write_json_lines(&output.join("llm-work-items.jsonl"), &work_items)?;
     write_json_lines(&output.join("llm-batches.jsonl"), &batches)?;
     // Publication is sequential. Once the indexed queue is on disk, the
     // semantic ledgers only need its counts and per-node routing maps, not
@@ -2245,6 +2288,9 @@ pub(crate) fn write_llm_context(
     let manifest = json!({
         "schema": "project-parity/llm-manifest-v3",
         "engine": super::ENGINE_VERSION,
+        "engineArtifact": {
+            "executableSha256": engine_executable_sha256,
+        },
         "orientation": "upstream-led",
         "authoritativeTarget": right.corpus.source_root.as_deref().unwrap_or(&right.root),
         "analysisProjection": right.root,
@@ -2272,6 +2318,10 @@ pub(crate) fn write_llm_context(
             })),
         },
         "summary": summary,
+        "workItemsIntegrity": {
+            "sha256": work_items_sha256,
+            "records": work_item_count,
+        },
         "artifacts": {
             "report": "report.json",
             "visualReport": "report.html",
@@ -2365,11 +2415,52 @@ mod tests {
         compact_work_evidence, expand_work_evidence, frontier_identity_override, frontier_triage, frontier_work_action,
         push_work_item, push_work_item_with_identity_action, read_shared_work_evidence,
         same_file_identity, should_defer_structural_frontier, unlinked_upstream_triage,
-        work_item_id, WorkItemDraft,
+        work_item_id, owner_context_needs_work, WorkItemDraft,
         write_json_lines,
     };
-    use crate::{FileRecord, Location, MatchRecord};
+    use crate::{run, FileRecord, Location, MatchRecord};
     use serde_json::json;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn covered_or_already_routed_owner_does_not_create_duplicate_context_work() {
+        assert!(!owner_context_needs_work("structurally-equal", false));
+        assert!(!owner_context_needs_work("candidate", true));
+        assert!(owner_context_needs_work("candidate", false));
+        assert!(owner_context_needs_work("unknown", false));
+    }
+
+    #[test]
+    fn file_container_does_not_create_context_work_for_comment_only_change() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::create_dir_all(left.path().join("src")).unwrap();
+        fs::create_dir_all(right.path().join("src")).unwrap();
+        fs::write(
+            left.path().join("src/runtime.ts"),
+            "function render() { return 42; }\n// local-only comment\n",
+        )
+        .unwrap();
+        fs::write(
+            right.path().join("src/runtime.ts"),
+            "function render() { return 42; }\n",
+        )
+        .unwrap();
+
+        let summary = run(left.path(), right.path(), output.path()).unwrap();
+        assert_eq!(summary.alpha_equal, 1);
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(!work.iter().any(|item| {
+            item["action"] == "inspect-unresolved-upstream-graph-context"
+                && item["semanticOwner"]["kind"] == "File"
+        }));
+    }
 
     #[test]
     fn frontier_identity_override_only_applies_to_structural_routing() {
