@@ -87,8 +87,16 @@ threshold. The command validates every ID before writing any decision and
 preserves each payload snapshot, so a later sync reopens only changed evidence.
 During an active `pending_sync` checkpoint, local source edits do not invalidate
 the last synced queue snapshot; continue reviewing that snapshot until the
-checkpoint. Upstream and dependency inputs must stay unchanged. If the report
-itself is regenerated or the engine changes, sync it before requesting more IDs.
+checkpoint. Upstream inputs must stay unchanged. A historical v79 manifest
+without executable and work-item integrity receipts may also be read from its
+already-synced database snapshot during that checkpoint; this does not permit
+syncing that report. If the report itself is regenerated or the engine changes,
+sync it before requesting more IDs.
+Queue reads validate the pinned engine and roots and enforce upstream
+fingerprints; active-checkpoint rules govern local and historical dependency
+fingerprints. The exact executable receipt and work-item integrity digest are
+required when a report is consumed by `sync`, not when reading decisions
+already stored in the database.
 
 Queue reads default to 100 items. The normal routing form avoids sending full
 evidence before the relevant shared batch is selected. Use `--summary` only when
