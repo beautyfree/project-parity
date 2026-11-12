@@ -700,6 +700,7 @@ fn sync_locked(db_path: &Path, report: &Path, roots: &RootIdentity) -> Result<Va
     ensure_queue_index(&conn, "work_items_queue_phase_confidence", true, false)?;
     ensure_batch_schema(&conn)?;
     ensure_decision_schema(&conn)?;
+    ensure_run_receipt_schema(&conn)?;
     conn.execute_batch("CREATE TEMP TABLE previous_seen (id TEXT PRIMARY KEY); INSERT INTO previous_seen SELECT id FROM work_items WHERE resolved_at IS NULL; CREATE TEMP TABLE previous_unresolved (id TEXT PRIMARY KEY); INSERT INTO previous_unresolved SELECT w.id FROM work_items w LEFT JOIN work_item_decisions d ON d.work_item_id=w.id WHERE w.resolved_at IS NULL AND d.work_item_id IS NULL;")?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS work_item_decision_history (id INTEGER PRIMARY KEY, work_item_id TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL, decided_at TEXT NOT NULL, payload TEXT, reopened_run_id INTEGER NOT NULL, reopened_payload TEXT NOT NULL, FOREIGN KEY(work_item_id) REFERENCES work_items(id), FOREIGN KEY(reopened_run_id) REFERENCES runs(id));")?;
     // Older ledgers contain decision snapshots and require an event column.
@@ -711,12 +712,20 @@ fn sync_locked(db_path: &Path, report: &Path, roots: &RootIdentity) -> Result<Va
         }
     }
     let history_has_event: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('work_item_decision_history') WHERE name='event')", [], |row| row.get(0))?;
+    let engine_sha256 = manifest["engineArtifact"]["executableSha256"].as_str();
+    let dependency_hash = manifest["inputHashes"]["dependencies"].as_str();
+    let work_items_sha256 = manifest["workItemsIntegrity"]["sha256"].as_str();
+    let work_items_count = manifest["workItemsIntegrity"]["records"].as_i64();
     conn.execute(
-        "INSERT INTO runs(report, upstream_hash, local_hash) VALUES (?1,?2,?3)",
+        "INSERT INTO runs(report, upstream_hash, local_hash, engine_sha256, dependency_hash, work_items_sha256, work_items_count) VALUES (?1,?2,?3,?4,?5,?6,?7)",
         params![
             report.to_string_lossy(),
             incoming.upstream_hash,
             incoming.local_hash,
+            engine_sha256,
+            dependency_hash,
+            work_items_sha256,
+            work_items_count,
         ],
     )?;
     let run_id = conn.last_insert_rowid();
@@ -1718,6 +1727,25 @@ fn ensure_decision_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_run_receipt_schema(conn: &Connection) -> Result<()> {
+    for (name, column_type) in [
+        ("engine_sha256", "TEXT"),
+        ("dependency_hash", "TEXT"),
+        ("work_items_sha256", "TEXT"),
+        ("work_items_count", "INTEGER"),
+    ] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('runs') WHERE name=?1)",
+            params![name],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            conn.execute_batch(&format!("ALTER TABLE runs ADD COLUMN {name} {column_type}"))?;
+        }
+    }
+    Ok(())
+}
+
 pub fn stats(db_path: &Path) -> Result<Value> {
     let conn = Connection::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
     let (active, skipped, pending_sync, done, resolved, deferred): (i64, i64, i64, i64, i64, i64) = conn.query_row(
@@ -1758,9 +1786,34 @@ pub fn stats(db_path: &Path) -> Result<Value> {
 
 pub fn runs(db_path: &Path, limit: usize) -> Result<Value> {
     let conn = Connection::open(db_path)?;
-    let mut stmt = conn.prepare(
-        "SELECT id, report, upstream_hash, local_hash, synced_at FROM runs ORDER BY id DESC LIMIT ?1",
-    )?;
+    let has_receipt_column = |name: &str| -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('runs') WHERE name=?1)",
+            params![name],
+            |row| row.get(0),
+        )?)
+    };
+    let optional_column = |name: &str| -> Result<&'static str> {
+        Ok(if has_receipt_column(name)? {
+            match name {
+                "engine_sha256" => "engine_sha256",
+                "dependency_hash" => "dependency_hash",
+                "work_items_sha256" => "work_items_sha256",
+                "work_items_count" => "work_items_count",
+                _ => bail!("unsupported run receipt column: {name}"),
+            }
+        } else {
+            "NULL"
+        })
+    };
+    let sql = format!(
+        "SELECT id, report, upstream_hash, local_hash, synced_at, {}, {}, {}, {} FROM runs ORDER BY id DESC LIMIT ?1",
+        optional_column("engine_sha256")?,
+        optional_column("dependency_hash")?,
+        optional_column("work_items_sha256")?,
+        optional_column("work_items_count")?,
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(params![limit as i64], |row| {
             Ok(serde_json::json!({
@@ -1769,6 +1822,10 @@ pub fn runs(db_path: &Path, limit: usize) -> Result<Value> {
                 "upstreamHash": row.get::<_, Option<String>>(2)?,
                 "localHash": row.get::<_, Option<String>>(3)?,
                 "syncedAt": row.get::<_, String>(4)?,
+                "engineSha256": row.get::<_, Option<String>>(5)?,
+                "dependencyHash": row.get::<_, Option<String>>(6)?,
+                "workItemsSha256": row.get::<_, Option<String>>(7)?,
+                "workItemsCount": row.get::<_, Option<i64>>(8)?,
             }))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1987,6 +2044,28 @@ mod tests {
             rows.extend(values.map(|value| (table.to_owned(), value.unwrap())));
         }
         rows
+    }
+
+    #[test]
+    fn run_receipts_upgrade_legacy_rows_and_remain_queryable() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("state.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE runs (id INTEGER PRIMARY KEY, report TEXT NOT NULL, upstream_hash TEXT, local_hash TEXT, synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP); INSERT INTO runs(report,upstream_hash,local_hash) VALUES ('legacy','u','l');").unwrap();
+
+        let before = runs(&db, 1).unwrap();
+        assert!(before["runs"][0]["engineSha256"].is_null());
+        ensure_run_receipt_schema(&conn).unwrap();
+        conn.execute(
+            "UPDATE runs SET engine_sha256=?1, dependency_hash=?2, work_items_sha256=?3, work_items_count=?4 WHERE id=1",
+            params!["engine", "dependencies", "items", 12],
+        ).unwrap();
+
+        let after = runs(&db, 1).unwrap();
+        assert_eq!(after["runs"][0]["engineSha256"], "engine");
+        assert_eq!(after["runs"][0]["dependencyHash"], "dependencies");
+        assert_eq!(after["runs"][0]["workItemsSha256"], "items");
+        assert_eq!(after["runs"][0]["workItemsCount"], 12);
     }
 
     #[test]

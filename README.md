@@ -194,6 +194,11 @@ refuses reports without a valid executable fingerprint. It also records
 `workItemsIntegrity` with the exact JSONL record count and SHA-256. State sync
 checks both while reading the queue and rolls back the run if the artifact is
 truncated or altered, so missing rows cannot silently resolve earlier work.
+Each synchronized run also stores those executable and work-item hashes, the
+dependency input hash, and the work-item count in SQLite; `state-runs` exposes
+these receipts so later queue changes can be attributed to a specific input,
+analyzer build, or work-item set. Older runs return `null` for receipts that
+were not recorded at the time.
 
 Group candidates require every member to explain additional target feature
 counts and score better together than the best individual member. Repeated
