@@ -690,7 +690,7 @@ fn sync_locked(db_path: &Path, report: &Path, roots: &RootIdentity) -> Result<Va
     ensure_queue_index(&conn, "work_items_queue_phase_confidence", true, false)?;
     ensure_batch_schema(&conn)?;
     ensure_decision_schema(&conn)?;
-    conn.execute_batch("CREATE TEMP TABLE previous_unresolved (id TEXT PRIMARY KEY); INSERT INTO previous_unresolved SELECT w.id FROM work_items w LEFT JOIN work_item_decisions d ON d.work_item_id=w.id WHERE w.resolved_at IS NULL AND d.work_item_id IS NULL;")?;
+    conn.execute_batch("CREATE TEMP TABLE previous_seen (id TEXT PRIMARY KEY); INSERT INTO previous_seen SELECT id FROM work_items WHERE resolved_at IS NULL; CREATE TEMP TABLE previous_unresolved (id TEXT PRIMARY KEY); INSERT INTO previous_unresolved SELECT w.id FROM work_items w LEFT JOIN work_item_decisions d ON d.work_item_id=w.id WHERE w.resolved_at IS NULL AND d.work_item_id IS NULL;")?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS work_item_decision_history (id INTEGER PRIMARY KEY, work_item_id TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL, decided_at TEXT NOT NULL, payload TEXT, reopened_run_id INTEGER NOT NULL, reopened_payload TEXT NOT NULL, FOREIGN KEY(work_item_id) REFERENCES work_items(id), FOREIGN KEY(reopened_run_id) REFERENCES runs(id));")?;
     // Older ledgers contain decision snapshots and require an event column.
     for column in ["reopened_run_id INTEGER", "reopened_payload TEXT"] {
@@ -790,13 +790,13 @@ fn sync_locked(db_path: &Path, report: &Path, roots: &RootIdentity) -> Result<Va
         }
     }
     let reopened: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM work_item_decisions d JOIN work_items w ON w.id=d.work_item_id WHERE w.run_id=?1 AND w.resolved_at IS NULL AND d.payload IS NOT NULL AND w.payload <> d.payload",
+        "SELECT COUNT(*) FROM work_item_decisions d JOIN work_items w ON w.id=d.work_item_id WHERE w.run_id=?1 AND w.resolved_at IS NULL AND (d.payload IS NULL OR w.payload <> d.payload)",
         params![run_id],
         |row| row.get(0),
     )?;
     let (event_column, event_value) = if history_has_event { (",event", ",'snapshot'") } else { ("", "") };
-    tx.execute(&format!("INSERT INTO work_item_decision_history(work_item_id,status,reason,decided_at,payload,reopened_run_id,reopened_payload{event_column}) SELECT d.work_item_id,d.status,d.reason,d.decided_at,d.payload,?1,w.payload{event_value} FROM work_item_decisions d JOIN work_items w ON w.id=d.work_item_id WHERE w.run_id=?1 AND w.resolved_at IS NULL AND d.payload IS NOT NULL AND w.payload <> d.payload"), params![run_id])?;
-    conn.execute("DELETE FROM work_item_decisions WHERE payload IS NOT NULL AND EXISTS (SELECT 1 FROM work_items w WHERE w.id=work_item_decisions.work_item_id AND w.run_id=?1 AND w.resolved_at IS NULL AND w.payload <> work_item_decisions.payload)", params![run_id])?;
+    tx.execute(&format!("INSERT INTO work_item_decision_history(work_item_id,status,reason,decided_at,payload,reopened_run_id,reopened_payload{event_column}) SELECT d.work_item_id,d.status,d.reason,d.decided_at,d.payload,?1,w.payload{event_value} FROM work_item_decisions d JOIN work_items w ON w.id=d.work_item_id WHERE w.run_id=?1 AND w.resolved_at IS NULL AND (d.payload IS NULL OR w.payload <> d.payload)"), params![run_id])?;
+    conn.execute("DELETE FROM work_item_decisions WHERE EXISTS (SELECT 1 FROM work_items w WHERE w.id=work_item_decisions.work_item_id AND w.run_id=?1 AND w.resolved_at IS NULL AND (work_item_decisions.payload IS NULL OR w.payload <> work_item_decisions.payload))", params![run_id])?;
     // A reviewed item becomes durable only when the fresh report still has
     // the exact payload that was reviewed. Payload changes were cleared above,
     // so a changed item is reopened for fresh evidence review.
@@ -810,7 +810,7 @@ fn sync_locked(db_path: &Path, report: &Path, roots: &RootIdentity) -> Result<Va
         |row| row.get(0),
     )?;
     let new_items: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM work_items w LEFT JOIN work_item_decisions d ON d.work_item_id=w.id LEFT JOIN previous_unresolved p ON p.id=w.id WHERE w.resolved_at IS NULL AND d.work_item_id IS NULL AND p.id IS NULL",
+        "SELECT COUNT(*) FROM work_items w LEFT JOIN work_item_decisions d ON d.work_item_id=w.id LEFT JOIN previous_seen p ON p.id=w.id WHERE w.resolved_at IS NULL AND d.work_item_id IS NULL AND p.id IS NULL",
         [], |row| row.get(0),
     )?;
     let resolved: i64 = tx.query_row(
@@ -2086,6 +2086,7 @@ mod tests {
             "engineArtifact":{"executableSha256":crate::sha256_file(&std::env::current_exe().unwrap()).unwrap()},
             "localRoot":local,
             "analysisProjection":upstream,
+            "inputHashes":{"local":"l","upstream":"u"},
             "workItemsIntegrity":{
                 "sha256":crate::sha256(work_items),
                 "records":record_count,
@@ -3334,6 +3335,75 @@ mod tests {
         assert_eq!(sync(&db, root.path()).unwrap()["reopened"], 1);
         let rows: Vec<(String, String, Option<i64>)> = conn.prepare("SELECT event,reason,reopened_run_id FROM work_item_decision_history ORDER BY id").unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         assert_eq!(rows, vec![("decision".into(), "old history".into(), None), ("snapshot".into(), "reviewed".into(), Some(2))]);
+    }
+
+    #[test]
+    fn sync_reopens_legacy_decisions_without_payload_evidence() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("state.sqlite");
+        report(root.path(), &["done", "skipped"]);
+        sync(&db, root.path()).unwrap();
+        mark_pending_sync(&db, "done", "reviewed before payload snapshots").unwrap();
+        sync(&db, root.path()).unwrap();
+        skip(&db, "skipped", "verified before payload snapshots").unwrap();
+
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE work_item_decisions SET payload=NULL WHERE work_item_id IN ('done','skipped')",
+            [],
+        )
+        .unwrap();
+
+        let result = sync(&db, root.path()).unwrap();
+        assert_eq!(result["new"], 0);
+        assert_eq!(result["reopened"], 2);
+        assert_eq!(stats(&db).unwrap()["active"], 2);
+        assert_eq!(next(&db, 10).unwrap()["count"], 2);
+        let decisions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM work_item_decisions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(decisions, 0);
+
+        let history: Vec<(String, String, Option<String>, String)> = conn
+            .prepare(
+                "SELECT h.status,h.reason,h.payload,h.reopened_payload FROM work_item_decision_history h WHERE h.reopened_run_id=(SELECT MAX(id) FROM runs) ORDER BY h.work_item_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            history,
+            vec![
+                (
+                    "done".into(),
+                    "reviewed before payload snapshots".into(),
+                    None,
+                    conn.query_row(
+                        "SELECT payload FROM work_items WHERE id='done'",
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "skipped".into(),
+                    "verified before payload snapshots".into(),
+                    None,
+                    conn.query_row(
+                        "SELECT payload FROM work_items WHERE id='skipped'",
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                ),
+            ]
+        );
     }
 
     #[test]
