@@ -1922,6 +1922,26 @@ pub(crate) fn write_llm_context(
         }
     }
 
+    // Non-executable graph nodes (for example CallSite) inherit the route of
+    // their containing executable unit, including roots routed as unlinked.
+    let mut routed_unit_dispositions = HashMap::<String, UnitDisposition>::new();
+    for node in &right_nodes {
+        let Some(unit) = unit_for_node(node, &units_by_file) else {
+            continue;
+        };
+        let Some((status, confidence, Some(work_item_id))) = node_status.get(&node.id) else {
+            continue;
+        };
+        routed_unit_dispositions.insert(
+            unit.id.clone(),
+            UnitDisposition {
+                status,
+                confidence,
+                work_item_id: Some(work_item_id.clone()),
+            },
+        );
+    }
+
     // The executable ledger drives code-change work. The semantic ledger below
     // additionally retains every graph node (module, binding, scope, file,
     // external and statement) in a compact compressed form. Nodes that have no
@@ -1940,11 +1960,18 @@ pub(crate) fn write_llm_context(
             return false;
         }
         if let Some(unit) = containing_unit(node, &units_by_file) {
-            if let Some(disposition) = unit_dispositions.get(&unit.id) {
+            if let Some(disposition) = context_unit_disposition(
+                &unit.id,
+                &unit_dispositions,
+                &routed_unit_dispositions,
+            ) {
                 // A child is covered only by an actual structural proof. A
                 // candidate may inherit its owner's work route, but is never
                 // silently classified as covered graph context.
-                return owner_context_needs_work(disposition.status, disposition.work_item_id.is_some());
+                return owner_context_needs_work(
+                    disposition.status,
+                    disposition.work_item_id.is_some(),
+                );
             }
         }
         let mut cursor = node.id.as_str();
@@ -2191,7 +2218,7 @@ pub(crate) fn write_llm_context(
         let (status, confidence, work_item_id) = if let Some(status) = node_status.get(&node.id) {
             status.clone()
         } else if let Some(unit) = containing_unit(&node, &units_by_file) {
-            match unit_dispositions.get(&unit.id) {
+            match context_unit_disposition(&unit.id, &unit_dispositions, &routed_unit_dispositions) {
                 Some(disposition) if disposition.status == "structurally-equal" => {
                     ("structurally-equal", disposition.confidence, None)
                 }
@@ -2242,8 +2269,13 @@ pub(crate) fn write_llm_context(
         {
             status.clone()
         } else if let Some(source) = node_by_id.get(edge.source.as_str()) {
-            match containing_unit(source, &units_by_file)
-                .and_then(|unit| unit_dispositions.get(&unit.id))
+            match containing_unit(source, &units_by_file).and_then(|unit| {
+                context_unit_disposition(
+                    &unit.id,
+                    &unit_dispositions,
+                    &routed_unit_dispositions,
+                )
+            })
             {
                 Some(disposition) if disposition.status == "structurally-equal" => {
                     ("structurally-equal", disposition.confidence, None)
@@ -2474,6 +2506,16 @@ fn owner_context_needs_work(status: &str, has_work_route: bool) -> bool {
     status != "structurally-equal" && !has_work_route
 }
 
+fn context_unit_disposition<'a>(
+    unit_id: &str,
+    unit_dispositions: &'a HashMap<String, UnitDisposition>,
+    routed_unit_dispositions: &'a HashMap<String, UnitDisposition>,
+) -> Option<&'a UnitDisposition> {
+    routed_unit_dispositions
+        .get(unit_id)
+        .or_else(|| unit_dispositions.get(unit_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2526,6 +2568,52 @@ mod tests {
             item["action"] == "inspect-unresolved-upstream-graph-context"
                 && item["semanticOwner"]["kind"] == "File"
         }));
+    }
+
+    #[test]
+    fn callsite_context_inherits_unlinked_executable_owner_route() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::create_dir_all(left.path()).unwrap();
+        fs::write(
+            right.path().join("chunk.js"),
+            "function upstreamOnly() { return sideEffect(); }",
+        )
+        .unwrap();
+
+        run(left.path(), right.path(), output.path()).unwrap();
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let owner_work = work
+            .iter()
+            .find(|item| item["action"] == "locate-unlinked-upstream-branch")
+            .expect("the uncovered executable owner remains actionable");
+        assert!(!work.iter().any(|item| {
+            item["action"] == "inspect-unresolved-upstream-graph-context"
+                && item["upstream"]
+                    .as_array()
+                    .is_some_and(|nodes| nodes.iter().any(|node| node["kind"] == "File"))
+        }));
+
+        let ledger = zstd::stream::decode_all(
+            fs::File::open(output.path().join("upstream-semantic-ledger.jsonl.zst")).unwrap(),
+        )
+        .unwrap();
+        let semantic_nodes = String::from_utf8(ledger)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let callsite = semantic_nodes
+            .iter()
+            .find(|node| node["kind"] == "CallSite")
+            .expect("the function call remains represented in the semantic ledger");
+        assert_eq!(callsite["disposition"], "inherited-owner-work");
+        assert_eq!(callsite["workItemId"], owner_work["id"]);
     }
 
     #[test]
