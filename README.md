@@ -219,10 +219,13 @@ items from repeated or context-only nodes.
 `state-sync` pins both input hashes in SQLite. After a local patch, run `sync`
 against the same two roots. An item is resolved only when
 its stable id disappears or its disposition is explicitly covered by fresh
-evidence.
+evidence. If a resolved item later returns with evidence identical to a
+previously reviewed payload, sync restores that decision from history. Changed
+evidence still reopens the item; the sync result reports restored decisions.
 
-The sync result counts queue entries that appeared (`new`) and disappeared
-(`resolved`) independently, so both can be nonzero in the same run. `new`
+The sync result counts queue entries that appeared (`new`), disappeared
+(`resolved`), or were restored from matching decision history independently,
+so all can be nonzero in the same run. `new`
 includes reviewed items reopened after their evidence changed; `reopened`
 reports that subset. Before reopening, sync preserves the prior decision and
 both evidence snapshots in SQLite's `work_item_decision_history` table.

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     io::{BufRead, BufReader, Cursor},
     path::{Path, PathBuf},
@@ -558,6 +558,16 @@ fn routing_reclassification_preserves_evidence(previous: &str, current: &str) ->
     previous == current
 }
 
+fn review_evidence_matches(previous: &str, current: &str) -> bool {
+    let (Ok(previous_value), Ok(current_value)) = (
+        serde_json::from_str::<Value>(previous),
+        serde_json::from_str::<Value>(current),
+    ) else {
+        return false;
+    };
+    previous_value == current_value || routing_reclassification_preserves_evidence(previous, current)
+}
+
 fn ensure_queue_index(conn: &Connection, name: &str, confidence: bool, batch: bool) -> Result<()> {
     let mut ordering = "CASE WHEN action='remove-or-justify-extra-local' THEN 4 WHEN action='locate-unlinked-upstream-branch' THEN 5 WHEN action='inspect-structural-frontier' THEN 6 WHEN priority='P0' THEN 0 WHEN priority='P1' THEN 1 ELSE 2 END".to_string();
     if confidence {
@@ -782,7 +792,7 @@ fn sync_locked(db_path: &Path, report: &Path, roots: &RootIdentity) -> Result<Va
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     for (id, previous, current) in reclassified {
-        if routing_reclassification_preserves_evidence(&previous, &current) {
+        if review_evidence_matches(&previous, &current) {
             tx.execute(
                 "UPDATE work_item_decisions SET payload=?2 WHERE work_item_id=?1",
                 params![id, current],
@@ -797,6 +807,44 @@ fn sync_locked(db_path: &Path, report: &Path, roots: &RootIdentity) -> Result<Va
     let (event_column, event_value) = if history_has_event { (",event", ",'snapshot'") } else { ("", "") };
     tx.execute(&format!("INSERT INTO work_item_decision_history(work_item_id,status,reason,decided_at,payload,reopened_run_id,reopened_payload{event_column}) SELECT d.work_item_id,d.status,d.reason,d.decided_at,d.payload,?1,w.payload{event_value} FROM work_item_decisions d JOIN work_items w ON w.id=d.work_item_id WHERE w.run_id=?1 AND w.resolved_at IS NULL AND (d.payload IS NULL OR w.payload <> d.payload)"), params![run_id])?;
     conn.execute("DELETE FROM work_item_decisions WHERE EXISTS (SELECT 1 FROM work_items w WHERE w.id=work_item_decisions.work_item_id AND w.run_id=?1 AND w.resolved_at IS NULL AND (work_item_decisions.payload IS NULL OR w.payload <> work_item_decisions.payload))", params![run_id])?;
+    let mut active_decisions = {
+        let mut stmt = tx.prepare(
+            "SELECT d.work_item_id FROM work_item_decisions d JOIN work_items w ON w.id=d.work_item_id WHERE w.run_id=?1 AND w.resolved_at IS NULL",
+        )?;
+        let rows = stmt.query_map(params![run_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<HashSet<_>>>()?
+    };
+    let historical_decisions = {
+        let mut stmt = tx.prepare(
+            "SELECT h.work_item_id,h.status,h.reason,h.decided_at,h.payload,w.payload FROM work_item_decision_history h JOIN work_items w ON w.id=h.work_item_id WHERE w.run_id=?1 AND w.resolved_at IS NULL AND h.payload IS NOT NULL ORDER BY h.id DESC",
+        )?;
+        let rows = stmt.query_map(params![run_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut restored = 0;
+    for (id, status, reason, decided_at, previous, current) in historical_decisions {
+        if active_decisions.contains(&id)
+            || !matches!(status.as_str(), "done" | "skipped" | "pending_sync")
+            || !review_evidence_matches(&previous, &current)
+        {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO work_item_decisions(work_item_id,status,reason,decided_at,payload) VALUES (?1,?2,?3,?4,?5)",
+            params![id, status, reason, decided_at, current],
+        )?;
+        active_decisions.insert(id);
+        restored += 1;
+    }
     // A reviewed item becomes durable only when the fresh report still has
     // the exact payload that was reviewed. Payload changes were cleared above,
     // so a changed item is reopened for fresh evidence review.
@@ -819,7 +867,7 @@ fn sync_locked(db_path: &Path, report: &Path, roots: &RootIdentity) -> Result<Va
     )?;
     tx.commit()?;
     Ok(
-        serde_json::json!({"schema":"project-parity/state-sync-v1","runId":run_id,"workItems":seen,"new":new_items,"resolved":resolved,"reopened":reopened,"pendingReleased":pending_released,"remaining":remaining,"db":db_path}),
+        serde_json::json!({"schema":"project-parity/state-sync-v1","runId":run_id,"workItems":seen,"new":new_items,"resolved":resolved,"reopened":reopened,"restored":restored,"pendingReleased":pending_released,"remaining":remaining,"db":db_path}),
     )
 }
 
@@ -1890,6 +1938,12 @@ mod tests {
             .map(|id| format!(r#"{{"id":"{id}","priority":"P1","action":"inspect"}}"#))
             .collect::<Vec<_>>()
             .join("\n");
+        fs::write(dir.join("llm-work-items.jsonl"), format!("{body}\n")).unwrap();
+    }
+
+    fn report_items(dir: &Path, items: &[Value]) {
+        fs::write(dir.join("llm-manifest.json"), test_manifest(dir)).unwrap();
+        let body = items.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
         fs::write(dir.join("llm-work-items.jsonl"), format!("{body}\n")).unwrap();
     }
 
@@ -3320,6 +3374,37 @@ mod tests {
         assert_eq!(archived.0, "pending_sync");
         assert_eq!(archived.1, "reviewed");
         assert!(archived.2.contains("\"id\":\"a\""));
+    }
+
+    #[test]
+    fn sync_restores_reviewed_decisions_when_identical_evidence_returns() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("state.sqlite");
+        let original = vec![
+            serde_json::json!({"id":"done","priority":"P1","action":"inspect"}),
+            serde_json::json!({"id":"skipped","priority":"P1","action":"inspect"}),
+        ];
+        report_items(root.path(), &original);
+        sync(&db, root.path()).unwrap();
+        mark_pending_sync(&db, "done", "reviewed source and callers").unwrap();
+        sync(&db, root.path()).unwrap();
+        skip(&db, "skipped", "confirmed local-only helper").unwrap();
+
+        report_items(root.path(), &[
+            serde_json::json!({"id":"done","priority":"P0","action":"changed"}),
+            serde_json::json!({"id":"skipped","priority":"P0","action":"changed"}),
+        ]);
+        assert_eq!(sync(&db, root.path()).unwrap()["reopened"], 2);
+        report_items(root.path(), &[]);
+        sync(&db, root.path()).unwrap();
+        report_items(root.path(), &original);
+
+        let result = sync(&db, root.path()).unwrap();
+        assert_eq!(result["restored"], 2);
+        assert_eq!(result["new"], 0);
+        assert_eq!(stats(&db).unwrap()["active"], 0);
+        assert_eq!(stats(&db).unwrap()["done"], 1);
+        assert_eq!(stats(&db).unwrap()["skipped"], 1);
     }
 
     #[test]
