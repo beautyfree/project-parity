@@ -542,6 +542,13 @@ fn routing_reclassification_preserves_evidence(previous: &str, current: &str) ->
                 for key in ["action", "priority", "confidence", "reason", "batchId"] {
                     object.remove(key);
                 }
+            } else if same_action {
+                // Priority and rationale are analyzer triage metadata. A new
+                // classification must not reopen a human decision when the
+                // action and all source evidence remain identical.
+                for key in ["priority", "confidence", "reason"] {
+                    object.remove(key);
+                }
             }
             if legacy_variant_migration {
                 if let Some(variants) = object.get_mut("evidenceVariants").and_then(Value::as_array_mut) {
@@ -3769,6 +3776,41 @@ mod tests {
             format!("{}\n", changed),
         )
         .unwrap();
+        let result = sync(&db, root.path()).unwrap();
+        assert_eq!(result["reopened"], 1);
+        assert_eq!(next(&db, 10).unwrap()["count"], 1);
+    }
+
+    #[test]
+    fn same_action_triage_reclassification_preserves_decision_but_changed_evidence_reopens() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("state.sqlite");
+        let mut item = serde_json::json!({
+            "id":"work:stable-owner",
+            "action":"reconcile-changed-branch",
+            "priority":"P2",
+            "confidence":"weak-candidate",
+            "reason":"The owner fingerprint matches, but graph correspondence is not established.",
+            "local":[{"id":"left:owner","file":"src/local.ts","line":10}],
+            "upstream":[{"id":"right:owner","file":"dist/chunk.js","line":20}],
+            "evidencePath":[{"basis":"owner-fingerprint"}],
+            "inspectNodeIds":["left:owner","right:owner"]
+        });
+        report_items(root.path(), &[item.clone()]);
+        sync(&db, root.path()).unwrap();
+        mark_pending_sync(&db, "work:stable-owner", "Reviewed against source").unwrap();
+
+        item["priority"] = serde_json::json!("P1");
+        item["confidence"] = serde_json::json!("candidate");
+        item["reason"] = serde_json::json!("The best owner correspondence is changed-candidate.");
+        report_items(root.path(), &[item.clone()]);
+        let result = sync(&db, root.path()).unwrap();
+        assert_eq!(result["reopened"], 0);
+        assert_eq!(result["pendingReleased"], 1);
+        assert_eq!(stats(&db).unwrap()["done"], 1);
+
+        item["upstream"][0]["id"] = serde_json::json!("right:other-owner");
+        report_items(root.path(), &[item]);
         let result = sync(&db, root.path()).unwrap();
         assert_eq!(result["reopened"], 1);
         assert_eq!(next(&db, 10).unwrap()["count"], 1);
