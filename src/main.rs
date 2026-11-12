@@ -6552,6 +6552,10 @@ impl BehaviorHashes {
     }
 }
 
+fn global_behavior_seeding_is_safe(left: &BehaviorHashes, right: &BehaviorHashes) -> bool {
+    left.converged && right.converged
+}
+
 fn graph_behavior_hashes(project: &ProjectIndex) -> BehaviorHashes {
     let mut hashes = project
         .graph_nodes
@@ -6865,6 +6869,8 @@ fn analyze_semantic_graph(
     let mut correspondence_conflicts = BTreeSet::<(String, String)>::new();
     let left_behavior_result = graph_behavior_hashes(left);
     let right_behavior_result = graph_behavior_hashes(right);
+    let allow_global_behavior_seeding =
+        global_behavior_seeding_is_safe(&left_behavior_result, &right_behavior_result);
     let left_behavior = left_behavior_result.hashes;
     let right_behavior = right_behavior_result.hashes;
     let mut matched_seeds = matches.iter().collect::<Vec<_>>();
@@ -6941,7 +6947,7 @@ fn analyze_semantic_graph(
     let mut left_groups = HashMap::<(&str, &str), Vec<&GraphNode>>::new();
     let mut right_groups = HashMap::<(&str, &str), Vec<&GraphNode>>::new();
     for node in &left.graph_nodes {
-        if !is_global_behavior_seed(node) {
+        if !allow_global_behavior_seeding || !is_global_behavior_seed(node) {
             continue;
         }
         left_groups
@@ -6956,7 +6962,7 @@ fn analyze_semantic_graph(
             .push(node);
     }
     for node in &right.graph_nodes {
-        if !is_global_behavior_seed(node) {
+        if !allow_global_behavior_seeding || !is_global_behavior_seed(node) {
             continue;
         }
         right_groups
@@ -11097,7 +11103,7 @@ mod tests {
     }
 
     #[test]
-    fn large_behavior_graph_uses_structural_seeds_without_edge_refinement() {
+    fn large_behavior_graph_does_not_use_unfinished_hashes_for_global_matching() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("entry.js"), "export function owner(x) { return x + 1; }").unwrap();
         let mut project = index_project(directory.path(), "right").unwrap();
@@ -11114,6 +11120,7 @@ mod tests {
         assert_eq!(hashes.iterations, 0);
         assert!(!hashes.converged);
         assert_eq!(hashes.hashes.len(), project.graph_nodes.len());
+        assert!(!global_behavior_seeding_is_safe(&hashes, &hashes));
         for node in &project.graph_nodes {
             assert_eq!(hashes.hashes.get(&node.id), Some(&sha256(format!("{}\0{}", node.kind, node.linked_sha256))));
         }
