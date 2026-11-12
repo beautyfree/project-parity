@@ -6556,6 +6556,15 @@ fn global_behavior_seeding_is_safe(left: &BehaviorHashes, right: &BehaviorHashes
     left.converged && right.converged
 }
 
+fn behavior_hashes_match(
+    left: &BehaviorHashes,
+    left_id: &str,
+    right: &BehaviorHashes,
+    right_id: &str,
+) -> bool {
+    global_behavior_seeding_is_safe(left, right) && left.get(left_id) == right.get(right_id)
+}
+
 fn graph_behavior_hashes(project: &ProjectIndex) -> BehaviorHashes {
     let mut hashes = project
         .graph_nodes
@@ -6871,8 +6880,8 @@ fn analyze_semantic_graph(
     let right_behavior_result = graph_behavior_hashes(right);
     let allow_global_behavior_seeding =
         global_behavior_seeding_is_safe(&left_behavior_result, &right_behavior_result);
-    let left_behavior = left_behavior_result.hashes;
-    let right_behavior = right_behavior_result.hashes;
+    let left_behavior = &left_behavior_result.hashes;
+    let right_behavior = &right_behavior_result.hashes;
     let mut matched_seeds = matches.iter().collect::<Vec<_>>();
     matched_seeds.sort_by(|left, right| {
         left.left
@@ -7327,9 +7336,12 @@ fn analyze_semantic_graph(
                 .filter_map(|right_edge| {
                     let right_parent = right_nodes.get(right_edge.source.as_str())?;
                     (left_parent.kind == right_parent.kind).then_some((
-                        if left_behavior.get(&left_parent.id)
-                            == right_behavior.get(&right_parent.id)
-                        {
+                        if behavior_hashes_match(
+                            &left_behavior_result,
+                            &left_parent.id,
+                            &right_behavior_result,
+                            &right_parent.id,
+                        ) {
                             1.0
                         } else {
                             graph_similarity(left_parent, right_parent)
@@ -11121,6 +11133,12 @@ mod tests {
         assert!(!hashes.converged);
         assert_eq!(hashes.hashes.len(), project.graph_nodes.len());
         assert!(!global_behavior_seeding_is_safe(&hashes, &hashes));
+        assert!(!behavior_hashes_match(
+            &hashes,
+            &project.graph_nodes[0].id,
+            &hashes,
+            &project.graph_nodes[0].id,
+        ));
         for node in &project.graph_nodes {
             assert_eq!(hashes.hashes.get(&node.id), Some(&sha256(format!("{}\0{}", node.kind, node.linked_sha256))));
         }
