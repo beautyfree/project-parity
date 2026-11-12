@@ -5432,6 +5432,111 @@ fn best_is_distinct(record: &Unmatched, ambiguous_owners: &HashSet<String>) -> b
     })
 }
 
+fn promote_mutual_best_candidates(
+    ranked_left: &[Unmatched],
+    ranked_right: &[Unmatched],
+    ambiguous_owners: &HashSet<String>,
+) -> Vec<MatchRecord> {
+    let left_ranked_by_id = ranked_left
+        .iter()
+        .map(|record| (record.location.id.as_str(), record))
+        .collect::<HashMap<_, _>>();
+    let mut promoted_left = HashSet::new();
+    let mut promoted_right = HashSet::new();
+    let mut matches = Vec::new();
+    for right_record in ranked_right {
+        if !best_is_distinct(right_record, ambiguous_owners) {
+            continue;
+        }
+        let best_left = &right_record.candidates[0];
+        let Some(left_record) = left_ranked_by_id.get(best_left.location.id.as_str()) else {
+            continue;
+        };
+        if !best_is_distinct(left_record, ambiguous_owners)
+            || left_record.candidates[0].location.id != right_record.location.id
+            || promoted_left.contains(&left_record.location.id)
+            || promoted_right.contains(&right_record.location.id)
+        {
+            continue;
+        }
+        promoted_left.insert(left_record.location.id.clone());
+        promoted_right.insert(right_record.location.id.clone());
+        matches.push(MatchRecord {
+            confidence: "candidate",
+            status: "changed-candidate",
+            basis: "mutual-best-fuzzy",
+            score: best_left.score,
+            channels: Some(best_left.channels),
+            left: left_record.location.clone(),
+            right: right_record.location.clone(),
+        });
+    }
+    matches
+}
+
+struct AffinityPromotion<'a> {
+    remaining_left: Vec<&'a Unit>,
+    remaining_right: Vec<&'a Unit>,
+    unmatched_left: Vec<Unmatched>,
+    unmatched_right: Vec<Unmatched>,
+    matches: Vec<MatchRecord>,
+}
+
+fn rank_and_promote_affinity_candidates<'a>(
+    remaining_left: &[&'a Unit],
+    remaining_right: &[&'a Unit],
+    left_affinities: &FileAffinities,
+    right_affinities: &FileAffinities,
+    ambiguous_owners: &HashSet<String>,
+) -> AffinityPromotion<'a> {
+    let ranked_left = rank_candidates_with_affinity(
+        remaining_left,
+        remaining_right,
+        Some(left_affinities),
+    );
+    let ranked_right = rank_candidates_with_affinity(
+        remaining_right,
+        remaining_left,
+        Some(right_affinities),
+    );
+    let matches = promote_mutual_best_candidates(&ranked_left, &ranked_right, ambiguous_owners);
+    let matched_left = matches
+        .iter()
+        .map(|matched| matched.left.id.clone())
+        .collect::<HashSet<_>>();
+    let matched_right = matches
+        .iter()
+        .map(|matched| matched.right.id.clone())
+        .collect::<HashSet<_>>();
+    let remaining_left = remaining_left
+        .iter()
+        .copied()
+        .filter(|unit| !matched_left.contains(&unit.id))
+        .collect::<Vec<_>>();
+    let remaining_right = remaining_right
+        .iter()
+        .copied()
+        .filter(|unit| !matched_right.contains(&unit.id))
+        .collect::<Vec<_>>();
+    let unmatched_left = rank_candidates_with_affinity(
+        &remaining_left,
+        &remaining_right,
+        Some(left_affinities),
+    );
+    let unmatched_right = rank_candidates_with_affinity(
+        &remaining_right,
+        &remaining_left,
+        Some(right_affinities),
+    );
+    AffinityPromotion {
+        remaining_left,
+        remaining_right,
+        unmatched_left,
+        unmatched_right,
+        matches,
+    }
+}
+
 #[derive(Default)]
 struct FileGraphEvidence {
     anchor_relations: usize,
@@ -8207,37 +8312,15 @@ fn generate_report(
         .collect::<Vec<_>>();
     let ranked_right = rank_candidates(&remaining_right, &remaining_left);
     let ranked_left = rank_candidates(&remaining_left, &remaining_right);
-    let left_ranked_by_id = ranked_left
-        .iter()
-        .map(|record| (record.location.id.clone(), record))
-        .collect::<HashMap<_, _>>();
     let mut mutual_left = HashSet::new();
     let mut mutual_right = HashSet::new();
-    for right_record in &ranked_right {
-        if !best_is_distinct(right_record, &ambiguous_owners) {
-            continue;
-        }
-        let best_left = &right_record.candidates[0];
-        let Some(left_record) = left_ranked_by_id.get(&best_left.location.id) else {
-            continue;
-        };
-        if !best_is_distinct(left_record, &ambiguous_owners)
-            || left_record.candidates[0].location.id != right_record.location.id
-        {
-            continue;
-        }
-        mutual_left.insert(left_record.location.id.clone());
-        mutual_right.insert(right_record.location.id.clone());
-        matches.push(MatchRecord {
-            confidence: "candidate",
-            status: "changed-candidate",
-            basis: "mutual-best-fuzzy",
-            score: best_left.score,
-            channels: Some(best_left.channels),
-            left: left_record.location.clone(),
-            right: right_record.location.clone(),
-        });
+    let first_pass_matches =
+        promote_mutual_best_candidates(&ranked_left, &ranked_right, &ambiguous_owners);
+    for matched in &first_pass_matches {
+        mutual_left.insert(matched.left.id.clone());
+        mutual_right.insert(matched.right.id.clone());
     }
+    matches.extend(first_pass_matches);
     apply_bundle_equivalence_certificates(&mut matches, &left, &right, certificates)?;
     let (file_graph_candidates, left_affinities) = infer_file_graph(&matches, &ranked_left, true);
     let (_, right_affinities) = infer_file_graph(&matches, &ranked_right, false);
@@ -8251,16 +8334,18 @@ fn generate_report(
         .copied()
         .filter(|unit| !mutual_right.contains(&unit.id))
         .collect::<Vec<_>>();
-    let mut unmatched_left = rank_candidates_with_affinity(
+    let affinity = rank_and_promote_affinity_candidates(
         &final_remaining_left,
         &final_remaining_right,
-        Some(&left_affinities),
+        &left_affinities,
+        &right_affinities,
+        &ambiguous_owners,
     );
-    let mut unmatched_right = rank_candidates_with_affinity(
-        &final_remaining_right,
-        &final_remaining_left,
-        Some(&right_affinities),
-    );
+    matches.extend(affinity.matches);
+    let final_remaining_left = affinity.remaining_left;
+    let final_remaining_right = affinity.remaining_right;
+    let mut unmatched_left = affinity.unmatched_left;
+    let mut unmatched_right = affinity.unmatched_right;
     merge_reverse_candidates(&mut unmatched_left, &unmatched_right);
     merge_reverse_candidates(&mut unmatched_right, &unmatched_left);
     let left_units_by_id = final_remaining_left
@@ -8305,7 +8390,6 @@ fn generate_report(
     // Matching scratch owns cloned units and ranked candidate payloads. The
     // final matches/groups now own all candidate evidence needed downstream.
     // Release it before graph analysis allocates its result, not at publication.
-    drop(left_ranked_by_id);
     drop(ranked_left);
     drop(ranked_right);
     drop(linked_left);
@@ -16798,6 +16882,81 @@ mod tests {
             .flat_map(|group| group.left.iter().chain(&group.right))
             .map(|owner| owner.id.clone()).collect();
         assert!(!best_is_distinct(&ranked[0], &ambiguous_owners), "shortlisting cannot make two globally equal owners unique");
+    }
+
+    #[test]
+    fn affinity_exposed_reciprocal_owner_promotes_but_weak_or_ambiguous_pairs_do_not() {
+        let mut local = unit("local-owner", &["shape-a", "shape-b"]);
+        local.file = "local.ts".into();
+        let mut upstream = unit("upstream-owner", &["shape-a", "shape-b"]);
+        upstream.file = "upstream.js".into();
+        let mut distractor = unit("distractor", &["other-a", "other-b"]);
+        distractor.file = "distractors.js".into();
+        let mut local_candidates = vec![&distractor; 20_000];
+        local_candidates.push(&upstream);
+        let mut upstream_candidates = vec![&distractor; 20_000];
+        upstream_candidates.push(&local);
+        let no_affinity_left = rank_candidates(&[&local], &local_candidates);
+        let no_affinity_right = rank_candidates(&[&upstream], &upstream_candidates);
+        assert!(no_affinity_left[0].candidates.is_empty());
+        assert!(no_affinity_right[0].candidates.is_empty());
+        let mut left_affinities = FileAffinities::new();
+        left_affinities.insert("local.ts".into(), vec!["upstream.js".into()]);
+        let mut right_affinities = FileAffinities::new();
+        right_affinities.insert("upstream.js".into(), vec!["local.ts".into()]);
+        let affinity = rank_and_promote_affinity_candidates(
+            &[&local],
+            &[&upstream],
+            &left_affinities,
+            &right_affinities,
+            &HashSet::new(),
+        );
+        assert_eq!(affinity.matches.len(), 1);
+        assert_eq!(affinity.matches[0].basis, "mutual-best-fuzzy");
+        assert!(affinity.remaining_left.is_empty());
+        assert!(affinity.remaining_right.is_empty());
+        assert!(affinity.unmatched_left.is_empty());
+        assert!(affinity.unmatched_right.is_empty());
+
+        let candidate = |owner: &Unit, score: f64| Candidate {
+            score,
+            basis: "containment-graph",
+            channels: ChannelScores {
+                shape: 0.98,
+                ordered: 0.94,
+                literals: 1.0,
+                operators: 1.0,
+                operators_active: true,
+                properties: 1.0,
+                externals: 1.0,
+                size: 1.0,
+            },
+            location: location(owner),
+        };
+        let ambiguous = HashSet::from(["local-owner".to_string()]);
+        let ambiguous_affinity = rank_and_promote_affinity_candidates(
+            &[&local],
+            &[&upstream],
+            &left_affinities,
+            &right_affinities,
+            &ambiguous,
+        );
+        assert!(ambiguous_affinity.matches.is_empty());
+
+        let weak_left = [Unmatched {
+            location: location(&local),
+            candidates: vec![candidate(&upstream, 0.71)],
+        }];
+        let weak_right = [Unmatched {
+            location: location(&upstream),
+            candidates: vec![candidate(&local, 0.71)],
+        }];
+        assert!(promote_mutual_best_candidates(
+            &weak_left,
+            &weak_right,
+            &HashSet::new()
+        )
+        .is_empty());
     }
 
     #[test]
