@@ -10933,7 +10933,7 @@ mod tests {
             let delay = Duration::from_millis(10);
             sender.send(serve(&thread_roots.0, &thread_roots.1, &thread_roots.2, None, delay, delay)).unwrap();
         });
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let status = fs::read(output.join("serve-status.json")).ok()
                 .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());

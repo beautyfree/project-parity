@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, BufWriter, Seek, Write},
     path::Path,
+    sync::OnceLock,
 };
 
 use anyhow::{Context, Result};
@@ -974,9 +975,15 @@ pub(crate) fn write_llm_context(
     unmatched_right: &[Unmatched],
     dependencies: Option<&ProjectIndex>,
 ) -> Result<LlmSummary> {
-    let engine_executable = std::env::current_exe()
-        .context("resolve Project Parity executable for report provenance")?;
-    let engine_executable_sha256 = crate::sha256_file(&engine_executable)?;
+    static ENGINE_EXECUTABLE_SHA256: OnceLock<std::result::Result<String, String>> = OnceLock::new();
+    let engine_executable_sha256 = ENGINE_EXECUTABLE_SHA256
+        .get_or_init(|| {
+            let executable = std::env::current_exe()
+                .map_err(|error| format!("resolve Project Parity executable for report provenance: {error}"))?;
+            crate::sha256_file(&executable).map_err(|error| format!("fingerprint Project Parity executable: {error:#}"))
+        })
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!(error.clone()))?;
     let mut work_items = Vec::<Value>::new();
     let shared_work_evidence = HashMap::new();
     let mut unit_dispositions = HashMap::<String, UnitDisposition>::new();
