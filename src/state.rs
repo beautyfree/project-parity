@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{BufRead, BufReader, Cursor},
     path::{Path, PathBuf},
@@ -565,6 +565,33 @@ fn routing_reclassification_preserves_evidence(previous: &str, current: &str) ->
     previous == current
 }
 
+fn remove_stable_locator_fields(value: &mut Value) -> (usize, bool) {
+    fn visit(value: &mut Value, root: bool, count: &mut usize, complete: &mut bool) {
+        match value {
+            Value::Object(object) => {
+                if object.get("stableFingerprint").and_then(Value::as_str).is_some_and(|value| !value.is_empty()) {
+                    *count += 1;
+                    for key in ["id", "line", "start", "end", "origin"] {
+                        object.remove(key);
+                    }
+                } else if !root && object.contains_key("id") {
+                    *complete = false;
+                }
+                for (key, child) in object.iter_mut() {
+                    if key != "legacyIds" {
+                        visit(child, false, count, complete);
+                    }
+                }
+            }
+            Value::Array(values) => values.iter_mut().for_each(|child| visit(child, false, count, complete)),
+            _ => {}
+        }
+    }
+    let mut count = 0;
+    let mut complete = true;
+    visit(value, true, &mut count, &mut complete);
+    (count, complete)
+}
 fn review_evidence_matches(previous: &str, current: &str) -> bool {
     let (Ok(previous_value), Ok(current_value)) = (
         serde_json::from_str::<Value>(previous),
@@ -572,9 +599,148 @@ fn review_evidence_matches(previous: &str, current: &str) -> bool {
     ) else {
         return false;
     };
-    previous_value == current_value || routing_reclassification_preserves_evidence(previous, current)
+    if previous_value == current_value || routing_reclassification_preserves_evidence(previous, current) {
+        return true;
+    }
+    let mut previous_stable = previous_value;
+    let mut current_stable = current_value;
+    let (previous_count, previous_complete) = remove_stable_locator_fields(&mut previous_stable);
+    let (current_count, current_complete) = remove_stable_locator_fields(&mut current_stable);
+    if previous_count == 0 || current_count == 0 || !previous_complete || !current_complete {
+        return false;
+    }
+    for value in [&mut previous_stable, &mut current_stable] {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("batchId");
+            object.remove("legacyIds");
+            object.remove("inspectNodeIds");
+            object.remove("inspectNodeIdsFromOwners");
+        }
+    }
+    let previous = serde_json::to_string(&previous_stable).unwrap_or_default();
+    let current = serde_json::to_string(&current_stable).unwrap_or_default();
+    previous == current || routing_reclassification_preserves_evidence(&previous, &current)
 }
-
+fn legacy_rekey_payload_matches(previous: &str, current: &str, legacy_id: &str) -> bool {
+    let (Ok(mut previous), Ok(mut current)) = (
+        serde_json::from_str::<Value>(previous),
+        serde_json::from_str::<Value>(current),
+    ) else {
+        return false;
+    };
+    if !current["legacyIds"]
+        .as_array()
+        .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(legacy_id)))
+    {
+        return false;
+    }
+    fn remove_locator_fields(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                if object.contains_key("file") && object.contains_key("id") {
+                    for key in ["id", "line", "start", "end", "origin", "stableFingerprint"] {
+                        object.remove(key);
+                    }
+                }
+                object.values_mut().for_each(remove_locator_fields);
+            }
+            Value::Array(values) => values.iter_mut().for_each(remove_locator_fields),
+            _ => {}
+        }
+    }
+    for value in [&mut previous, &mut current] {
+        if let Some(object) = value.as_object_mut() {
+            for key in [
+                "id",
+                "legacyIds",
+                "batchId",
+                "inspectNodeIds",
+                "inspectNodeIdsFromOwners",
+            ] {
+                object.remove(key);
+            }
+        }
+        remove_locator_fields(value);
+    }
+    review_evidence_matches(
+        &serde_json::to_string(&previous).unwrap_or_default(),
+        &serde_json::to_string(&current).unwrap_or_default(),
+    )
+}
+fn migrate_legacy_decisions(
+    conn: &Connection,
+    run_id: i64,
+    local_hash: &str,
+    upstream_hash: &str,
+    engine_sha256: Option<&str>,
+    dependency_hash: Option<&str>,
+) -> Result<usize> {
+    let (Some(_engine_sha256), Some(dependency_hash)) = (engine_sha256, dependency_hash) else {
+        return Ok(0);
+    };
+    let old_decisions = {
+        let mut stmt = conn.prepare(
+            "SELECT d.work_item_id,d.status,d.reason,d.decided_at,d.payload
+             FROM work_item_decisions d
+             JOIN work_items w ON w.id=d.work_item_id
+             JOIN runs r ON r.id=w.run_id
+             WHERE w.run_id<>?1 AND d.status IN ('done','skipped','pending_sync')
+               AND d.payload IS NOT NULL AND r.local_hash=?2 AND r.upstream_hash=?3
+               AND r.engine_sha256 IS NOT NULL AND r.dependency_hash=?4",
+        )?;
+        let rows = stmt.query_map(params![run_id, local_hash, upstream_hash, dependency_hash], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?, row.get::<_, String>(4)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if old_decisions.is_empty() { return Ok(0); }
+    let new_items = {
+        let mut stmt = conn.prepare("SELECT id,payload FROM work_items WHERE run_id=?1")?;
+        let rows = stmt.query_map(params![run_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let old_by_id = old_decisions.into_iter().map(|row| (row.0.clone(), row)).collect::<HashMap<_, _>>();
+    let mut alias_targets = HashMap::<String, HashSet<String>>::new();
+    for (new_id, current) in &new_items {
+        let Ok(item) = serde_json::from_str::<Value>(current) else { continue };
+        for alias in item["legacyIds"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            alias_targets.entry(alias.to_owned()).or_default().insert(new_id.clone());
+        }
+    }
+    let mut old_to_new = HashMap::<String, BTreeMap<String, String>>::new();
+    let mut new_to_old = HashMap::<String, BTreeMap<String, String>>::new();
+    for (new_id, current) in &new_items {
+        let Ok(item) = serde_json::from_str::<Value>(current) else { continue };
+        let Some(aliases) = item["legacyIds"].as_array() else { continue };
+        for alias in aliases.iter().filter_map(Value::as_str) {
+            if alias_targets.get(alias).is_none_or(|targets| targets.len() != 1) { continue; }
+            let Some(old) = old_by_id.get(alias) else { continue };
+            if old.0 == *new_id || !legacy_rekey_payload_matches(&old.4, current, alias) { continue; }
+            old_to_new.entry(alias.to_owned()).or_default().insert(new_id.clone(), current.clone());
+            new_to_old.entry(new_id.clone()).or_default().insert(alias.to_owned(), current.clone());
+        }
+    }
+    let mut migrated = 0;
+    for (old_id, candidates) in old_to_new {
+        if candidates.len() != 1 { continue; }
+        let (new_id, current) = candidates.into_iter().next().expect("one migration candidate");
+        if new_to_old.get(&new_id).is_none_or(|old_ids| old_ids.len() != 1) { continue; }
+        let old = old_by_id.get(&old_id).expect("candidate came from old decision");
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO work_item_decisions(work_item_id,status,reason,decided_at,payload) VALUES (?1,?2,?3,?4,?5)",
+            params![new_id, old.1, old.2, old.3, current],
+        )?;
+        if inserted != 1 { continue; }
+        conn.execute(
+            "INSERT INTO work_item_id_migrations(old_work_item_id,new_work_item_id,run_id,status,reason,decided_at,previous_payload,current_payload) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![old_id, new_id, run_id, old.1, old.2, old.3, old.4, current],
+        )?;
+        conn.execute("DELETE FROM work_item_decisions WHERE work_item_id=?1", params![old_id])?;
+        migrated += 1;
+    }
+    Ok(migrated)
+}
 fn ensure_queue_index(conn: &Connection, name: &str, confidence: bool, batch: bool) -> Result<()> {
     let mut ordering = "CASE WHEN action='remove-or-justify-extra-local' THEN 4 WHEN action='locate-unlinked-upstream-branch' THEN 5 WHEN action='inspect-structural-frontier' THEN 6 WHEN priority='P0' THEN 0 WHEN priority='P1' THEN 1 ELSE 2 END".to_string();
     if confidence {
@@ -708,6 +874,7 @@ fn sync_locked(db_path: &Path, report: &Path, roots: &RootIdentity) -> Result<Va
     ensure_batch_schema(&conn)?;
     ensure_decision_schema(&conn)?;
     ensure_run_receipt_schema(&conn)?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS work_item_id_migrations (old_work_item_id TEXT NOT NULL,new_work_item_id TEXT NOT NULL,run_id INTEGER NOT NULL,status TEXT NOT NULL,reason TEXT NOT NULL,decided_at TEXT NOT NULL,previous_payload TEXT NOT NULL,current_payload TEXT NOT NULL,PRIMARY KEY(old_work_item_id,new_work_item_id,run_id),FOREIGN KEY(old_work_item_id) REFERENCES work_items(id),FOREIGN KEY(new_work_item_id) REFERENCES work_items(id),FOREIGN KEY(run_id) REFERENCES runs(id))")?;
     conn.execute_batch("CREATE TEMP TABLE previous_seen (id TEXT PRIMARY KEY); INSERT INTO previous_seen SELECT id FROM work_items WHERE resolved_at IS NULL; CREATE TEMP TABLE previous_unresolved (id TEXT PRIMARY KEY); INSERT INTO previous_unresolved SELECT w.id FROM work_items w LEFT JOIN work_item_decisions d ON d.work_item_id=w.id WHERE w.resolved_at IS NULL AND d.work_item_id IS NULL;")?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS work_item_decision_history (id INTEGER PRIMARY KEY, work_item_id TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL, decided_at TEXT NOT NULL, payload TEXT, reopened_run_id INTEGER NOT NULL, reopened_payload TEXT NOT NULL, FOREIGN KEY(work_item_id) REFERENCES work_items(id), FOREIGN KEY(reopened_run_id) REFERENCES runs(id));")?;
     // Older ledgers contain decision snapshots and require an event column.
@@ -790,6 +957,9 @@ fn sync_locked(db_path: &Path, report: &Path, roots: &RootIdentity) -> Result<Va
     tx.execute(
         "UPDATE work_items SET resolved_at=CURRENT_TIMESTAMP WHERE run_id <> ?1 AND resolved_at IS NULL",
         params![run_id],
+    )?;
+    let migrated = migrate_legacy_decisions(
+        conn, run_id, &incoming.local_hash, &incoming.upstream_hash, engine_sha256, dependency_hash,
     )?;
     // Preserve reviewed decisions across routing and coalesced-evidence schema
     // changes only when the underlying owner and evidence are unchanged.
@@ -883,7 +1053,7 @@ fn sync_locked(db_path: &Path, report: &Path, roots: &RootIdentity) -> Result<Va
     )?;
     tx.commit()?;
     Ok(
-        serde_json::json!({"schema":"project-parity/state-sync-v1","runId":run_id,"workItems":seen,"new":new_items,"resolved":resolved,"reopened":reopened,"restored":restored,"pendingReleased":pending_released,"remaining":remaining,"db":db_path}),
+        serde_json::json!({"schema":"project-parity/state-sync-v1","runId":run_id,"workItems":seen,"new":new_items,"resolved":resolved,"reopened":reopened,"restored":restored,"pendingReleased":pending_released,"migrated":migrated,"remaining":remaining,"db":db_path}),
     )
 }
 
@@ -2239,6 +2409,29 @@ mod tests {
         .unwrap();
     }
 
+    fn write_receipted_report(dir: &Path, local: &Path, upstream: &Path, local_hash: &str, items: &[Value]) {
+        fs::create_dir_all(dir).unwrap();
+        fs::create_dir_all(local).unwrap();
+        fs::create_dir_all(upstream).unwrap();
+        let body = if items.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", items.iter().map(Value::to_string).collect::<Vec<_>>().join("\n"))
+        };
+        fs::write(dir.join("llm-work-items.jsonl"), &body).unwrap();
+        let manifest = serde_json::json!({
+            "schema":"project-parity/llm-manifest-v3",
+            "engine":ENGINE_VERSION,
+            "engineArtifact":{"executableSha256":crate::sha256_file(&std::env::current_exe().unwrap()).unwrap()},
+            "localRoot":local,
+            "analysisProjection":upstream,
+            "inputHashes":{"local":local_hash,"upstream":"upstream-hash","dependencies":"dependency-hash"},
+            "inputFingerprints":{"local":{"sha256":crate::fingerprint_input(local, &[]).unwrap(),"inputFiles":[]},"upstream":{"sha256":crate::fingerprint_input(upstream, &[]).unwrap(),"inputFiles":[]},"dependencies":{"root":local,"sha256":crate::fingerprint_dependency_input(local, &[], &[], &[]).unwrap(),"packageRoots":[],"resolutionQueries":[],"inputFiles":[]}},
+            "workItemsIntegrity":{"sha256":crate::sha256(body),"records":items.len()},
+        });
+        fs::write(dir.join("llm-manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+
     #[test]
     fn sync_rejects_truncated_or_same_count_corrupt_work_item_artifact() {
         let root = tempdir().unwrap();
@@ -3460,6 +3653,113 @@ mod tests {
         assert_eq!(archived.0, "pending_sync");
         assert_eq!(archived.1, "reviewed");
         assert!(archived.2.contains("\"id\":\"a\""));
+    }
+
+    #[test]
+    fn sync_rekeys_legacy_decision_only_with_matching_receipt_and_unique_evidence() {
+        let root = tempdir().unwrap();
+        let report_dir = root.path().join("report");
+        let db = root.path().join("state.sqlite");
+        let local = root.path().join("local");
+        let upstream = root.path().join("upstream");
+        let old_id = "work-legacy-offset-id";
+        let location = serde_json::json!({
+            "id":"left:src/editor.ts:10:40:0","file":"src/editor.ts","kind":"Function",
+            "line":1,"start":10,"end":40,
+        });
+        let old = serde_json::json!({
+            "id":old_id,"action":"reconcile-changed-owner","priority":"P1","confidence":"candidate",
+            "reason":"review the changed owner","local":[location],"upstream":[],"evidencePath":[],
+            "inspectNodeIds":["left:src/editor.ts:10:40:0"],
+        });
+        write_receipted_report(&report_dir, &local, &upstream, "local-hash", &[old]);
+        sync(&db, &report_dir).unwrap();
+        mark_pending_sync(&db, old_id, "reviewed source and callers").unwrap();
+
+        let mut stable_location = location.clone();
+        stable_location["id"] = "left:src/editor.ts:11:41:0".into();
+        stable_location["line"] = 2.into();
+        stable_location["start"] = 11.into();
+        stable_location["end"] = 41.into();
+        stable_location["stableFingerprint"] = "stable-review-v1:unchanged-owner".into();
+        let current = serde_json::json!({
+            "id":"work-stable-offset-independent-id","legacyIds":[old_id],
+            "action":"reconcile-changed-owner","priority":"P2","confidence":"weak-candidate",
+            "reason":"same owner, updated triage","local":[stable_location],"upstream":[],"evidencePath":[],
+            "inspectNodeIds":["left:src/editor.ts:11:41:0"],
+        });
+        write_receipted_report(&report_dir, &local, &upstream, "local-hash", &[current]);
+        let result = sync(&db, &report_dir).unwrap();
+        assert_eq!(result["migrated"], 1);
+        assert_eq!(result["remaining"], 0);
+        assert_eq!(stats(&db).unwrap()["done"], 1);
+        let conn = Connection::open(&db).unwrap();
+        let migrated: (String, String, String) = conn.query_row(
+            "SELECT old_work_item_id,new_work_item_id,status FROM work_item_id_migrations",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(migrated, (old_id.into(), "work-stable-offset-independent-id".into(), "pending_sync".into()));
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM work_item_decisions WHERE work_item_id=?1", [old_id], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(conn.query_row("SELECT status FROM work_item_decisions WHERE work_item_id='work-stable-offset-independent-id'", [], |row| row.get::<_, String>(0)).unwrap(), "done");
+    }
+
+    #[test]
+    fn sync_does_not_rekey_when_input_receipt_changes_or_alias_is_ambiguous() {
+        let root = tempdir().unwrap();
+        let report_dir = root.path().join("report");
+        let db = root.path().join("state.sqlite");
+        let local = root.path().join("local");
+        let upstream = root.path().join("upstream");
+        let old_id = "work-legacy-offset-id";
+        let old = serde_json::json!({
+            "id":old_id,"action":"inspect","priority":"P1","local":[{"id":"left:a","file":"a.ts","kind":"Function","start":1,"end":4}],
+            "upstream":[],"evidencePath":[],"inspectNodeIds":["left:a"],
+        });
+        write_receipted_report(&report_dir, &local, &upstream, "local-hash", &[old]);
+        sync(&db, &report_dir).unwrap();
+        mark_pending_sync(&db, old_id, "reviewed").unwrap();
+
+        let current = serde_json::json!({
+            "id":"work-stable-new","legacyIds":[old_id],"action":"inspect","priority":"P1",
+            "local":[{"id":"left:a","stableFingerprint":"stable-a","file":"a.ts","kind":"Function","start":1,"end":4}],
+            "upstream":[],"evidencePath":[],"inspectNodeIds":["left:a"],
+        });
+        write_receipted_report(&report_dir, &local, &upstream, "changed-local-hash", &[current.clone()]);
+        assert_eq!(sync(&db, &report_dir).unwrap()["migrated"], 0);
+        assert_eq!(next(&db, 10).unwrap()["count"], 1);
+
+        let ambiguous_a = serde_json::json!({
+            "id":"work-stable-a","legacyIds":[old_id],"action":"inspect","priority":"P1",
+            "local":[{"id":"left:a","stableFingerprint":"stable-a","file":"a.ts","kind":"Function","start":1,"end":4}],
+            "upstream":[],"evidencePath":[],"inspectNodeIds":["left:a"],
+        });
+        let ambiguous_b = serde_json::json!({
+            "id":"work-stable-b","legacyIds":[old_id],"action":"inspect","priority":"P1",
+            "local":[{"id":"left:a","stableFingerprint":"stable-a","file":"a.ts","kind":"Function","start":1,"end":4}],
+            "upstream":[],"evidencePath":[],"inspectNodeIds":["left:a"],
+        });
+        write_receipted_report(&report_dir, &local, &upstream, "changed-local-hash", &[ambiguous_a, ambiguous_b]);
+        assert_eq!(sync(&db, &report_dir).unwrap()["migrated"], 0);
+        assert_eq!(next(&db, 10).unwrap()["count"], 2);
+    }
+
+    #[test]
+    fn stable_locator_evidence_ignores_only_offsets_and_ids() {
+        let previous = serde_json::json!({
+            "id":"work-stable","action":"inspect","priority":"P1",
+            "local":[{"id":"left:a:10:20:0","stableFingerprint":"stable-a","file":"a.ts","kind":"Function","line":1,"start":10,"end":20}],
+        });
+        let moved = serde_json::json!({
+            "id":"work-stable","action":"inspect","priority":"P2",
+            "local":[{"id":"left:a:50:60:2","stableFingerprint":"stable-a","file":"a.ts","kind":"Function","line":4,"start":50,"end":60}],
+        });
+        assert!(review_evidence_matches(&previous.to_string(), &moved.to_string()));
+        let changed = serde_json::json!({
+            "id":"work-stable","action":"inspect","priority":"P2",
+            "local":[{"id":"left:a:50:60:2","stableFingerprint":"changed","file":"a.ts","kind":"Function","line":4,"start":50,"end":60}],
+        });
+        assert!(!review_evidence_matches(&previous.to_string(), &changed.to_string()));
     }
 
     #[test]

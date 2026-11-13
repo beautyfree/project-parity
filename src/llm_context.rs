@@ -461,6 +461,73 @@ fn graph_node_ref(node: &GraphNode) -> GraphNodeRef {
     }
 }
 
+fn unique_stable_review_identities(candidates: Vec<(String, String)>) -> HashMap<String, String> {
+    let mut counts = HashMap::<String, usize>::with_capacity(candidates.len());
+    for (_, fingerprint) in &candidates {
+        *counts.entry(fingerprint.clone()).or_default() += 1;
+    }
+    candidates
+        .into_iter()
+        .filter_map(|(id, fingerprint)| {
+            (counts[&fingerprint] == 1).then_some((id, fingerprint))
+        })
+        .collect()
+}
+fn stable_review_fingerprint(material: &str) -> String {
+    format!("stable-review-v1:{}", sha256(material))
+}
+fn stable_review_identity_map(left: &ProjectIndex, right: &ProjectIndex) -> HashMap<String, String> {
+    let mut candidates = Vec::<(String, String)>::with_capacity(
+        left.units.len() + right.units.len() + left.graph_nodes.len() + right.graph_nodes.len(),
+    );
+    for (side, project) in [("left", left), ("right", right)] {
+        for unit in &project.units {
+            let material = format!(
+                "unit\0{side}\0{}\0{}\0{}\0{}",
+                unit.file, unit.kind, unit.strict_sha256, unit.linked_sha256
+            );
+            candidates.push((unit.id.clone(), stable_review_fingerprint(&material)));
+        }
+
+        for node in &project.graph_nodes {
+            let material = format!(
+                "graph\0{side}\0{}\0{}\0{}\0{}",
+                node.file, node.kind, node.label, node.linked_sha256
+            );
+            candidates.push((node.id.clone(), stable_review_fingerprint(&material)));
+        }
+    }
+    unique_stable_review_identities(candidates)
+}
+fn stable_identity(identity: &str, identities: &HashMap<String, String>) -> Option<String> {
+    identities.get(identity).cloned().or_else(|| {
+        (!identity.starts_with("left:") && !identity.starts_with("right:"))
+            .then(|| identity.to_string())
+    })
+}
+fn annotate_stable_fingerprints(value: &mut Value, identities: &HashMap<String, String>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(id) = object.get("id").and_then(Value::as_str) {
+                if let Some(fingerprint) = identities.get(id) {
+                    object.insert(
+                        "stableFingerprint".to_string(),
+                        Value::String(fingerprint.clone()),
+                    );
+                }
+            }
+            for child in object.values_mut() {
+                annotate_stable_fingerprints(child, identities);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                annotate_stable_fingerprints(item, identities);
+            }
+        }
+        _ => {}
+    }
+}
 fn work_item_id(action: &str, identities: impl IntoIterator<Item = String>) -> String {
     // Identities are collected from graph/hash-map traversals whose iteration
     // order is not a stable part of the evidence.  A work-item ID must name
@@ -624,30 +691,60 @@ fn unlinked_upstream_triage() -> (&'static str, &'static str) {
 fn push_work_item(items: &mut Vec<Value>, draft: WorkItemDraft) -> String {
     push_work_item_with_identity_action(items, draft, None)
 }
-
 fn push_work_item_with_identity_action(
     items: &mut Vec<Value>,
     draft: WorkItemDraft,
     identity_action: Option<&str>,
 ) -> String {
-    let id = work_item_id(identity_action.unwrap_or(draft.action), draft.identities);
+    push_work_item_with_review_identities(items, draft, identity_action, &HashMap::new())
+}
+fn push_work_item_with_review_identities(
+    items: &mut Vec<Value>,
+    draft: WorkItemDraft,
+    identity_action: Option<&str>,
+    stable_identities: &HashMap<String, String>,
+) -> String {
+    let action = identity_action.unwrap_or(draft.action);
+    let legacy_id = work_item_id(action, draft.identities.iter().cloned());
+    let stable_ids = draft
+        .identities
+        .iter()
+        .map(|identity| stable_identity(identity, stable_identities))
+        .collect::<Option<Vec<_>>>();
+    let id = if !draft.identities.is_empty() {
+        stable_ids
+            .map(|identities| work_item_id(action, identities))
+            .unwrap_or_else(|| legacy_id.clone())
+    } else {
+        legacy_id.clone()
+    };
     let inspect_node_ids = draft
         .local
         .iter()
         .chain(&draft.upstream)
-        .filter_map(|location| location["id"].as_str())
+        .filter_map(|location| location["id"].as_str().map(str::to_owned))
         .collect::<Vec<_>>();
-    items.push(json!({
+    let mut local = draft.local;
+    let mut upstream = draft.upstream;
+    let mut evidence_path = draft.evidence_path;
+    for evidence in local.iter_mut().chain(&mut upstream).chain(&mut evidence_path) {
+        annotate_stable_fingerprints(evidence, stable_identities);
+    }
+    let mut item = json!({
         "id": id,
         "priority": draft.priority,
         "action": draft.action,
         "confidence": draft.confidence,
         "reason": draft.reason,
-        "local": draft.local,
-        "upstream": draft.upstream,
-        "evidencePath": draft.evidence_path,
+        "local": local,
+        "upstream": upstream,
+        "evidencePath": evidence_path,
         "inspectNodeIds": inspect_node_ids,
-    }));
+    });
+    if id != legacy_id {
+        item["legacyIds"] = json!([legacy_id]);
+    }
+    items.push(item);
     id
 }
 
@@ -689,6 +786,12 @@ fn coalesce_work_items(items: Vec<Value>, shared: &HashMap<String, Value>) -> Re
             }
 
             let mut merged = variants[0].clone();
+            let legacy_ids = variants
+                .iter()
+                .flat_map(|variant| variant["legacyIds"].as_array().into_iter().flatten())
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>();
             for key in ["local", "upstream", "evidencePath", "inspectNodeIds"] {
                 let mut values = BTreeMap::<String, Value>::new();
                 for variant in &variants {
@@ -748,6 +851,9 @@ fn coalesce_work_items(items: Vec<Value>, shared: &HashMap<String, Value>) -> Re
                 for (key, value) in active_fields {
                     merged[key] = value;
                 }
+            }
+            if !legacy_ids.is_empty() {
+                merged["legacyIds"] = Value::Array(legacy_ids.into_iter().map(Value::String).collect());
             }
             Ok(merged)
         })
@@ -984,6 +1090,13 @@ pub(crate) fn write_llm_context(
         })
         .as_ref()
         .map_err(|error| anyhow::anyhow!(error.clone()))?;
+    let stable_review_identities = stable_review_identity_map(left, right);
+    let push_work_item = |items: &mut Vec<Value>, draft: WorkItemDraft| {
+        push_work_item_with_review_identities(items, draft, None, &stable_review_identities)
+    };
+    let push_work_item_with_identity_action = |items: &mut Vec<Value>, draft: WorkItemDraft, action: Option<&str>| {
+        push_work_item_with_review_identities(items, draft, action, &stable_review_identities)
+    };
     let mut work_items = Vec::<Value>::new();
     let shared_work_evidence = HashMap::new();
     let mut unit_dispositions = HashMap::<String, UnitDisposition>::new();
@@ -2528,14 +2641,16 @@ mod tests {
     use super::{
         candidate_owner_triage, coalesce_work_items,
         compact_work_evidence, expand_work_evidence, frontier_identity_override, frontier_triage, frontier_work_action,
-        push_work_item, push_work_item_with_identity_action, read_shared_work_evidence,
+        push_work_item, push_work_item_with_identity_action, push_work_item_with_review_identities,
+        read_shared_work_evidence,
         same_file_identity, should_defer_structural_frontier, unlinked_upstream_triage,
+        stable_identity, stable_review_fingerprint, unique_stable_review_identities,
         work_item_id, owner_context_needs_work, WorkItemDraft,
         write_json_lines,
     };
     use crate::{run, FileRecord, Location, MatchRecord};
     use serde_json::json;
-    use std::fs;
+    use std::{collections::HashMap, fs};
     use tempfile::tempdir;
 
     #[test]
@@ -2621,6 +2736,46 @@ mod tests {
             .expect("the function call remains represented in the semantic ledger");
         assert_eq!(callsite["disposition"], "inherited-owner-work");
         assert_eq!(callsite["workItemId"], owner_work["id"]);
+    }
+
+    #[test]
+    fn unrelated_preceding_unit_keeps_the_unlinked_owner_work_id() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let first_report = tempdir().unwrap();
+        let second_report = tempdir().unwrap();
+        fs::create_dir_all(left.path()).unwrap();
+        fs::create_dir_all(right.path()).unwrap();
+        let upstream = right.path().join("chunk.js");
+        fs::write(&upstream, "function upstreamOnly() { return sideEffect(); }").unwrap();
+        run(left.path(), right.path(), first_report.path()).unwrap();
+        let first = fs::read_to_string(first_report.path().join("llm-work-items.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|item| {
+                item["action"] == "locate-unlinked-upstream-branch"
+                    && item["upstream"][0]["start"] == 0
+            })
+            .expect("unlinked function is actionable");
+        fs::write(
+            &upstream,
+            "const unrelated = 1;\nfunction upstreamOnly() { return sideEffect(); }",
+        )
+        .unwrap();
+        run(left.path(), right.path(), second_report.path()).unwrap();
+        let second = fs::read_to_string(second_report.path().join("llm-work-items.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|item| {
+                item["action"] == "locate-unlinked-upstream-branch"
+                    && item["upstream"][0]["start"].as_u64().is_some_and(|start| start >= 20)
+            })
+            .expect("same unlinked function remains actionable");
+        assert_eq!(first["id"], second["id"]);
+        assert_ne!(first["upstream"][0]["id"], second["upstream"][0]["id"]);
+        assert_eq!(second["legacyIds"].as_array().map(Vec::len), Some(1));
     }
 
     #[test]
@@ -2720,6 +2875,17 @@ mod tests {
             frontier_triage(&["Calls"], "P1", "candidate"),
             ("P1", "candidate")
         );
+    }
+
+    #[test]
+    fn coalescing_preserves_every_legacy_id_alias() {
+        let items = vec![
+            json!({"id":"stable","legacyIds":["old-a"],"action":"port-missing-upstream-branch","priority":"P1","confidence":"candidate","reason":"a","local":[],"upstream":[],"evidencePath":[],"inspectNodeIds":[]}),
+            json!({"id":"stable","legacyIds":["old-b"],"action":"port-missing-upstream-branch","priority":"P1","confidence":"candidate","reason":"b","local":[],"upstream":[],"evidencePath":[],"inspectNodeIds":[]}),
+        ];
+        let coalesced = coalesce_work_items(items, &HashMap::new()).unwrap();
+        assert_eq!(coalesced.len(), 1);
+        assert_eq!(coalesced[0]["legacyIds"], json!(["old-a", "old-b"]));
     }
 
     #[test]
@@ -2984,6 +3150,77 @@ mod tests {
             assert_eq!(frontier_triage(&[edge], "P0", "candidate"), ("P0", "candidate"));
             assert_eq!(frontier_work_action("port-missing-upstream-branch", &[edge], true).0, "port-missing-upstream-branch");
         }
+    }
+
+    #[test]
+    fn stable_review_identity_ignores_offsets_and_fails_closed_on_duplicates() {
+        let material = "unit\0left\0src/editor.ts\0Function\0source-sha\0linked-sha";
+        let fingerprint = stable_review_fingerprint(material);
+        let moved = stable_review_fingerprint(material);
+        assert_eq!(fingerprint, moved);
+
+        let before = unique_stable_review_identities(vec![(
+            "left:src/editor.ts:10:40:0".to_string(),
+            fingerprint.clone(),
+        )]);
+        let after = unique_stable_review_identities(vec![(
+            "left:src/editor.ts:30:60:2".to_string(),
+            moved,
+        )]);
+        let before_id = stable_identity("left:src/editor.ts:10:40:0", &before).unwrap();
+        let after_id = stable_identity("left:src/editor.ts:30:60:2", &after).unwrap();
+        assert_eq!(
+            work_item_id("reconcile-changed-owner", [before_id]),
+            work_item_id("reconcile-changed-owner", [after_id])
+        );
+
+        let duplicate = unique_stable_review_identities(vec![
+            ("left:src/editor.ts:10:40:0".to_string(), fingerprint.clone()),
+            ("left:src/editor.ts:50:80:1".to_string(), fingerprint),
+        ]);
+        assert!(duplicate.is_empty());
+        assert!(stable_identity("left:src/editor.ts:10:40:0", &duplicate).is_none());
+    }
+
+    #[test]
+    fn stable_work_items_keep_legacy_ids_and_locator_fingerprints() {
+        let old_id = "left:src/editor.ts:10:40:0";
+        let stable_fingerprint = "stable-review-v1:owner";
+        let identities = HashMap::from([(old_id.to_string(), stable_fingerprint.to_string())]);
+        let mut items = Vec::new();
+        let item_id = push_work_item_with_review_identities(
+            &mut items,
+            WorkItemDraft {
+                action: "reconcile-changed-owner",
+                priority: "P1",
+                confidence: "candidate",
+                reason: "inspect owner".to_string(),
+                local: vec![json!({"id":old_id,"file":"src/editor.ts","start":10,"end":40})],
+                upstream: Vec::new(),
+                evidence_path: Vec::new(),
+                identities: vec![old_id.to_string()],
+            },
+            None,
+            &identities,
+        );
+        let item = &items[0];
+        assert_eq!(item["id"], item_id);
+        assert_eq!(item["legacyIds"], json!([work_item_id("reconcile-changed-owner", [old_id.to_string()])]));
+        assert_eq!(item["local"][0]["id"], old_id);
+        assert_eq!(item["local"][0]["stableFingerprint"], stable_fingerprint);
+    }
+
+    #[test]
+    fn stable_review_identity_tracks_file_and_source_changes() {
+        let identity = stable_review_fingerprint("unit\0left\0src/editor.ts\0Function\0source-a\0linked-a");
+        assert_ne!(
+            identity,
+            stable_review_fingerprint("unit\0left\0src/renamed.ts\0Function\0source-a\0linked-a")
+        );
+        assert_ne!(
+            identity,
+            stable_review_fingerprint("unit\0left\0src/editor.ts\0Function\0source-b\0linked-b")
+        );
     }
 
     #[test]
