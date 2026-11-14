@@ -587,6 +587,54 @@ fn stable_review_identity_map(left: &ProjectIndex, right: &ProjectIndex) -> Hash
         left.units.len() + right.units.len() + left.graph_nodes.len() + right.graph_nodes.len(),
     );
     for (side, project) in [("left", left), ("right", right)] {
+        let nodes = project
+            .graph_nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node))
+            .collect::<HashMap<_, _>>();
+        // A Symbol node deliberately has no AST feature stream of its own: its
+        // behavior is represented by its declaration and typed binding edges.
+        // Key a symbol's durable review identity by those contracts, instead of
+        // its source offsets. This distinguishes exported/imported bindings and
+        // most shadowed declarations while leaving genuinely indistinguishable
+        // symbols ambiguous (and therefore fail-closed below).
+        let mut symbol_contracts = HashMap::<&str, Vec<String>>::new();
+        for edge in &project.graph_edges {
+            if !matches!(
+                edge.kind.as_str(),
+                "Defines"
+                    | "ImportsBinding"
+                    | "TypeImportsBinding"
+                    | "ExportsBinding"
+                    | "TypeExportsBinding"
+            ) {
+                continue;
+            }
+            let Some(source) = nodes.get(edge.source.as_str()) else {
+                continue;
+            };
+            if source.kind != "Symbol" {
+                continue;
+            }
+            let Some(target) = nodes.get(edge.target.as_str()) else {
+                continue;
+            };
+            symbol_contracts
+                .entry(source.id.as_str())
+                .or_default()
+                .push(format!(
+                    "{}\0{}\0{}\0{}\0{}",
+                    edge.kind,
+                    edge.label.as_deref().unwrap_or_default(),
+                    edge.dynamic,
+                    target.kind,
+                    target.linked_sha256,
+                ));
+        }
+        for contracts in symbol_contracts.values_mut() {
+            contracts.sort();
+            contracts.dedup();
+        }
         for unit in &project.units {
             let material = format!(
                 "unit\0{side}\0{}\0{}\0{}\0{}",
@@ -596,8 +644,16 @@ fn stable_review_identity_map(left: &ProjectIndex, right: &ProjectIndex) -> Hash
         }
 
         for node in &project.graph_nodes {
+            let contract = if node.kind == "Symbol" {
+                symbol_contracts
+                    .get(node.id.as_str())
+                    .map(|contracts| contracts.join("\n"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             let material = format!(
-                "graph\0{side}\0{}\0{}\0{}\0{}",
+                "graph\0{side}\0{}\0{}\0{}\0{}\0{contract}",
                 node.file, node.kind, node.label, node.linked_sha256
             );
             candidates.push((node.id.clone(), stable_review_fingerprint(&material)));
@@ -2943,6 +2999,60 @@ mod tests {
             }),
             "the resolved named export binding must remain reviewable: {module_contract_work:?}"
         );
+    }
+
+    #[test]
+    fn named_export_binding_review_stays_resolved_after_offset_only_source_shift() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let first_output = tempdir().unwrap();
+        let second_output = tempdir().unwrap();
+        fs::create_dir_all(left.path().join("src")).unwrap();
+        let source = left.path().join("src/public.js");
+        fs::write(&source, "export function api() { return 1; }\n").unwrap();
+
+        let export_binding_id = |output: &std::path::Path| {
+            fs::read_to_string(output.join("llm-work-items.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|item| {
+                    item["action"] == "remove-or-justify-extra-local"
+                        && item["reason"]
+                            .as_str()
+                            .is_some_and(|reason| reason.starts_with("No upstream module at the same path"))
+                        && item["local"].as_array().is_some_and(|owners| {
+                            owners.len() == 1 && owners[0]["kind"] == "Symbol"
+                        })
+                })
+                .map(|item| item["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        run(left.path(), right.path(), first_output.path()).unwrap();
+        let first_ids = export_binding_id(first_output.path());
+        assert_eq!(first_ids.len(), 1, "fixture must produce one named export binding review");
+
+        let db = left.path().join("state.sqlite");
+        crate::state::sync(&db, first_output.path()).unwrap();
+        crate::state::mark_pending_sync(&db, &first_ids[0], "reviewed before an offset-only edit").unwrap();
+
+        fs::write(&source, "// a non-semantic offset shift\nexport function api() { return 1; }\n").unwrap();
+        run(left.path(), right.path(), second_output.path()).unwrap();
+        let second_ids = export_binding_id(second_output.path());
+        assert_eq!(
+            first_ids,
+            second_ids,
+            "a stable Symbol contract must keep an offset-only edit on the same review item"
+        );
+        let result = crate::state::sync(&db, second_output.path()).unwrap();
+        assert_eq!(result["reopened"], 0);
+        assert_eq!(crate::state::stats(&db).unwrap()["done"], 1);
+        assert!(crate::state::next(&db, 10).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["id"] != first_ids[0]));
     }
 
     #[test]

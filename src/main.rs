@@ -1506,7 +1506,14 @@ fn is_derivative_duplicate(path: &Path) -> bool {
 
 fn is_conventionally_filtered_source(relative: &str) -> bool {
     relative.contains("/__tests__/")
-        || [".test.", ".spec.", ".stories.", ".node-test."]
+        || [
+            ".test.",
+            ".spec.",
+            ".stories.",
+            ".node-test.",
+            "-test.",
+            "-spec.",
+        ]
             .iter()
             .any(|needle| relative.contains(needle))
 }
@@ -16337,6 +16344,8 @@ mod tests {
             "editor.node-test.mjs",
             "owner.test.mjs",
             "owner.spec.ts",
+            "staging-test.mjs",
+            "staging-spec.mjs",
             "owner.stories.tsx",
             "capture.ts",
             "device.mjs",
