@@ -5683,6 +5683,15 @@ fn best_is_distinct(record: &Unmatched, ambiguous_owners: &HashSet<String>) -> b
             && best.channels.ordered >= 0.60
             && ((!best.channels.operators_active
                 || (best.channels.operators == 1.0 && best.channels.ordered >= 0.90))
+                // A single ordering penalty can come from source refactoring
+                // (for example, extracting an inline lookup into a helper).
+                // Relax it only when the operator inventory is exact and the
+                // AST shape, owner size, and overall score remain strong.
+                || (best.score >= 0.78
+                    && best.channels.operators == 1.0
+                    && best.channels.ordered >= 0.70
+                    && best.channels.shape >= 0.80
+                    && best.channels.size >= 0.90)
                 // TypeScript-to-bundle lowering can change one operator
                 // channel while every owner-level channel remains exact.
                 // Require a high overall score and a near-exact operator
@@ -17274,6 +17283,46 @@ mod tests {
             &HashSet::new()
         )
         .is_empty());
+    }
+
+    #[test]
+    fn distinct_structural_match_can_survive_refactoring_order_noise() {
+        let local = unit("local-owner", &["shape-a", "shape-b"]);
+        let upstream = unit("upstream-owner", &["shape-a", "shape-b"]);
+        let candidate = |channels| Candidate {
+            score: 0.784,
+            basis: "feature",
+            channels,
+            location: location(&upstream),
+        };
+        let record = |channels| Unmatched {
+            location: location(&local),
+            candidates: vec![candidate(channels)],
+        };
+        let strong = ChannelScores {
+            shape: 0.825,
+            ordered: 0.717,
+            literals: 0.6,
+            operators: 1.0,
+            operators_active: true,
+            properties: 0.765,
+            externals: 0.0,
+            size: 0.917,
+        };
+        assert!(best_is_distinct(&record(strong), &HashSet::new()));
+
+        let mut changed_operator = strong;
+        changed_operator.operators = 0.99;
+        assert!(!best_is_distinct(
+            &record(changed_operator),
+            &HashSet::new()
+        ));
+
+        let tied = Unmatched {
+            location: location(&local),
+            candidates: vec![candidate(strong), candidate(strong)],
+        };
+        assert!(!best_is_distinct(&tied, &HashSet::new()));
     }
 
     #[test]
