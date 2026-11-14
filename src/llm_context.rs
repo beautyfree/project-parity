@@ -1494,9 +1494,68 @@ pub(crate) fn write_llm_context(
     // Compare both directions so an extra local public binding remains visible.
     let module_contract = |project: &ProjectIndex| {
         let nodes = project.graph_nodes.iter().map(|node| (node.id.as_str(), node)).collect::<HashMap<_, _>>();
+        // Oxc keeps coarse module export markers alongside resolved public
+        // bindings and exact re-export edges. When there is no same-path
+        // upstream module, emitting both representations as separate local-
+        // only work items double-counts one contract. Drop a coarse marker
+        // only when a same-target binding or same-edge re-export proves its
+        // more precise representation; unbound wildcard/unknown edges remain.
+        let binding_targets = project
+            .graph_edges
+            .iter()
+            .filter(|edge| matches!(edge.kind.as_str(), "ExportsBinding" | "TypeExportsBinding"))
+            .map(|edge| (edge.kind.as_str(), edge.target.as_str()))
+            .collect::<HashSet<_>>();
+        let reexport_targets = project
+            .graph_edges
+            .iter()
+            .filter(|edge| matches!(edge.kind.as_str(), "ReExportsBinding" | "TypeReExportsBinding"))
+            .filter_map(|edge| {
+                nodes.get(edge.source.as_str()).map(|source| {
+                    (edge.kind.as_str(), source.file.as_str(), edge.target.as_str())
+                })
+            })
+            .collect::<HashSet<_>>();
+        let redundant_markers = project
+            .graph_edges
+            .iter()
+            .filter(|marker| matches!(marker.kind.as_str(), "Exports" | "TypeExports"))
+            .filter(|marker| {
+                let (binding_kind, reexport_kind) = if marker.kind == "Exports" {
+                    ("ExportsBinding", "ReExportsBinding")
+                } else {
+                    ("TypeExportsBinding", "TypeReExportsBinding")
+                };
+                let has_binding = binding_targets.contains(&(binding_kind, marker.target.as_str()));
+                let has_reexport = nodes.get(marker.source.as_str()).is_some_and(|source| {
+                    reexport_targets.contains(&(
+                        reexport_kind,
+                        source.file.as_str(),
+                        marker.target.as_str(),
+                    ))
+                });
+                has_binding || has_reexport
+            })
+            .map(|edge| {
+                (
+                    edge.source.as_str(),
+                    edge.target.as_str(),
+                    edge.kind.as_str(),
+                    edge.label.as_deref(),
+                    edge.dynamic,
+                )
+            })
+            .collect::<HashSet<_>>();
         let mut contract = BTreeMap::<String, BTreeMap<(String, Option<String>, bool, String), GraphNode>>::new();
         for edge in &project.graph_edges {
             if !matches!(edge.kind.as_str(), "Exports" | "ExportsBinding" | "ReExportsBinding" | "TypeExports" | "TypeExportsBinding" | "TypeReExportsBinding") { continue; }
+            if redundant_markers.contains(&(
+                edge.source.as_str(),
+                edge.target.as_str(),
+                edge.kind.as_str(),
+                edge.label.as_deref(),
+                edge.dynamic,
+            )) { continue; }
             let (Some(source), Some(target)) = (nodes.get(edge.source.as_str()), nodes.get(edge.target.as_str())) else { continue; };
             contract.entry(source.file.clone()).or_default().insert(
                 (edge.kind.clone(), edge.label.clone(), edge.dynamic, target.label.clone()), (*source).clone()
@@ -2841,6 +2900,49 @@ mod tests {
             item["action"] == "inspect-unresolved-upstream-graph-context"
                 && item["semanticOwner"]["kind"] == "File"
         }));
+    }
+
+    #[test]
+    fn named_export_marker_is_not_counted_twice_but_wildcard_export_stays_visible() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::create_dir_all(left.path().join("src")).unwrap();
+        fs::write(
+            left.path().join("src/public.js"),
+            "export function api() { return 1; }\nexport * from './plugins.js';\n",
+        )
+        .unwrap();
+
+        run(left.path(), right.path(), output.path()).unwrap();
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let module_contract_work = work
+            .iter()
+            .filter(|item| {
+                item["action"] == "remove-or-justify-extra-local"
+                    && item["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.starts_with("No upstream module at the same path"))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            module_contract_work.len(),
+            2,
+            "one named export binding and one wildcard re-export should remain visible; the declaration marker must not duplicate the binding: {module_contract_work:?}"
+        );
+        assert!(
+            module_contract_work.iter().any(|item| {
+                item["local"].as_array().is_some_and(|owners| {
+                    owners.iter().any(|owner| owner["kind"] == "Symbol")
+                })
+            }),
+            "the resolved named export binding must remain reviewable: {module_contract_work:?}"
+        );
     }
 
     #[test]
