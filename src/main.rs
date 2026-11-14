@@ -851,11 +851,27 @@ fn record_ast_feature(features: &mut FeatureChannels, source: &str, kind: AstKin
             FeatureChannels::increment(&mut features.properties, identifier.name.as_str());
             features.record_event(format!("property:{}", identifier.name));
         }
-        AstKind::StringLiteral(_)
-        | AstKind::NumericLiteral(_)
-        | AstKind::BooleanLiteral(_)
+        AstKind::StringLiteral(literal) => {
+            let value = format!(
+                "string:{}:{:?}",
+                literal.lone_surrogates,
+                literal.value.as_str()
+            );
+            FeatureChannels::increment(&mut features.literals, &value);
+            features.record_event(format!("literal:{value}"));
+        }
+        AstKind::NumericLiteral(literal) => {
+            let value = format!("number:{:016x}", literal.value.to_bits());
+            FeatureChannels::increment(&mut features.literals, &value);
+            features.record_event(format!("literal:{value}"));
+        }
+        AstKind::BigIntLiteral(literal) => {
+            let value = format!("bigint:{}", literal.value.as_str());
+            FeatureChannels::increment(&mut features.literals, &value);
+            features.record_event(format!("literal:{value}"));
+        }
+        AstKind::BooleanLiteral(_)
         | AstKind::NullLiteral(_)
-        | AstKind::BigIntLiteral(_)
         | AstKind::RegExpLiteral(_)
         | AstKind::TemplateElement(_) => {
             let span = kind.span();
@@ -879,25 +895,19 @@ fn record_ast_feature(features: &mut FeatureChannels, source: &str, kind: AstKin
             features.record_event(format!("operator:{operator}"));
         }
         AstKind::BinaryExpression(expression) => {
-            // Webcrack/deobfuscation commonly rewrites a typeof string check
-            // from `===` to `==`.  These are equivalent because `typeof`
-            // always returns a primitive string; normalize only this proven
-            // context and preserve ordinary equality operators.
-            let operator = if matches!(
-                expression.left,
-                Expression::UnaryExpression(ref unary)
-                    if unary.operator == UnaryOperator::Typeof
+            // Deobfuscation may switch strictness here; `typeof` and the other
+            // operand are both known primitive strings. Keep arbitrary values distinct.
+            let operator = match (
+                is_typeof_string_literal_comparison(expression),
+                expression.operator,
             ) {
-                match expression.operator {
-                    BinaryOperator::Equality | BinaryOperator::StrictEquality => "TypeofEquality",
-                    BinaryOperator::Inequality | BinaryOperator::StrictInequality => {
-                        "TypeofInequality"
-                    }
-                    _ => "Other",
+                (true, BinaryOperator::Equality | BinaryOperator::StrictEquality) => {
+                    "TypeofEquality".to_string()
                 }
-                .to_string()
-            } else {
-                format!("{:?}", expression.operator)
+                (true, BinaryOperator::Inequality | BinaryOperator::StrictInequality) => {
+                    "TypeofInequality".to_string()
+                }
+                _ => format!("{:?}", expression.operator),
             };
             FeatureChannels::increment(&mut features.operators, &operator);
             features.record_event(format!("operator:{operator}"));
@@ -914,6 +924,30 @@ fn record_ast_feature(features: &mut FeatureChannels, source: &str, kind: AstKin
         }
         _ => {}
     }
+}
+
+fn unparenthesized_expression<'a, 'b>(mut expression: &'a Expression<'b>) -> &'a Expression<'b> {
+    while let Expression::ParenthesizedExpression(parenthesized) = expression {
+        expression = &parenthesized.expression;
+    }
+    expression
+}
+
+fn is_typeof_string_literal_comparison(expression: &oxc_ast::ast::BinaryExpression<'_>) -> bool {
+    if !matches!(
+        expression.operator,
+        BinaryOperator::Equality
+            | BinaryOperator::StrictEquality
+            | BinaryOperator::Inequality
+            | BinaryOperator::StrictInequality
+    ) {
+        return false;
+    }
+    let left = unparenthesized_expression(&expression.left);
+    let right = unparenthesized_expression(&expression.right);
+    let is_typeof = |expression: &Expression<'_>| matches!(expression, Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::Typeof);
+    (is_typeof(left) && matches!(right, Expression::StringLiteral(_)))
+        || (is_typeof(right) && matches!(left, Expression::StringLiteral(_)))
 }
 
 // A string-literal property lookup has the same runtime key as a dot lookup.
@@ -1007,6 +1041,25 @@ impl<'a> Visit<'a> for CanonicalUnitCollector<'_> {
 
     fn visit_parenthesized_expression(&mut self, expression: &ParenthesizedExpression<'a>) {
         self.visit_expression(&expression.expression);
+    }
+
+    fn visit_binary_expression(&mut self, expression: &oxc_ast::ast::BinaryExpression<'a>) {
+        if is_typeof_string_literal_comparison(expression) {
+            let (typeof_expression, other_operand) =
+                if matches!(
+                    unparenthesized_expression(&expression.left),
+                    Expression::UnaryExpression(unary)
+                        if unary.operator == UnaryOperator::Typeof
+                ) {
+                    (&expression.left, &expression.right)
+                } else {
+                    (&expression.right, &expression.left)
+                };
+            self.visit_expression(typeof_expression);
+            self.visit_expression(other_operand);
+        } else {
+            walk::walk_binary_expression(self, expression);
+        }
     }
 
     fn visit_computed_member_expression(&mut self, expression: &oxc_ast::ast::ComputedMemberExpression<'a>) {
@@ -11648,41 +11701,71 @@ mod tests {
 
     #[test]
     fn typeof_equality_normalization_matches_deobfuscated_dependency() {
-        let loose = "const check = value => typeof value == 'string' ? value : undefined;";
-        let strict = "const check = value => typeof value === 'string' ? value : undefined;";
-        let (loose_canonical, loose_raw, _) =
-            canonicalize(loose, SourceType::mjs(), "loose.js", "right").unwrap();
-        let (strict_canonical, strict_raw, _) =
-            canonicalize(strict, SourceType::mjs(), "strict.js", "dependency").unwrap();
-        let loose_units = collect_units(
-            &loose_canonical,
-            loose,
-            SourceType::mjs(),
-            "loose.js",
-            "right",
-            loose_raw,
-            None,
-        )
-        .unwrap();
-        let strict_units = collect_units(
-            &strict_canonical,
-            strict,
-            SourceType::mjs(),
-            "strict.js",
-            "dependency",
-            strict_raw,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            loose_units
-                .iter()
-                .map(|unit| &unit.linked_sha256)
-                .collect::<Vec<_>>(),
-            strict_units
-                .iter()
-                .map(|unit| &unit.linked_sha256)
+        let linked_hashes = |source: &str, file: &str, side: &str| {
+            let (canonical, raw, _) = canonicalize(source, SourceType::mjs(), file, side).unwrap();
+            collect_units(&canonical, source, SourceType::mjs(), file, side, raw, None)
+                .unwrap()
+                .into_iter()
+                .map(|unit| unit.linked_sha256)
                 .collect::<Vec<_>>()
+        };
+        let loose = "const check = value => 'string' == ((typeof value)) ? value : undefined;";
+        let strict = "const check = value => typeof value === \"string\" ? value : undefined;";
+        assert_eq!(
+            linked_hashes(loose, "loose.js", "right"),
+            linked_hashes(strict, "strict.js", "dependency")
+        );
+        assert_eq!(
+            linked_hashes("const f = value => value === 'saved';", "single.js", "left"),
+            linked_hashes("const f = value => value === \"saved\";", "double.js", "right")
+        );
+        assert_eq!(
+            linked_hashes("const f = value => value === '\\u0061';", "escaped.js", "left"),
+            linked_hashes("const f = value => value === 'a';", "plain.js", "right")
+        );
+        assert_eq!(
+            linked_hashes("const f = () => 1_000;", "separated.js", "left"),
+            linked_hashes("const f = () => 1e3;", "exponent.js", "right")
+        );
+        assert_eq!(
+            linked_hashes("const f = () => 10_000n;", "decimal.js", "left"),
+            linked_hashes("const f = () => 0x2710n;", "hex.js", "right")
+        );
+        assert_ne!(
+            linked_hashes("const f = value => value === 'saved';", "saved.js", "left"),
+            linked_hashes(
+                "const f = value => value === \"draft\";",
+                "draft.js",
+                "right"
+            )
+        );
+        assert_ne!(
+            linked_hashes("const f = () => 1_000;", "thousand.js", "left"),
+            linked_hashes("const f = () => 1_001;", "thousand-one.js", "right")
+        );
+        assert_ne!(
+            linked_hashes(
+                "const f = value => typeof value == other;",
+                "loose.js",
+                "left"
+            ),
+            linked_hashes(
+                "const f = value => typeof value === other;",
+                "strict.js",
+                "right"
+            )
+        );
+        assert_ne!(
+            linked_hashes(
+                "const f = value => typeof value > 'string';",
+                "greater.js",
+                "left"
+            ),
+            linked_hashes(
+                "const f = value => typeof value < 'string';",
+                "less.js",
+                "right"
+            )
         );
     }
 
