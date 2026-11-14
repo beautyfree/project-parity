@@ -208,8 +208,41 @@ fn database_identity(conn: &Connection, db: &Path) -> Result<Option<RootIdentity
     Ok(Some(prior.roots))
 }
 
+fn require_nonempty_database_file(db: &Path) -> Result<()> {
+    let metadata = fs::metadata(db)
+        .with_context(|| format!("state database does not exist: {}", db.display()))?;
+    if !metadata.is_file() {
+        bail!("state database path is not a regular file: {}", db.display());
+    }
+    if metadata.len() == 0 {
+        bail!(
+            "state database is an empty file: {}; refusing to create a fresh queue or overwrite the missing ledger",
+            db.display()
+        );
+    }
+    Ok(())
+}
+
+fn open_existing_database(db: &Path) -> Result<Connection> {
+    require_nonempty_database_file(db)?;
+    Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .with_context(|| format!("open state database {}", db.display()))
+}
+
+fn open_or_create_state_database(db: &Path) -> Result<Connection> {
+    let flags = if db.exists() {
+        require_nonempty_database_file(db)?;
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+    } else {
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
+    };
+    Connection::open_with_flags(db, flags)
+        .with_context(|| format!("open state database {}", db.display()))
+}
+
 fn check_database_identity(db: &Path, expected: &RootIdentity) -> Result<()> {
     if db.exists() {
+        require_nonempty_database_file(db)?;
         // Never use immutable mode: it can ignore live WAL decisions.
         let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(Duration::from_millis(1000))?;
@@ -299,13 +332,15 @@ impl SyncGuard {
     pub fn for_generation(local: &Path, upstream: &Path, report: &Path, db: Option<&Path>) -> Result<Self> {
         let guard = Self::acquire(RootIdentity::new(local, upstream)?, report, db, true)?;
         if let Some(db) = &guard.db {
-            let mut conn = Connection::open(db)?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if let Some(roots) = database_identity(&tx, db)? { roots.require(&guard.roots, db)?; }
-            // Bind verified legacy provenance before its report can be replaced.
-            // A later generation failure leaves decisions intact and roots known.
-            store_database_identity(&tx, &guard.roots)?;
-            tx.commit()?;
+            if db.exists() {
+                let mut conn = open_existing_database(db)?;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                if let Some(roots) = database_identity(&tx, db)? { roots.require(&guard.roots, db)?; }
+                // Bind verified legacy provenance before its report can be replaced.
+                // A later generation failure leaves decisions intact and roots known.
+                store_database_identity(&tx, &guard.roots)?;
+                tx.commit()?;
+            }
         }
         fs::create_dir_all(&guard.report)?;
         write_report_marker(&guard.report, &guard.roots, true)?;
@@ -927,7 +962,7 @@ fn sync_locked(db_path: &Path, report: &Path, roots: &RootIdentity) -> Result<Va
     incoming.roots.require(roots, report)?;
     check_report_identity(report, roots, true, Some(db_path))?;
     let shared = super::llm_context::read_shared_work_evidence(report)?;
-    let mut conn = Connection::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
+    let mut conn = open_or_create_state_database(db_path)?;
     conn.busy_timeout(Duration::from_millis(1000))?;
     if let Some(previous) = database_identity(&conn, db_path)? { previous.require(roots, db_path)?; }
     conn.execute_batch("PRAGMA journal_mode=WAL")?;
@@ -1148,7 +1183,7 @@ pub fn next_routing_summary(db_path: &Path, limit: usize) -> Result<Value> {
 /// Install the derived ordering index on an existing state database without
 /// rescanning either source tree or changing queue decisions.
 pub fn optimize_queue(db_path: &Path) -> Result<Value> {
-    let conn = Connection::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
+    let conn = open_existing_database(db_path)?;
     conn.busy_timeout(Duration::from_millis(1000))?;
     ensure_batch_schema(&conn)?;
     Ok(serde_json::json!({
@@ -1252,8 +1287,7 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
     // connection so SQLite can safely attach the WAL. A bounded busy timeout
     // prevents an active sync from turning queue inspection into an unbounded
     // hang.
-    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .with_context(|| format!("open {}", db_path.display()))?;
+    let conn = open_existing_database(db_path)?;
     conn.busy_timeout(Duration::from_millis(1000))?;
     ensure_report_is_synced(db_path, &conn)?;
     // Order only the small queue key first. Sorting the full payload here makes
@@ -1810,8 +1844,7 @@ pub fn mark_pending_sync(db_path: &Path, work_item_id: &str, reason: &str) -> Re
     if reason.is_empty() {
         anyhow::bail!("REASON must not be empty");
     }
-    let mut conn =
-        Connection::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
+    let mut conn = open_existing_database(db_path)?;
     conn.busy_timeout(Duration::from_millis(1000))?;
     ensure_decision_schema(&conn)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1844,8 +1877,7 @@ pub fn mark_pending_sync_batch(
     let mut ids = work_item_ids.to_vec();
     ids.sort();
     ids.dedup();
-    let mut conn =
-        Connection::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
+    let mut conn = open_existing_database(db_path)?;
     conn.busy_timeout(Duration::from_millis(1000))?;
     ensure_decision_schema(&conn)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1880,8 +1912,7 @@ pub fn skip(db_path: &Path, work_item_id: &str, reason: &str) -> Result<Value> {
     if reason.is_empty() {
         anyhow::bail!("REASON must not be empty");
     }
-    let mut conn =
-        Connection::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
+    let mut conn = open_existing_database(db_path)?;
     conn.busy_timeout(Duration::from_millis(1000))?;
     ensure_decision_schema(&conn)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1910,8 +1941,7 @@ pub fn skip_batch(db_path: &Path, work_item_ids: &[String], reason: &str) -> Res
     let mut ids = work_item_ids.to_vec();
     ids.sort();
     ids.dedup();
-    let mut conn =
-        Connection::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
+    let mut conn = open_existing_database(db_path)?;
     conn.busy_timeout(Duration::from_millis(1000))?;
     ensure_decision_schema(&conn)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1991,7 +2021,7 @@ fn ensure_run_receipt_schema(conn: &Connection) -> Result<()> {
 }
 
 pub fn stats(db_path: &Path) -> Result<Value> {
-    let conn = Connection::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
+    let conn = open_existing_database(db_path)?;
     let (active, skipped, pending_sync, done, resolved, deferred): (i64, i64, i64, i64, i64, i64) = conn.query_row(
         "SELECT
             COALESCE(SUM(CASE WHEN w.resolved_at IS NULL AND d.work_item_id IS NULL THEN 1 ELSE 0 END), 0),
@@ -2029,7 +2059,7 @@ pub fn stats(db_path: &Path) -> Result<Value> {
 }
 
 pub fn runs(db_path: &Path, limit: usize) -> Result<Value> {
-    let conn = Connection::open(db_path)?;
+    let conn = open_existing_database(db_path)?;
     let has_receipt_column = |name: &str| -> Result<bool> {
         Ok(conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('runs') WHERE name=?1)",
@@ -2077,6 +2107,8 @@ pub fn runs(db_path: &Path, limit: usize) -> Result<Value> {
 }
 
 pub fn import_graph(db_path: &Path, artifact: &Path) -> Result<Value> {
+    // This command owns a standalone graph database and intentionally creates
+    // it when absent; unlike queue commands, it cannot create work items.
     let mut conn = Connection::open(db_path)?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS graph_nodes (id TEXT PRIMARY KEY, side TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS graph_edges (id TEXT PRIMARY KEY, side TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, kind TEXT NOT NULL, dynamic INTEGER NOT NULL, label TEXT, payload TEXT NOT NULL); CREATE INDEX IF NOT EXISTS graph_edges_source ON graph_edges(source); CREATE INDEX IF NOT EXISTS graph_edges_target ON graph_edges(target);")?;
     let input = fs::File::open(artifact).with_context(|| format!("open {}", artifact.display()))?;
@@ -2131,8 +2163,7 @@ pub fn import_graph(db_path: &Path, artifact: &Path) -> Result<Value> {
 pub fn import_codegraph(db_path: &Path, source_db: &Path, side: &str) -> Result<Value> {
     let source = Connection::open(source_db)
         .with_context(|| format!("open CodeGraph database {}", source_db.display()))?;
-    let mut target = Connection::open(db_path)
-        .with_context(|| format!("open state database {}", db_path.display()))?;
+    let mut target = open_existing_database(db_path)?;
     target.execute_batch("CREATE TABLE IF NOT EXISTS graph_nodes (id TEXT PRIMARY KEY, side TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS graph_edges (id TEXT PRIMARY KEY, side TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, kind TEXT NOT NULL, dynamic INTEGER NOT NULL, label TEXT, payload TEXT NOT NULL); CREATE INDEX IF NOT EXISTS graph_edges_source ON graph_edges(source); CREATE INDEX IF NOT EXISTS graph_edges_target ON graph_edges(target);")?;
     let tx = target.transaction()?;
     let mut nodes_stmt = source.prepare(
@@ -2497,6 +2528,33 @@ mod tests {
             "workItemsIntegrity":{"sha256":crate::sha256(body),"records":items.len()},
         });
         fs::write(dir.join("llm-manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn state_commands_do_not_create_a_missing_database() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("missing/state.sqlite");
+
+        assert!(stats(&db).is_err());
+        assert!(!db.exists());
+        assert!(mark_pending_sync(&db, "work-item", "reviewed").is_err());
+        assert!(!db.exists());
+    }
+
+    #[test]
+    fn state_sync_refuses_an_existing_empty_database_without_changing_it() {
+        let root = tempdir().unwrap();
+        let local = root.path().join("local");
+        let upstream = root.path().join("upstream");
+        let report_dir = root.path().join("report");
+        let db = root.path().join("state.sqlite");
+        write_receipted_report(&report_dir, &local, &upstream, "local-hash", &[]);
+        fs::write(&db, []).unwrap();
+
+        let error = sync(&db, &report_dir).unwrap_err();
+
+        assert!(error.to_string().contains("state database is an empty file"));
+        assert_eq!(fs::metadata(&db).unwrap().len(), 0);
     }
 
     #[test]
