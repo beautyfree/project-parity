@@ -1336,6 +1336,11 @@ struct SummaryWorkItem {
     evidence_variants: Option<Vec<EvidenceVariant>>,
 }
 
+struct LocalReportSnapshot {
+    root: PathBuf,
+    file_hashes: HashMap<String, String>,
+}
+
 fn summarize_owners(owners: Option<Vec<SummaryOwner>>) -> (usize, usize, Vec<String>) {
     let owners = owners.unwrap_or_default();
     let owner_count = owners.len();
@@ -1350,6 +1355,103 @@ fn summarize_owners(owners: Option<Vec<SummaryOwner>>) -> (usize, usize, Vec<Str
     (owner_count, file_count, files)
 }
 
+fn next_queue_page(conn: &Connection, limit: usize, offset: usize) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT w.id, w.action, w.priority, w.confidence, w.payload FROM work_items w JOIN (SELECT w.id FROM work_items w LEFT JOIN work_item_decisions d ON d.work_item_id=w.id WHERE w.resolved_at IS NULL AND d.work_item_id IS NULL ORDER BY CASE WHEN w.action='remove-or-justify-extra-local' THEN 4 WHEN w.action='locate-unlinked-upstream-branch' THEN 5 WHEN w.action='inspect-structural-frontier' THEN 6 WHEN w.priority='P0' THEN 0 WHEN w.priority='P1' THEN 1 ELSE 2 END, CASE w.confidence WHEN 'proven-structure' THEN 0 WHEN 'proven-bundle-normalized' THEN 0 WHEN 'candidate' THEN 1 WHEN 'weak-candidate' THEN 2 ELSE 3 END, w.batch_id, w.id LIMIT ?1 OFFSET ?2) next ON next.id=w.id ORDER BY CASE WHEN w.action='remove-or-justify-extra-local' THEN 4 WHEN w.action='locate-unlinked-upstream-branch' THEN 5 WHEN w.action='inspect-structural-frontier' THEN 6 WHEN w.priority='P0' THEN 0 WHEN w.priority='P1' THEN 1 ELSE 2 END, CASE w.confidence WHEN 'proven-structure' THEN 0 WHEN 'proven-bundle-normalized' THEN 0 WHEN 'candidate' THEN 1 WHEN 'weak-candidate' THEN 2 ELSE 3 END, w.batch_id, w.id")?;
+    let rows = stmt.query_map(params![limit as i64, offset as i64], |row| row.get::<_, String>(4))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn item_has_stale_local_source(
+    payload: &str,
+    snapshot: &LocalReportSnapshot,
+    file_staleness: &mut HashMap<String, bool>,
+) -> Result<bool> {
+    let item: SummaryWorkItem = serde_json::from_str(payload)?;
+    let mut files = item
+        .local
+        .into_iter()
+        .flatten()
+        .filter_map(|owner| owner.file)
+        .collect::<HashSet<_>>();
+    files.extend(local_context_files(item.evidence_path, item.evidence_variants));
+    if files.is_empty() {
+        // Legacy and aggregate items without a concrete local owner cannot be
+        // invalidated by a per-file source check. Keep them in the queue.
+        return Ok(false);
+    }
+    for file in files {
+        if let Some(stale) = file_staleness.get(&file) {
+            if *stale {
+                return Ok(true);
+            }
+            continue;
+        }
+        let relative = Path::new(&file);
+        let expected = snapshot.file_hashes.get(&file);
+        let root = snapshot.root.canonicalize()?;
+        let stale = if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            || expected.is_none()
+        {
+            true
+        } else {
+            let source = snapshot.root.join(relative);
+            if !source.is_file() {
+                true
+            } else {
+                let source = source.canonicalize()?;
+                !source.starts_with(&root)
+                    || super::sha256_file(&source)? != *expected.expect("checked above")
+            }
+        };
+        file_staleness.insert(file, stale);
+        if stale {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn next_queue_payloads(
+    conn: &Connection,
+    limit: usize,
+    local_snapshot: Option<&LocalReportSnapshot>,
+) -> Result<(Vec<String>, usize)> {
+    if limit == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    let Some(snapshot) = local_snapshot else {
+        return Ok((next_queue_page(conn, limit, 0)?, 0));
+    };
+
+    let page_size = limit.max(32);
+    let mut offset = 0;
+    let mut payloads = Vec::with_capacity(limit);
+    let mut stale_count = 0;
+    let mut file_staleness = HashMap::new();
+    loop {
+        let page = next_queue_page(conn, page_size, offset)?;
+        let page_len = page.len();
+        for payload in page {
+            if item_has_stale_local_source(&payload, snapshot, &mut file_staleness)? {
+                stale_count += 1;
+            } else {
+                payloads.push(payload);
+                if payloads.len() == limit {
+                    return Ok((payloads, stale_count));
+                }
+            }
+        }
+        if page_len < page_size {
+            break;
+        }
+        offset += page_len;
+    }
+    Ok((payloads, stale_count))
+}
+
 fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) -> Result<Value> {
     // SQLite WAL readers on macOS still need to open the database directory
     // for the -shm sidecar. A strict READ_ONLY connection therefore fails on
@@ -1360,7 +1462,7 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
     // hang.
     let conn = open_existing_database(db_path)?;
     conn.busy_timeout(Duration::from_millis(1000))?;
-    ensure_report_is_synced(db_path, &conn)?;
+    let local_snapshot = ensure_report_is_synced(db_path, &conn)?;
     // Order only the small queue key first. Sorting the full payload here makes
     // SQLite materialize tens of thousands of large JSON blobs before LIMIT
     // can apply, which is both slow and capable of exhausting disk space.
@@ -1368,8 +1470,9 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
     // audit phases. Large generated/compatibility-heavy sets can otherwise
     // starve upstream functionality gaps. Keep both classes in the queue and
     // surface them automatically after earlier phases are exhausted.
-    let mut stmt = conn.prepare("SELECT w.id, w.action, w.priority, w.confidence, w.payload FROM work_items w JOIN (SELECT w.id FROM work_items w LEFT JOIN work_item_decisions d ON d.work_item_id=w.id WHERE w.resolved_at IS NULL AND d.work_item_id IS NULL ORDER BY CASE WHEN w.action='remove-or-justify-extra-local' THEN 4 WHEN w.action='locate-unlinked-upstream-branch' THEN 5 WHEN w.action='inspect-structural-frontier' THEN 6 WHEN w.priority='P0' THEN 0 WHEN w.priority='P1' THEN 1 ELSE 2 END, CASE w.confidence WHEN 'proven-structure' THEN 0 WHEN 'proven-bundle-normalized' THEN 0 WHEN 'candidate' THEN 1 WHEN 'weak-candidate' THEN 2 ELSE 3 END, w.batch_id, w.id LIMIT ?1) next ON next.id=w.id ORDER BY CASE WHEN w.action='remove-or-justify-extra-local' THEN 4 WHEN w.action='locate-unlinked-upstream-branch' THEN 5 WHEN w.action='inspect-structural-frontier' THEN 6 WHEN w.priority='P0' THEN 0 WHEN w.priority='P1' THEN 1 ELSE 2 END, CASE w.confidence WHEN 'proven-structure' THEN 0 WHEN 'proven-bundle-normalized' THEN 0 WHEN 'candidate' THEN 1 WHEN 'weak-candidate' THEN 2 ELSE 3 END, w.batch_id, w.id")?;
-    let rows = stmt.query_map(params![limit as i64], |row| row.get::<_, String>(4))?;
+    let (payloads, stale_local_items_excluded) =
+        next_queue_payloads(&conn, limit, local_snapshot.as_ref())?;
+    let rows = payloads.into_iter().map(Ok::<_, anyhow::Error>);
     let items = if routing && summary {
         rows.map(|row| -> Result<Value> {
             let payload = row?;
@@ -1628,6 +1731,7 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
             "schema": "project-parity/state-next-v2",
             "routing": true,
             "summary": summary,
+            "staleLocalItemsExcluded": stale_local_items_excluded,
             "count": items.len(),
             "reviewGroups": review_groups,
             "ownerGroups": owner_groups,
@@ -1640,6 +1744,7 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
         serde_json::json!({
             "schema": "project-parity/state-next-v1",
             "summary": summary,
+            "staleLocalItemsExcluded": stale_local_items_excluded,
             "count": items.len(),
             "items": items,
         })
@@ -1692,7 +1797,7 @@ fn is_parity_campaign_db(db_path: &Path) -> bool {
         .is_some_and(|name| name == ".parity" || name.starts_with(".parity-"))
 }
 
-fn ensure_report_is_synced(db_path: &Path, conn: &Connection) -> Result<()> {
+fn ensure_report_is_synced(db_path: &Path, conn: &Connection) -> Result<Option<LocalReportSnapshot>> {
     let latest: Option<(String, i64)> = conn
         .query_row(
             "SELECT report, CAST(strftime('%s', synced_at) AS INTEGER) FROM runs ORDER BY id DESC LIMIT 1",
@@ -1701,7 +1806,7 @@ fn ensure_report_is_synced(db_path: &Path, conn: &Connection) -> Result<()> {
         )
         .optional()?;
     let Some((report, synced_at)) = latest else {
-        return Ok(());
+        return Ok(None);
     };
     let report = resolve_report_path(db_path, &report);
     let manifest = report.join("llm-manifest.json");
@@ -1714,10 +1819,10 @@ fn ensure_report_is_synced(db_path: &Path, conn: &Connection) -> Result<()> {
             db_path.display(),
             manifest.display()
         ),
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(None),
     };
     let Ok(age) = modified_at.duration_since(UNIX_EPOCH) else {
-        return Ok(());
+        return Ok(None);
     };
     let modified_seconds = age.as_secs() as i64;
     // SQLite's CURRENT_TIMESTAMP has one-second precision. Permit the same
@@ -1790,6 +1895,27 @@ fn ensure_report_is_synced(db_path: &Path, conn: &Connection) -> Result<()> {
             );
         }
     }
+    let local_report_snapshot = manifest_value["localRoot"]
+        .as_str()
+        .and_then(|root| {
+            let report_json = report.join("report.json");
+            let bytes = fs::read(report_json).ok()?;
+            let value: Value = serde_json::from_slice(&bytes).ok()?;
+            let files = value["left"]["files"].as_array()?;
+            let file_hashes = files
+                .iter()
+                .filter_map(|file| {
+                    Some((
+                        file["file"].as_str()?.to_string(),
+                        file["sourceSha256"].as_str()?.to_string(),
+                    ))
+                })
+                .collect::<HashMap<_, _>>();
+            (!file_hashes.is_empty()).then(|| LocalReportSnapshot {
+                root: PathBuf::from(root),
+                file_hashes,
+            })
+        });
     if let Some(dependencies) = manifest_value["inputFingerprints"]["dependencies"].as_object() {
         let root = dependencies["root"]
             .as_str()
@@ -1833,7 +1959,7 @@ fn ensure_report_is_synced(db_path: &Path, conn: &Connection) -> Result<()> {
             "parity report manifest is missing dependency source fingerprints. Regenerate the report and run `project-parity sync` before requesting the next item"
         );
     }
-    Ok(())
+    Ok(local_report_snapshot)
 }
 
 /// Guard the bounded queue slice against a report/state mismatch. The index is
@@ -3047,6 +3173,98 @@ mod tests {
         fs::remove_file(local.join("tsconfig.json")).unwrap();
         fs::write(local.join("package.json"), r#"{"name":"fixture"}"#).unwrap();
         assert_eq!(next(&db, 10).unwrap()["count"], 1);
+    }
+
+    #[test]
+    fn next_excludes_work_items_whose_local_owner_changed_during_checkpoint() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("state.sqlite");
+        let report_dir = root.path().join("report");
+        let local = root.path().join("local");
+        let upstream = root.path().join("upstream");
+        fs::create_dir_all(local.join("src")).unwrap();
+        fs::create_dir_all(upstream.join("src")).unwrap();
+        fs::create_dir_all(&report_dir).unwrap();
+
+        let sources = [
+            ("src/a.js", "export const a = 1\n"),
+            ("src/b.js", "export const b = 1\n"),
+            ("src/c.js", "export const c = 1\n"),
+        ];
+        for (relative, source) in sources {
+            fs::write(local.join(relative), source).unwrap();
+        }
+        let items = [
+            ("a", "src/a.js"),
+            ("b", "src/b.js"),
+            ("c", "src/c.js"),
+        ]
+        .map(|(id, file)| {
+            serde_json::json!({
+                "id": id,
+                "action": "inspect",
+                "priority": "P1",
+                "local": [{"file": file}],
+            })
+        });
+        report_items(&report_dir, &items);
+
+        let local_input_files = sources
+            .iter()
+            .map(|(relative, _)| (local.join(relative), relative.to_string()))
+            .collect::<Vec<_>>();
+        let local_fingerprint = crate::fingerprint_input(&local, &local_input_files).unwrap();
+        let upstream_fingerprint = crate::fingerprint_input(&upstream, &[]).unwrap();
+        fs::write(
+            report_dir.join("llm-manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "engine": ENGINE_VERSION,
+                "localRoot": local.display().to_string(),
+                "analysisProjection": upstream.display().to_string(),
+                "inputHashes": {"local": "local", "upstream": "upstream"},
+                "inputFingerprints": {
+                    "local": {
+                        "sha256": local_fingerprint,
+                        "inputFiles": local_input_files,
+                    },
+                    "upstream": {"sha256": upstream_fingerprint, "inputFiles": []},
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            report_dir.join("report.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "left": {
+                    "root": local.display().to_string(),
+                    "projectSha256": "local",
+                    "files": sources.iter().map(|(file, source)| serde_json::json!({
+                        "file": file,
+                        "sourceSha256": crate::sha256(source.as_bytes()),
+                    })).collect::<Vec<_>>(),
+                },
+                "right": {
+                    "root": upstream.display().to_string(),
+                    "projectSha256": "upstream",
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        sync(&db, &report_dir).unwrap();
+        mark_pending_sync(&db, "a", "reviewed patch awaiting checkpoint").unwrap();
+
+        fs::write(local.join("src/b.js"), "export const b = 2\n").unwrap();
+
+        let queue = next(&db, 10).unwrap();
+        let ids = queue["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["c"]);
     }
 
     #[test]
