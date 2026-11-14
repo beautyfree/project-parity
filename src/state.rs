@@ -600,31 +600,67 @@ fn routing_reclassification_preserves_evidence(previous: &str, current: &str) ->
     previous == current
 }
 
-fn remove_stable_locator_fields(value: &mut Value) -> (usize, bool) {
-    fn visit(value: &mut Value, root: bool, count: &mut usize, complete: &mut bool) {
+fn remove_stable_locator_fields(value: &mut Value, allow_review_fingerprint: bool) -> (usize, bool) {
+    fn visit(
+        value: &mut Value,
+        root: bool,
+        allow_review_fingerprint: bool,
+        count: &mut usize,
+        complete: &mut bool,
+    ) {
         match value {
             Value::Object(object) => {
-                if object.get("stableFingerprint").and_then(Value::as_str).is_some_and(|value| !value.is_empty()) {
+                let stable_fingerprint = object
+                    .get("stableFingerprint")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+                let review_fingerprint = object
+                    .get("reviewFingerprint")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+                let fingerprint = if allow_review_fingerprint {
+                    match (stable_fingerprint.as_deref(), review_fingerprint.as_deref()) {
+                        (Some(stable), Some(review)) if stable != review => {
+                            *complete = false;
+                            None
+                        }
+                        (Some(stable), _) => Some(stable.to_owned()),
+                        (_, Some(review)) => Some(review.to_owned()),
+                        _ => None,
+                    }
+                } else {
+                    stable_fingerprint
+                };
+                if let Some(fingerprint) = fingerprint {
                     *count += 1;
                     for key in ["id", "line", "start", "end", "origin"] {
                         object.remove(key);
                     }
+                    object.remove("stableFingerprint");
+                    object.insert("reviewFingerprint".to_string(), Value::String(fingerprint));
                 } else if !root && object.contains_key("id") {
+                    object.remove("reviewFingerprint");
                     *complete = false;
+                } else {
+                    object.remove("reviewFingerprint");
                 }
                 for (key, child) in object.iter_mut() {
                     if key != "legacyIds" {
-                        visit(child, false, count, complete);
+                        visit(child, false, allow_review_fingerprint, count, complete);
                     }
                 }
             }
-            Value::Array(values) => values.iter_mut().for_each(|child| visit(child, false, count, complete)),
+            Value::Array(values) => values.iter_mut().for_each(|child| {
+                visit(child, false, allow_review_fingerprint, count, complete)
+            }),
             _ => {}
         }
     }
     let mut count = 0;
     let mut complete = true;
-    visit(value, true, &mut count, &mut complete);
+    visit(value, true, allow_review_fingerprint, &mut count, &mut complete);
     (count, complete)
 }
 fn review_evidence_matches(previous: &str, current: &str) -> bool {
@@ -634,13 +670,36 @@ fn review_evidence_matches(previous: &str, current: &str) -> bool {
     ) else {
         return false;
     };
-    if previous_value == current_value || routing_reclassification_preserves_evidence(previous, current) {
+    if previous_value == current_value {
+        return true;
+    }
+    let allow_review_fingerprint = match (
+        previous_value.get("reviewIdentity"),
+        current_value.get("reviewIdentity"),
+    ) {
+        (Some(previous), Some(current)) => {
+            if previous != current {
+                return false;
+            }
+            true
+        }
+        (None, Some(_)) => {
+            let mut legacy = previous_value.clone();
+            let (count, complete) = remove_stable_locator_fields(&mut legacy, false);
+            count > 0 && complete
+        }
+        (Some(_), None) => return false,
+        (None, None) => false,
+    };
+    if routing_reclassification_preserves_evidence(previous, current) {
         return true;
     }
     let mut previous_stable = previous_value;
     let mut current_stable = current_value;
-    let (previous_count, previous_complete) = remove_stable_locator_fields(&mut previous_stable);
-    let (current_count, current_complete) = remove_stable_locator_fields(&mut current_stable);
+    let (previous_count, previous_complete) =
+        remove_stable_locator_fields(&mut previous_stable, allow_review_fingerprint);
+    let (current_count, current_complete) =
+        remove_stable_locator_fields(&mut current_stable, allow_review_fingerprint);
     if previous_count == 0 || current_count == 0 || !previous_complete || !current_complete {
         return false;
     }
@@ -650,6 +709,7 @@ fn review_evidence_matches(previous: &str, current: &str) -> bool {
             object.remove("legacyIds");
             object.remove("inspectNodeIds");
             object.remove("inspectNodeIdsFromOwners");
+            object.remove("reviewIdentity");
         }
     }
     let previous = serde_json::to_string(&previous_stable).unwrap_or_default();
@@ -673,7 +733,15 @@ fn legacy_rekey_payload_matches(previous: &str, current: &str, legacy_id: &str) 
         match value {
             Value::Object(object) => {
                 if object.contains_key("file") && object.contains_key("id") {
-                    for key in ["id", "line", "start", "end", "origin", "stableFingerprint"] {
+                    for key in [
+                        "id",
+                        "line",
+                        "start",
+                        "end",
+                        "origin",
+                        "stableFingerprint",
+                        "reviewFingerprint",
+                    ] {
                         object.remove(key);
                     }
                 }
@@ -691,6 +759,7 @@ fn legacy_rekey_payload_matches(previous: &str, current: &str, legacy_id: &str) 
                 "batchId",
                 "inspectNodeIds",
                 "inspectNodeIdsFromOwners",
+                "reviewIdentity",
             ] {
                 object.remove(key);
             }
@@ -723,7 +792,8 @@ fn stable_review_payload_matches(previous: &str, current: &str) -> bool {
 }
 fn stable_review_payload_key(payload: &str) -> Option<String> {
     let mut value = serde_json::from_str::<Value>(payload).ok()?;
-    let (count, complete) = remove_stable_locator_fields(&mut value);
+    let allow_review_fingerprint = value.get("reviewIdentity").is_some();
+    let (count, complete) = remove_stable_locator_fields(&mut value, allow_review_fingerprint);
     if count == 0 || !complete {
         return None;
     }
@@ -738,6 +808,7 @@ fn stable_review_payload_key(payload: &str) -> Option<String> {
         "batchId",
         "inspectNodeIds",
         "inspectNodeIdsFromOwners",
+        "reviewIdentity",
     ] {
         object.remove(key);
     }

@@ -567,22 +567,38 @@ fn graph_node_ref(node: &GraphNode) -> GraphNodeRef {
     }
 }
 
+#[cfg(test)]
 fn unique_stable_review_identities(candidates: Vec<(String, String)>) -> HashMap<String, String> {
+    let (fingerprints, ambiguous) = stable_review_identity_maps(candidates);
+    fingerprints
+        .into_iter()
+        .filter(|(_, fingerprint)| !ambiguous.contains(fingerprint))
+        .collect()
+}
+fn stable_review_identity_maps(
+    candidates: Vec<(String, String)>,
+) -> (HashMap<String, String>, HashSet<String>) {
     let mut counts = HashMap::<String, usize>::with_capacity(candidates.len());
     for (_, fingerprint) in &candidates {
         *counts.entry(fingerprint.clone()).or_default() += 1;
     }
-    candidates
-        .into_iter()
-        .filter_map(|(id, fingerprint)| {
-            (counts[&fingerprint] == 1).then_some((id, fingerprint))
-        })
-        .collect()
+    let mut fingerprints = HashMap::with_capacity(candidates.len());
+    let mut ambiguous = HashSet::new();
+    for (id, fingerprint) in candidates {
+        if counts[&fingerprint] != 1 {
+            ambiguous.insert(fingerprint.clone());
+        }
+        fingerprints.insert(id, fingerprint);
+    }
+    (fingerprints, ambiguous)
 }
 fn stable_review_fingerprint(material: &str) -> String {
     format!("stable-review-v1:{}", sha256(material))
 }
-fn stable_review_identity_map(left: &ProjectIndex, right: &ProjectIndex) -> HashMap<String, String> {
+fn stable_review_identity_map(
+    left: &ProjectIndex,
+    right: &ProjectIndex,
+) -> (HashMap<String, String>, HashSet<String>) {
     let mut candidates = Vec::<(String, String)>::with_capacity(
         left.units.len() + right.units.len() + left.graph_nodes.len() + right.graph_nodes.len(),
     );
@@ -659,43 +675,66 @@ fn stable_review_identity_map(left: &ProjectIndex, right: &ProjectIndex) -> Hash
             candidates.push((node.id.clone(), stable_review_fingerprint(&material)));
         }
     }
-    unique_stable_review_identities(candidates)
+    stable_review_identity_maps(candidates)
 }
-fn stable_identity(identity: &str, identities: &HashMap<String, String>) -> Option<String> {
-    identities.get(identity).cloned().or_else(|| {
-        (!identity.starts_with("left:") && !identity.starts_with("right:"))
-            .then(|| identity.to_string())
-    })
+#[cfg(test)]
+fn stable_identity(
+    identity: &str,
+    fingerprints: &HashMap<String, String>,
+) -> Option<String> {
+    stable_identity_with_ambiguity(identity, fingerprints, &HashSet::new())
 }
-fn annotate_stable_fingerprints(value: &mut Value, identities: &HashMap<String, String>) {
+fn stable_identity_with_ambiguity(
+    identity: &str,
+    fingerprints: &HashMap<String, String>,
+    ambiguous: &HashSet<String>,
+) -> Option<String> {
+    fingerprints
+        .get(identity)
+        .filter(|fingerprint| !ambiguous.contains(*fingerprint))
+        .cloned()
+        .or_else(|| {
+            (!identity.starts_with("left:") && !identity.starts_with("right:"))
+                .then(|| identity.to_string())
+        })
+}
+fn annotate_review_fingerprints(
+    value: &mut Value,
+    fingerprints: &HashMap<String, String>,
+    ambiguous_fingerprints: &HashSet<String>,
+) {
     match value {
         Value::Object(object) => {
             if let Some(id) = object.get("id").and_then(Value::as_str) {
-                if let Some(fingerprint) = identities.get(id) {
+                if let Some(fingerprint) = fingerprints.get(id) {
                     object.insert(
-                        "stableFingerprint".to_string(),
+                        "reviewFingerprint".to_string(),
                         Value::String(fingerprint.clone()),
                     );
+                    if !ambiguous_fingerprints.contains(fingerprint) {
+                        object.insert(
+                            "stableFingerprint".to_string(),
+                            Value::String(fingerprint.clone()),
+                        );
+                    }
                 }
             }
             for child in object.values_mut() {
-                annotate_stable_fingerprints(child, identities);
+                annotate_review_fingerprints(child, fingerprints, ambiguous_fingerprints);
             }
         }
         Value::Array(items) => {
             for item in items {
-                annotate_stable_fingerprints(item, identities);
+                annotate_review_fingerprints(item, fingerprints, ambiguous_fingerprints);
             }
         }
         _ => {}
     }
 }
-fn work_item_id(action: &str, identities: impl IntoIterator<Item = String>) -> String {
-    // Identities are collected from graph/hash-map traversals whose iteration
-    // order is not a stable part of the evidence.  A work-item ID must name
-    // the evidence set, not the incidental order in which it was discovered;
-    // otherwise an unchanged report reopens the same item under a new ID.
-    let identities = identities.into_iter().collect::<Vec<_>>();
+fn work_item_identity_parts(
+    action: &str,
+    identities: impl IntoIterator<Item = String>,
+) -> (String, Vec<String>) {
     // Frontier evidence can legitimately contain several equivalent edge
     // routes, and unmatched-local candidates are ranked with unstable ties.
     // Those alternatives belong in the payload, not in the durable queue key.
@@ -708,6 +747,7 @@ fn work_item_id(action: &str, identities: impl IntoIterator<Item = String>) -> S
         "inspect-weak-changed-branch" => "reconcile-changed-branch",
         _ => action,
     };
+    let identities = identities.into_iter().collect::<Vec<_>>();
     let identities = match identity_action {
         "remove-or-justify-extra-local" => identities.into_iter().take(1).collect(),
         "port-missing-upstream-branch" | "reconcile-changed-branch" => {
@@ -716,6 +756,14 @@ fn work_item_id(action: &str, identities: impl IntoIterator<Item = String>) -> S
         _ => identities,
     };
     let identities = identities.into_iter().collect::<BTreeSet<_>>();
+    (identity_action.to_string(), identities.into_iter().collect())
+}
+fn work_item_id(action: &str, identities: impl IntoIterator<Item = String>) -> String {
+    // Identities are collected from graph/hash-map traversals whose iteration
+    // order is not a stable part of the evidence.  A work-item ID must name
+    // the evidence set, not the incidental order in which it was discovered;
+    // otherwise an unchanged report reopens the same item under a new ID.
+    let (identity_action, identities) = work_item_identity_parts(action, identities);
     let material = std::iter::once(identity_action.to_string())
         .chain(identities)
         .collect::<Vec<_>>()
@@ -850,9 +898,11 @@ fn unlinked_upstream_triage() -> (&'static str, &'static str) {
     ("P2", "unknown")
 }
 
+#[cfg(test)]
 fn push_work_item(items: &mut Vec<Value>, draft: WorkItemDraft) -> String {
     push_work_item_with_identity_action(items, draft, None)
 }
+#[cfg(test)]
 fn push_work_item_with_identity_action(
     items: &mut Vec<Value>,
     draft: WorkItemDraft,
@@ -860,20 +910,49 @@ fn push_work_item_with_identity_action(
 ) -> String {
     push_work_item_with_review_identities(items, draft, identity_action, &HashMap::new())
 }
+#[cfg(test)]
 fn push_work_item_with_review_identities(
     items: &mut Vec<Value>,
     draft: WorkItemDraft,
     identity_action: Option<&str>,
     stable_identities: &HashMap<String, String>,
 ) -> String {
+    push_work_item_with_review_fingerprints(
+        items,
+        draft,
+        identity_action,
+        stable_identities,
+        &HashSet::new(),
+    )
+}
+fn push_work_item_with_review_fingerprints(
+    items: &mut Vec<Value>,
+    draft: WorkItemDraft,
+    identity_action: Option<&str>,
+    review_fingerprints: &HashMap<String, String>,
+    ambiguous_fingerprints: &HashSet<String>,
+) -> String {
     let action = identity_action.unwrap_or(draft.action);
     let legacy_id = work_item_id(action, draft.identities.iter().cloned());
-    let stable_ids = draft
-        .identities
+    let (stable_identity_action, key_identities) =
+        work_item_identity_parts(action, draft.identities.iter().cloned());
+    let stable_ids = key_identities
         .iter()
-        .map(|identity| stable_identity(identity, stable_identities))
+        .map(|identity| {
+            stable_identity_with_ambiguity(identity, review_fingerprints, ambiguous_fingerprints)
+        })
         .collect::<Option<Vec<_>>>();
-    let id = if !draft.identities.is_empty() {
+    let review_identity = if key_identities.is_empty() {
+        None
+    } else {
+        stable_ids.as_ref().map(|identities| {
+            json!({
+                "action": stable_identity_action,
+                "identities": identities,
+            })
+        })
+    };
+    let id = if !key_identities.is_empty() {
         stable_ids
             .map(|identities| work_item_id(action, identities))
             .unwrap_or_else(|| legacy_id.clone())
@@ -890,7 +969,7 @@ fn push_work_item_with_review_identities(
     let mut upstream = draft.upstream;
     let mut evidence_path = draft.evidence_path;
     for evidence in local.iter_mut().chain(&mut upstream).chain(&mut evidence_path) {
-        annotate_stable_fingerprints(evidence, stable_identities);
+        annotate_review_fingerprints(evidence, review_fingerprints, ambiguous_fingerprints);
     }
     let mut item = json!({
         "id": id,
@@ -903,6 +982,9 @@ fn push_work_item_with_review_identities(
         "evidencePath": evidence_path,
         "inspectNodeIds": inspect_node_ids,
     });
+    if let Some(review_identity) = review_identity {
+        item["reviewIdentity"] = review_identity;
+    }
     if id != legacy_id {
         item["legacyIds"] = json!([legacy_id]);
     }
@@ -1252,12 +1334,24 @@ pub(crate) fn write_llm_context(
         })
         .as_ref()
         .map_err(|error| anyhow::anyhow!(error.clone()))?;
-    let stable_review_identities = stable_review_identity_map(left, right);
+    let (review_fingerprints, ambiguous_review_fingerprints) = stable_review_identity_map(left, right);
     let push_work_item = |items: &mut Vec<Value>, draft: WorkItemDraft| {
-        push_work_item_with_review_identities(items, draft, None, &stable_review_identities)
+        push_work_item_with_review_fingerprints(
+            items,
+            draft,
+            None,
+            &review_fingerprints,
+            &ambiguous_review_fingerprints,
+        )
     };
     let push_work_item_with_identity_action = |items: &mut Vec<Value>, draft: WorkItemDraft, action: Option<&str>| {
-        push_work_item_with_review_identities(items, draft, action, &stable_review_identities)
+        push_work_item_with_review_fingerprints(
+            items,
+            draft,
+            action,
+            &review_fingerprints,
+            &ambiguous_review_fingerprints,
+        )
     };
     let mut work_items = Vec::<Value>::new();
     let shared_work_evidence = HashMap::new();
