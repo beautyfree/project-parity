@@ -449,6 +449,112 @@ fn graph_node_value(node: &GraphNodeRef) -> Value {
     serde_json::to_value(node).expect("GraphNodeRef serializes")
 }
 
+fn proven_single_export_module_context(
+    matches: &[MatchRecord],
+    left: &ProjectIndex,
+    right: &ProjectIndex,
+) -> (HashSet<String>, HashSet<(String, String)>) {
+    let owner_at = |project: &ProjectIndex, location: &Location| {
+        project.graph_nodes.iter().find(|node| {
+            node.file == location.file
+                && node.kind == location.kind
+                && node.start == location.start
+                && node.end == location.end
+        }).cloned()
+    };
+    let wrapper_and_file = |project: &ProjectIndex, owner: &GraphNode| {
+        let nodes = project.graph_nodes.iter().map(|node| (node.id.as_str(), node)).collect::<HashMap<_, _>>();
+        let wrappers = project.graph_edges.iter()
+            .filter(|edge| edge.kind == "Contains" && edge.target.as_str() == owner.id)
+            .filter_map(|edge| nodes.get(edge.source.as_str()).copied())
+            .filter(|node| node.kind == "Statement")
+            .collect::<Vec<_>>();
+        if wrappers.len() != 1 { return None; }
+        let wrapper = wrappers[0];
+        let files = project.graph_edges.iter()
+            .filter(|edge| edge.kind == "Contains" && edge.target.as_str() == wrapper.id)
+            .filter_map(|edge| nodes.get(edge.source.as_str()).copied())
+            .filter(|node| node.kind == "File")
+            .collect::<Vec<_>>();
+        if files.len() != 1 { return None; }
+        let file = files[0];
+        let top_level_statements = project.graph_edges.iter()
+            .filter(|edge| edge.kind == "Contains" && edge.source.as_str() == file.id)
+            .filter_map(|edge| nodes.get(edge.target.as_str()).copied())
+            .filter(|node| node.kind == "Statement")
+            .collect::<Vec<_>>();
+        if top_level_statements.len() != 1 || top_level_statements[0].id != wrapper.id { return None; }
+        let executable_units = project.units.iter().filter(|unit| unit.file == file.file).collect::<Vec<_>>();
+        if executable_units.len() != 1
+            || executable_units[0].file != owner.file
+            || executable_units[0].kind != owner.kind
+            || executable_units[0].start != owner.start
+            || executable_units[0].end != owner.end
+        { return None; }
+        let symbol_ids = project.graph_edges.iter()
+            .filter(|edge| edge.kind == "Defines" && edge.target.as_str() == owner.id)
+            .filter_map(|edge| nodes.get(edge.source.as_str()).copied())
+            .filter(|node| node.kind == "Symbol")
+            .map(|node| node.id.as_str())
+            .collect::<HashSet<_>>();
+        if symbol_ids.len() != 1 { return None; }
+        let module_exports = project.graph_edges.iter()
+            .filter(|edge| matches!(edge.kind.as_str(), "Exports" | "ExportsBinding" | "ReExportsBinding" | "TypeExports" | "TypeExportsBinding" | "TypeReExportsBinding"))
+            .filter(|edge| nodes.get(edge.target.as_str()).is_some_and(|node| node.kind == "External" && node.label == "module:<current>" && node.file == file.file))
+            .collect::<Vec<_>>();
+        let bindings = module_exports.iter().filter(|edge| edge.kind == "ExportsBinding").collect::<Vec<_>>();
+        if bindings.is_empty()
+            || module_exports.iter().any(|edge| match edge.kind.as_str() {
+                "Exports" => edge.source.as_str() != wrapper.id,
+                "ExportsBinding" => !symbol_ids.contains(edge.source.as_str()) || edge.label.is_none(),
+                _ => true,
+            })
+        { return None; }
+        let names = bindings.iter().filter_map(|edge| edge.label.clone()).collect::<BTreeSet<_>>();
+        (names.len() == bindings.len()).then_some((file.file.clone(), wrapper.id.clone(), names))
+    };
+
+    let mut covered_nodes = HashSet::new();
+    let mut candidates = Vec::<(String, String)>::new();
+    for record in matches.iter().filter(|record| {
+        record.confidence == "proven-bundle-normalized"
+            && record.basis == "conditional-expression-proof"
+            && record.left.kind == "Function"
+            && record.right.kind == "Function"
+    }) {
+        let (Some(left_owner), Some(right_owner)) = (owner_at(left, &record.left), owner_at(right, &record.right)) else { continue; };
+        let (Some((left_file, _, left_names)), Some((right_file, _, right_names))) =
+            (wrapper_and_file(left, &left_owner), wrapper_and_file(right, &right_owner)) else { continue; };
+        if left_names != right_names { continue; }
+        candidates.push((left_file, right_file));
+    }
+    let mut pair_counts = HashMap::<(String, String), usize>::new();
+    let mut left_counts = HashMap::<String, usize>::new();
+    let mut right_counts = HashMap::<String, usize>::new();
+    for pair in &candidates {
+        *pair_counts.entry(pair.clone()).or_default() += 1;
+        *left_counts.entry(pair.0.clone()).or_default() += 1;
+        *right_counts.entry(pair.1.clone()).or_default() += 1;
+    }
+    let mut used_left = HashSet::new();
+    let mut used_right = HashSet::new();
+    let mut proven_pairs = HashSet::new();
+    for pair in candidates {
+        if pair_counts.get(&pair) != Some(&1)
+            || left_counts.get(&pair.0) != Some(&1)
+            || right_counts.get(&pair.1) != Some(&1)
+            || !used_left.insert(pair.0.clone())
+            || !used_right.insert(pair.1.clone())
+        { continue; }
+        let right_file_node = right.graph_nodes.iter().find(|node| node.kind == "File" && node.file == pair.1);
+        let Some(right_file_node) = right_file_node else { continue; };
+        covered_nodes.extend(right.graph_nodes.iter().filter(|node| node.file == pair.1).map(|node| node.id.clone()));
+        covered_nodes.insert(right_file_node.id.clone());
+        proven_pairs.insert(pair);
+    }
+    (covered_nodes, proven_pairs)
+}
+
 fn graph_node_ref(node: &GraphNode) -> GraphNodeRef {
     GraphNodeRef {
         id: node.id.clone(),
@@ -1381,6 +1487,9 @@ pub(crate) fn write_llm_context(
         );
     }
 
+    let (proven_module_context_nodes, proven_module_file_pairs) =
+        proven_single_export_module_context(matches, left, right);
+
     // Matched function bodies do not establish the enclosing module's exports.
     // Compare both directions so an extra local public binding remains visible.
     let module_contract = |project: &ProjectIndex| {
@@ -1399,6 +1508,7 @@ pub(crate) fn write_llm_context(
     let right_contract = module_contract(right);
     for (file, local_edges) in &left_contract {
         let Some(upstream_edges) = right_contract.get(file) else {
+            if proven_module_file_pairs.iter().any(|(local, _)| local == file) { continue; }
             for node in local_edges.values() {
                 let location = graph_node_ref(node);
                 push_work_item(&mut work_items, WorkItemDraft {
@@ -1473,6 +1583,41 @@ pub(crate) fn write_llm_context(
         .filter(|edge| edge.kind == "Contains")
         .map(|edge| (edge.target.as_str(), edge.source.as_str()))
         .collect::<HashMap<_, _>>();
+    // A narrowly scoped semantic proof covers syntax graph descendants of that
+    // exact function. Neighboring matches and ordinary fingerprints never do.
+    let proven_semantic_owners = matches
+        .iter()
+        .filter(|record| {
+            record.confidence == "proven-bundle-normalized"
+                && record.basis == "conditional-expression-proof"
+                && record.right.kind == "Function"
+        })
+        .filter_map(|record| {
+            right.graph_nodes.iter().find(|node| {
+                node.file == record.right.file
+                    && node.kind == record.right.kind
+                    && node.start == record.right.start
+                    && node.end == record.right.end
+            }).map(|node| node.id.as_str())
+        })
+        .collect::<HashSet<_>>();
+    let semantically_proven_descendants = right.graph_nodes
+        .iter()
+        .filter_map(|node| {
+            let mut cursor = node.id.as_str();
+            let mut seen = HashSet::new();
+            while seen.insert(cursor) {
+                if proven_semantic_owners.contains(cursor) {
+                    return Some(node.id.as_str());
+                }
+                let Some(parent) = parent_by_child.get(cursor).copied() else {
+                    break;
+                };
+                cursor = parent;
+            }
+            None
+        })
+        .collect::<HashSet<_>>();
     let left_parent_by_child = left
         .graph_edges
         .iter()
@@ -1481,7 +1626,10 @@ pub(crate) fn write_llm_context(
         .collect::<HashMap<_, _>>();
     let mut node_status = HashMap::<String, (&'static str, &'static str, Option<String>)>::new();
     for node in &right_nodes {
-        let status = if let Some(frontier) = frontier_by_right.get(node.id.as_str()) {
+        let status = if proven_module_context_nodes.contains(&node.id)
+            || semantically_proven_descendants.contains(node.id.as_str()) {
+            ("structurally-equal", "proven-bundle-normalized", None)
+        } else if let Some(frontier) = frontier_by_right.get(node.id.as_str()) {
             (
                 if frontier.classification == "missing-local-branch" {
                     "missing-local"
@@ -1882,7 +2030,8 @@ pub(crate) fn write_llm_context(
         let Some(right_edge) = frontier.right_edge.as_ref() else {
             continue;
         };
-        if identical_files.contains(right_edge.target.file.as_str())
+        if semantically_proven_descendants.contains(right_edge.target.id.as_str())
+            || identical_files.contains(right_edge.target.file.as_str())
             || node_status
                 .get(&right_edge.target.id)
                 .is_some_and(|status| {
@@ -2073,7 +2222,9 @@ pub(crate) fn write_llm_context(
         .map(|node| node.id.as_str())
         .collect::<HashSet<_>>();
     let context_needs_work = |node: &GraphNode| {
-        if node.kind == "File" || identical_files.contains(node.file.as_str()) {
+        if proven_module_context_nodes.contains(&node.id)
+            || node.kind == "File"
+            || identical_files.contains(node.file.as_str()) {
             return false;
         }
         if executable_ids.contains(node.id.as_str()) {
@@ -2939,6 +3090,7 @@ mod tests {
                 id: i.to_string(), file: "fixture.js".into(), kind: "Function".into(),
                 name: None, start, end, line: 1, origin: None, nodes_approx: 0,
                 strict_sha256: String::new(), linked_sha256: String::new(),
+                semantic_proof: None,
                 tokens: Default::default(), features: Default::default(),
             }).collect::<Vec<_>>();
             let index = HashMap::from([("fixture.js", UnitIntervals::new(units.iter().collect()))]);

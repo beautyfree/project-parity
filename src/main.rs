@@ -117,6 +117,8 @@ struct Unit {
     nodes_approx: usize,
     strict_sha256: String,
     linked_sha256: String,
+    #[serde(skip)]
+    semantic_proof: Option<String>,
     tokens: BTreeSet<Arc<str>>,
     features: FeatureChannels,
 }
@@ -936,6 +938,7 @@ fn record_static_member_property(features: &mut FeatureChannels, property: &str)
 struct CanonicalUnit {
     span: Span,
     features: FeatureChannels,
+    semantic_proof: Option<String>,
 }
 
 struct CanonicalUnitCollector<'s> {
@@ -953,11 +956,12 @@ impl<'s> CanonicalUnitCollector<'s> {
         }
     }
 
-    fn begin_unit(&mut self, span: Span) {
+    fn begin_unit(&mut self, span: Span, semantic_proof: Option<String>) {
         let index = self.units.len();
         self.units.push(CanonicalUnit {
             span,
             features: FeatureChannels::default(),
+            semantic_proof,
         });
         self.active_units.push(index);
     }
@@ -984,19 +988,19 @@ impl<'a> Visit<'a> for CanonicalUnitCollector<'_> {
         if function.body.is_none() {
             return;
         }
-        self.begin_unit(function.span());
+        self.begin_unit(function.span(), conditional_expression_proof(function));
         walk::walk_function(self, function, flags);
         self.end_unit();
     }
 
     fn visit_arrow_function_expression(&mut self, function: &ArrowFunctionExpression<'a>) {
-        self.begin_unit(function.span());
+        self.begin_unit(function.span(), None);
         walk::walk_arrow_function_expression(self, function);
         self.end_unit();
     }
 
     fn visit_class(&mut self, class: &Class<'a>) {
-        self.begin_unit(class.span());
+        self.begin_unit(class.span(), None);
         walk::walk_class(self, class);
         self.end_unit();
     }
@@ -1058,6 +1062,127 @@ impl<'a> Visit<'a> for CanonicalUnitCollector<'_> {
     }
 }
 
+fn simple_binding_name<'a>(pattern: &'a oxc_ast::ast::BindingPattern<'a>) -> Option<&'a str> {
+    match pattern {
+        oxc_ast::ast::BindingPattern::BindingIdentifier(identifier) => Some(identifier.name.as_str()),
+        _ => None,
+    }
+}
+
+fn simple_identifier_name<'a>(expression: &'a Expression<'a>) -> Option<&'a str> {
+    match expression {
+        Expression::Identifier(identifier) => Some(identifier.name.as_str()),
+        _ => None,
+    }
+}
+
+fn assignment_to_identifier<'a>(statement: &'a oxc_ast::ast::Statement<'a>) -> Option<(&'a str, &'a str)> {
+    let oxc_ast::ast::Statement::ExpressionStatement(statement) = statement else {
+        return None;
+    };
+    let Expression::AssignmentExpression(assignment) = &statement.expression else {
+        return None;
+    };
+    if !assignment.operator.is_assign() {
+        return None;
+    }
+    let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(left) = &assignment.left else {
+        return None;
+    };
+    Some((left.name.as_str(), simple_identifier_name(&assignment.right)?))
+}
+
+fn block_assignment_to_identifier<'a>(statement: &'a oxc_ast::ast::Statement<'a>) -> Option<(&'a str, &'a str)> {
+    let oxc_ast::ast::Statement::BlockStatement(block) = statement else {
+        return None;
+    };
+    (block.body.len() == 1)
+        .then(|| assignment_to_identifier(&block.body[0]))
+        .flatten()
+}
+
+fn conditional_expression_proof<'a>(function: &Function<'a>) -> Option<String> {
+    if function.r#async
+        || function.generator
+        || function.this_param.is_some()
+        || function.params.rest.is_some()
+        || function.type_parameters.is_some()
+        || function.return_type.is_some()
+    {
+        return None;
+    }
+    let parameters = function
+        .params
+        .items
+        .iter()
+        .map(|parameter| {
+            (parameter.initializer.is_none()
+                && parameter.type_annotation.is_none()
+                && !parameter.optional
+                && parameter.decorators.is_empty()
+                && parameter.accessibility.is_none()
+                && !parameter.readonly
+                && !parameter.r#override)
+                .then(|| simple_binding_name(&parameter.pattern))
+                .flatten()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let [test_parameter, consequent_parameter, alternate_parameter] = parameters.as_slice() else {
+        return None;
+    };
+    if test_parameter == consequent_parameter
+        || test_parameter == alternate_parameter
+        || consequent_parameter == alternate_parameter
+    {
+        return None;
+    }
+    let body = function.body.as_ref()?;
+    if !body.directives.is_empty() {
+        return None;
+    }
+    let (binding, test, consequent, alternate) = match body.statements.as_slice() {
+        [oxc_ast::ast::Statement::VariableDeclaration(declaration), oxc_ast::ast::Statement::IfStatement(branch), oxc_ast::ast::Statement::ReturnStatement(return_statement)]
+            if declaration.kind == oxc_ast::ast::VariableDeclarationKind::Let
+                && declaration.declarations.len() == 1
+                && declaration.declarations[0].init.is_none() => {
+            let binding = simple_binding_name(&declaration.declarations[0].id)?;
+            let test = simple_identifier_name(&branch.test)?;
+            let alternate_branch = branch.alternate.as_ref()?;
+            let (consequent_binding, consequent) = block_assignment_to_identifier(&branch.consequent)?;
+            let (alternate_binding, alternate) = block_assignment_to_identifier(alternate_branch)?;
+            let returned = return_statement.argument.as_ref().and_then(simple_identifier_name)?;
+            (binding == consequent_binding && binding == alternate_binding && binding == returned)
+                .then_some((binding, test, consequent, alternate))?
+        }
+        [oxc_ast::ast::Statement::VariableDeclaration(declaration), oxc_ast::ast::Statement::ReturnStatement(return_statement)]
+            if declaration.kind == oxc_ast::ast::VariableDeclarationKind::Const
+                && declaration.declarations.len() == 1 => {
+            let declarator = &declaration.declarations[0];
+            let binding = simple_binding_name(&declarator.id)?;
+            let Expression::ConditionalExpression(conditional) = declarator.init.as_ref()? else {
+                return None;
+            };
+            let test = simple_identifier_name(&conditional.test)?;
+            let consequent = simple_identifier_name(&conditional.consequent)?;
+            let alternate = simple_identifier_name(&conditional.alternate)?;
+            let returned = return_statement.argument.as_ref().and_then(simple_identifier_name)?;
+            (binding == returned).then_some((binding, test, consequent, alternate))?
+        }
+        _ => return None,
+    };
+    (binding != test
+        && binding != consequent
+        && binding != alternate
+        && test == *test_parameter
+        && consequent == *consequent_parameter
+        && alternate == *alternate_parameter)
+        .then(|| {
+            sha256(format!(
+                "conditional-expression-proof-v1\\0params:{test_parameter},{consequent_parameter},{alternate_parameter}\\0async:{}\\0generator:{}\\0test:{test}\\0consequent:{consequent}\\0alternate:{alternate}",
+                function.r#async, function.generator
+            ))
+        })
+}
 fn line_at(source: &str, offset: usize) -> usize {
     source[..offset.min(source.len())]
         .bytes()
@@ -1337,6 +1462,7 @@ fn collect_units(
                 linked_sha256: sha256(features.signature(false)),
                 tokens,
                 features,
+                semantic_proof: canonical_unit.semantic_proof,
             }
         })
         .collect())
@@ -5006,6 +5132,85 @@ fn location(unit: &Unit) -> Location {
     }
 }
 
+fn direct_runtime_export_map(project: &ProjectIndex) -> HashMap<String, BTreeSet<String>> {
+    let nodes = project
+        .graph_nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect::<HashMap<_, _>>();
+    let mut symbol_owners = HashMap::<&str, Vec<&str>>::new();
+    for edge in &project.graph_edges {
+        if edge.kind != "Defines" {
+            continue;
+        }
+        let (Some(symbol), Some(owner)) = (nodes.get(edge.source.as_str()), nodes.get(edge.target.as_str())) else {
+            continue;
+        };
+        if symbol.kind == "Symbol" && matches!(owner.kind.as_str(), "Function" | "Class") {
+            symbol_owners
+                .entry(symbol.id.as_str())
+                .or_default()
+                .push(owner.id.as_str());
+        }
+    }
+    let mut exports = HashMap::<String, BTreeSet<String>>::new();
+    for edge in &project.graph_edges {
+        if edge.kind != "ExportsBinding" {
+            continue;
+        }
+        let (Some(module), Some(name)) = (nodes.get(edge.target.as_str()), edge.label.as_ref()) else {
+            continue;
+        };
+        if module.label != "module:<current>" {
+            continue;
+        }
+        for owner in symbol_owners.get(edge.source.as_str()).into_iter().flatten() {
+            let Some(owner) = nodes.get(*owner) else {
+                continue;
+            };
+            if owner.file == module.file {
+                exports.entry(owner.id.clone()).or_default().insert(name.clone());
+            }
+        }
+    }
+    exports
+}
+
+fn unique_runtime_semantic_proof_matches<'a>(
+    left: &'a ProjectIndex,
+    right: &'a ProjectIndex,
+) -> Vec<(&'a Unit, &'a Unit)> {
+    let left_exports = direct_runtime_export_map(left);
+    let right_exports = direct_runtime_export_map(right);
+    let group = |project: &'a ProjectIndex,
+                 exports: &HashMap<String, BTreeSet<String>>| {
+        project
+            .units
+            .iter()
+            .filter_map(|unit| {
+                let proof = unit.semantic_proof.as_ref()?;
+                let owner = graph_location_node(project, &location(unit))?;
+                let names = exports.get(&owner.id)?;
+                let name = names.first()?.clone();
+                (names.len() == 1)
+                    .then_some(((unit.kind.clone(), name, proof.clone()), unit))
+            })
+            .fold(HashMap::<(String, String, String), Vec<&Unit>>::new(), |mut groups, (key, unit)| {
+                groups.entry(key).or_default().push(unit);
+                groups
+            })
+    };
+    let left_groups = group(left, &left_exports);
+    let right_groups = group(right, &right_exports);
+    left_groups
+        .into_iter()
+        .filter_map(|(key, left)| {
+            let right = right_groups.get(&key)?;
+            (left.len() == 1 && right.len() == 1).then_some((left[0], right[0]))
+        })
+        .collect()
+}
+
 fn multiset_similarity(left: &BTreeMap<Arc<str>, u32>, right: &BTreeMap<Arc<str>, u32>) -> f64 {
     let mut left = left.iter().peekable();
     let mut right = right.iter().peekable();
@@ -8264,6 +8469,30 @@ fn generate_report(
             } else {
                 "linked"
             },
+            score: 1.0,
+            channels: None,
+            left: location(old),
+            right: location(new),
+        });
+    }
+    for (old, new) in unique_runtime_semantic_proof_matches(&left, &right) {
+        if used_left.contains(&old.id) || used_right.contains(&new.id) {
+            continue;
+        }
+        if !units_have_equivalent_dependency_context(
+            &left_dependency_contexts,
+            &right_dependency_contexts,
+            old,
+            new,
+        ) {
+            continue;
+        }
+        used_left.insert(old.id.clone());
+        used_right.insert(new.id.clone());
+        matches.push(MatchRecord {
+            confidence: "proven-bundle-normalized",
+            status: "alpha-equal",
+            basis: "conditional-expression-proof",
             score: 1.0,
             channels: None,
             left: location(old),
@@ -11982,6 +12211,7 @@ mod tests {
             nodes_approx: tokens.len(),
             strict_sha256: id.to_string(),
             linked_sha256: id.to_string(),
+            semantic_proof: None,
             tokens: tokens.iter().map(|token| Arc::from(*token)).collect(),
             features,
         }
@@ -12774,10 +13004,8 @@ mod tests {
         fs::write(right.path().join("upstream.js"), equivalent).unwrap();
         run(left.path(), right.path(), output.path()).unwrap();
         let equivalent_work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
-        assert!(!equivalent_work.iter().any(|item| {
-            item["priority"] == "P0"
-                && matches!(item["action"].as_str(), Some("port-missing-upstream-branch" | "reconcile-changed-branch"))
-        }), "equivalent if/else and conditional-expression syntax was promoted to repair: {equivalent_work:?}");
+        assert!(equivalent_work.is_empty(),
+            "equivalent if/else and conditional-expression syntax must not leave active owner or frontier work: {equivalent_work:?}");
 
         let changed = include_str!("../fixtures/conditional-expression-equivalence/changed-upstream.js");
         let left = tempdir().unwrap();
@@ -12793,6 +13021,17 @@ mod tests {
                     owners.iter().any(|owner| owner["file"] == "upstream.js" && owner["name"] == "choose")
                 })
         }), "a real conditional branch change was silently suppressed: {changed_work:?}");
+
+        let with_extra_top_level = format!("{equivalent}\nexport const publicFlag = true;\n");
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::write(left.path().join("local.js"), local).unwrap();
+        fs::write(right.path().join("upstream.js"), with_extra_top_level).unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let extra_top_level_work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
+        assert!(!extra_top_level_work.is_empty(),
+            "an extra top-level export must prevent whole-module proof from suppressing work");
     }
 
     #[test]
