@@ -2319,6 +2319,7 @@ pub fn import_codegraph(db_path: &Path, source_db: &Path, side: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
 
