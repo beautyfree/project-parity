@@ -1470,6 +1470,7 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
     // audit phases. Large generated/compatibility-heavy sets can otherwise
     // starve upstream functionality gaps. Keep both classes in the queue and
     // surface them automatically after earlier phases are exhausted.
+    let unverified_decisions = unverified_decision_count(&conn)?;
     let (payloads, stale_local_items_excluded) =
         next_queue_payloads(&conn, limit, local_snapshot.as_ref())?;
     let rows = payloads.into_iter().map(Ok::<_, anyhow::Error>);
@@ -1732,6 +1733,7 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
             "routing": true,
             "summary": summary,
             "staleLocalItemsExcluded": stale_local_items_excluded,
+            "unverifiedDecisions": unverified_decisions,
             "count": items.len(),
             "reviewGroups": review_groups,
             "ownerGroups": owner_groups,
@@ -1745,6 +1747,7 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
             "schema": "project-parity/state-next-v1",
             "summary": summary,
             "staleLocalItemsExcluded": stale_local_items_excluded,
+            "unverifiedDecisions": unverified_decisions,
             "count": items.len(),
             "items": items,
         })
@@ -1848,7 +1851,7 @@ fn ensure_report_is_synced(db_path: &Path, conn: &Connection) -> Result<Option<L
     }
     let has_pending_sync = if table_exists(conn, "work_item_decisions")? {
         conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM work_item_decisions d JOIN work_items w ON w.id=d.work_item_id WHERE d.status='pending_sync' AND w.resolved_at IS NULL)",
+            "SELECT EXISTS(SELECT 1 FROM work_item_decisions d JOIN work_items w ON w.id=d.work_item_id WHERE d.status='pending_sync' AND w.resolved_at IS NULL AND d.payload IS NOT NULL AND d.payload=w.payload)",
             [],
             |row| row.get::<_, bool>(0),
         )?
@@ -2088,7 +2091,7 @@ pub fn mark_pending_sync_batch(
         )?;
     }
     let pending_sync: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM work_items w JOIN work_item_decisions d ON d.work_item_id=w.id WHERE w.resolved_at IS NULL AND d.status='pending_sync'",
+        "SELECT COUNT(*) FROM work_items w JOIN work_item_decisions d ON d.work_item_id=w.id WHERE w.resolved_at IS NULL AND d.status='pending_sync' AND d.payload IS NOT NULL AND d.payload=w.payload",
         [],
         |row| row.get(0),
     )?;
@@ -2217,19 +2220,28 @@ fn ensure_run_receipt_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn unverified_decision_count(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM work_items w JOIN work_item_decisions d ON d.work_item_id=w.id WHERE w.resolved_at IS NULL AND (d.payload IS NULL OR d.payload<>w.payload)",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
 pub fn stats(db_path: &Path) -> Result<Value> {
     let conn = open_existing_database(db_path)?;
-    let (active, skipped, pending_sync, done, resolved, deferred): (i64, i64, i64, i64, i64, i64) = conn.query_row(
+    let (active, skipped, pending_sync, done, resolved, deferred, unverified): (i64, i64, i64, i64, i64, i64, i64) = conn.query_row(
         "SELECT
             COALESCE(SUM(CASE WHEN w.resolved_at IS NULL AND d.work_item_id IS NULL THEN 1 ELSE 0 END), 0),
-            COALESCE(SUM(CASE WHEN w.resolved_at IS NULL AND d.status='skipped' THEN 1 ELSE 0 END), 0),
-            COALESCE(SUM(CASE WHEN w.resolved_at IS NULL AND d.status='pending_sync' THEN 1 ELSE 0 END), 0),
-            COALESCE(SUM(CASE WHEN w.resolved_at IS NULL AND d.status='done' THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN w.resolved_at IS NULL AND d.status='skipped' AND d.payload IS NOT NULL AND d.payload=w.payload THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN w.resolved_at IS NULL AND d.status='pending_sync' AND d.payload IS NOT NULL AND d.payload=w.payload THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN w.resolved_at IS NULL AND d.status='done' AND d.payload IS NOT NULL AND d.payload=w.payload THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN w.resolved_at IS NOT NULL THEN 1 ELSE 0 END), 0),
-            COALESCE(SUM(CASE WHEN w.resolved_at IS NULL AND d.work_item_id IS NULL AND w.action IN ('remove-or-justify-extra-local','locate-unlinked-upstream-branch','inspect-structural-frontier') THEN 1 ELSE 0 END), 0)
+            COALESCE(SUM(CASE WHEN w.resolved_at IS NULL AND d.work_item_id IS NULL AND w.action IN ('remove-or-justify-extra-local','locate-unlinked-upstream-branch','inspect-structural-frontier') THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN w.resolved_at IS NULL AND d.work_item_id IS NOT NULL AND (d.payload IS NULL OR d.payload<>w.payload) THEN 1 ELSE 0 END), 0)
          FROM work_items w LEFT JOIN work_item_decisions d ON d.work_item_id=w.id",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
     )?;
     let mut breakdown_stmt = conn.prepare(
         "SELECT CASE WHEN w.action IN ('remove-or-justify-extra-local','locate-unlinked-upstream-branch','inspect-structural-frontier') THEN 'P2' ELSE COALESCE(w.priority,'unknown') END, COALESCE(w.confidence,'unknown'), COALESCE(w.action,'unknown'), COUNT(*)
@@ -2251,7 +2263,7 @@ pub fn stats(db_path: &Path) -> Result<Value> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(
-        serde_json::json!({"schema":"project-parity/state-stats-v1","active":active,"actionable":active-deferred,"deferred":deferred,"skipped":skipped,"pendingSync":pending_sync,"done":done,"resolved":resolved,"tracked":active+skipped+pending_sync+done+resolved,"queueBreakdown":queue_breakdown,"db":db_path}),
+        serde_json::json!({"schema":"project-parity/state-stats-v1","active":active,"actionable":active-deferred,"deferred":deferred,"skipped":skipped,"pendingSync":pending_sync,"done":done,"unverifiedDecisions":unverified,"resolved":resolved,"tracked":active+skipped+pending_sync+done+unverified+resolved,"queueBreakdown":queue_breakdown,"db":db_path}),
     )
 }
 
@@ -3062,7 +3074,7 @@ mod tests {
     }
 
     #[test]
-    fn next_refuses_local_edits_without_pending_sync_decisions() {
+    fn next_refuses_local_edits_when_pending_sync_lacks_payload_evidence() {
         let root = tempdir().unwrap();
         let db = root.path().join("state.sqlite");
         let report_dir = root.path().join("report");
@@ -3095,6 +3107,11 @@ mod tests {
         )
         .unwrap();
         sync(&db, &report_dir).unwrap();
+        mark_pending_sync(&db, "a", "reviewed; awaiting source checkpoint").unwrap();
+        Connection::open(&db)
+            .unwrap()
+            .execute("UPDATE work_item_decisions SET payload=NULL WHERE work_item_id='a'", [])
+            .unwrap();
 
         fs::write(local.join("src/index.ts"), "export const value = 2\n").unwrap();
 
@@ -4360,6 +4377,16 @@ mod tests {
             [],
         )
         .unwrap();
+
+        let legacy_stats = stats(&db).unwrap();
+        assert_eq!(legacy_stats["active"], 0);
+        assert_eq!(legacy_stats["done"], 0);
+        assert_eq!(legacy_stats["skipped"], 0);
+        assert_eq!(legacy_stats["unverifiedDecisions"], 2);
+        assert_eq!(legacy_stats["tracked"], 2);
+        let before_sync = next(&db, 10).unwrap();
+        assert_eq!(before_sync["count"], 0);
+        assert_eq!(before_sync["unverifiedDecisions"], 2);
 
         let result = sync(&db, root.path()).unwrap();
         assert_eq!(result["new"], 0);
