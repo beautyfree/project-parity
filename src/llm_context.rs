@@ -3005,12 +3005,12 @@ mod tests {
         read_shared_work_evidence,
         same_file_identity, should_defer_structural_frontier, unlinked_upstream_triage,
         stable_identity, stable_review_fingerprint, unique_stable_review_identities,
-        work_item_id, owner_context_needs_work, WorkItemDraft,
+        work_item_id, owner_context_needs_work, push_work_item_with_review_fingerprints, WorkItemDraft,
         write_json_lines,
     };
     use crate::{run, FileRecord, Location, MatchRecord};
     use serde_json::json;
-    use std::{collections::HashMap, fs};
+    use std::{collections::{HashMap, HashSet}, fs};
     use tempfile::tempdir;
 
     #[test]
@@ -3666,6 +3666,73 @@ mod tests {
         assert_eq!(item["legacyIds"], json!([work_item_id("reconcile-changed-owner", [old_id.to_string()])]));
         assert_eq!(item["local"][0]["id"], old_id);
         assert_eq!(item["local"][0]["stableFingerprint"], stable_fingerprint);
+    }
+
+    #[test]
+    fn durable_branch_identity_ignores_ambiguous_secondary_locator_ids() {
+        let left_owner = "left:src/editor.ts:10:40:0";
+        let right_owner = "right:src/editor.ts:10:40:0";
+        let secondary_locators = [
+            ("right:src/editor.ts:50:60:0", 50, 60),
+            ("right:src/editor.ts:70:80:1", 70, 80),
+        ];
+        let ambiguous_fingerprint = "stable-review-v1:ambiguous-edge";
+        let review_fingerprints = HashMap::from([
+            (left_owner.to_string(), "stable-review-v1:left-owner".to_string()),
+            (right_owner.to_string(), "stable-review-v1:right-owner".to_string()),
+            (secondary_locators[0].0.to_string(), ambiguous_fingerprint.to_string()),
+            (secondary_locators[1].0.to_string(), ambiguous_fingerprint.to_string()),
+        ]);
+        let ambiguous_fingerprints = HashSet::from([ambiguous_fingerprint.to_string()]);
+        let mut items = Vec::new();
+        let ids = secondary_locators
+            .iter()
+            .map(|(secondary_id, start, end)| {
+                push_work_item_with_review_fingerprints(
+                    &mut items,
+                    WorkItemDraft {
+                        action: "port-missing-upstream-branch",
+                        priority: "P1",
+                        confidence: "candidate",
+                        reason: "review the missing branch".to_string(),
+                        local: vec![json!({
+                            "id": left_owner, "file": "src/editor.ts", "kind": "Function", "start": 10, "end": 40
+                        })],
+                        upstream: vec![
+                            json!({
+                                "id": right_owner, "file": "src/editor.ts", "kind": "Function", "start": 10, "end": 40
+                            }),
+                            json!({
+                                "id": secondary_id, "file": "src/editor.ts", "kind": "CallExpression", "start": start, "end": end
+                            }),
+                        ],
+                        evidence_path: Vec::new(),
+                        identities: vec![left_owner.to_string(), right_owner.to_string(), secondary_id.to_string()],
+                    },
+                    None,
+                    &review_fingerprints,
+                    &ambiguous_fingerprints,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let expected_id = work_item_id(
+            "port-missing-upstream-branch",
+            [
+                "stable-review-v1:left-owner".to_string(),
+                "stable-review-v1:right-owner".to_string(),
+            ],
+        );
+        assert_eq!(ids, vec![expected_id.clone(), expected_id]);
+        assert_eq!(items[0]["reviewIdentity"], items[1]["reviewIdentity"]);
+        for item in &items {
+            assert_eq!(item["id"], items[0]["id"]);
+            assert_eq!(item["upstream"][1]["reviewFingerprint"], ambiguous_fingerprint);
+            assert!(item["upstream"][1]["stableFingerprint"].is_null());
+        }
+        let coalesced = coalesce_work_items(items, &HashMap::new()).unwrap();
+        assert_eq!(coalesced.len(), 1);
+        assert_eq!(coalesced[0]["evidenceVariants"].as_array().unwrap().len(), 2);
     }
 
     #[test]

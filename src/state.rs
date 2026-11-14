@@ -3971,6 +3971,79 @@ mod tests {
     }
 
     #[test]
+    fn sync_preserves_anchored_review_across_locator_moves_and_reopens_changed_evidence() {
+        let root = tempdir().unwrap();
+        let report_dir = root.path().join("report");
+        let db = root.path().join("state.sqlite");
+        let local = root.path().join("local");
+        let upstream = root.path().join("upstream");
+        let make_item = |review_identity: Value, offset: u64, edge_fingerprint: &str| {
+            let local_id = format!("left:src/editor.ts:{offset}:{}:0", offset + 10);
+            let owner_id = format!("right:src/editor.ts:{}:{}:0", offset + 20, offset + 30);
+            let edge_id = format!("right:src/editor.ts:{}:{}:0", offset + 40, offset + 50);
+            let left_fingerprint = review_identity["identities"][0].as_str().unwrap();
+            let right_fingerprint = review_identity["identities"][1].as_str().unwrap();
+            serde_json::json!({
+                "id":"work-owner-pair",
+                "action":"port-missing-upstream-branch",
+                "priority":"P1",
+                "confidence":"candidate",
+                "reason":"review the missing branch",
+                "reviewIdentity":review_identity,
+                "local":[{
+                    "id":local_id,"file":"src/editor.ts","kind":"Function",
+                    "line":offset,"start":offset,"end":offset + 10,
+                    "stableFingerprint":left_fingerprint,"reviewFingerprint":left_fingerprint,
+                }],
+                "upstream":[
+                    {
+                        "id":owner_id,"file":"src/editor.ts","kind":"Function",
+                        "line":offset,"start":offset + 20,"end":offset + 30,
+                        "stableFingerprint":right_fingerprint,"reviewFingerprint":right_fingerprint,
+                    },
+                    {
+                        "id":edge_id,"file":"src/editor.ts","kind":"CallExpression",
+                        "line":offset,"start":offset + 40,"end":offset + 50,
+                        "reviewFingerprint":edge_fingerprint,
+                    },
+                ],
+                "evidencePath":[],
+                "inspectNodeIds":[local_id,owner_id,edge_id],
+            })
+        };
+        let durable_identity = serde_json::json!({
+            "action":"port-missing-upstream-branch",
+            "identities":["stable-review-v1:left-owner","stable-review-v1:right-owner"],
+        });
+        let initial = make_item(durable_identity.clone(), 10, "stable-review-v1:edge");
+        write_receipted_report(&report_dir, &local, &upstream, "local-before", &[initial]);
+        sync(&db, &report_dir).unwrap();
+        mark_pending_sync(&db, "work-owner-pair", "reviewed owner pair and edge").unwrap();
+
+        let moved = make_item(durable_identity.clone(), 100, "stable-review-v1:edge");
+        write_receipted_report(&report_dir, &local, &upstream, "local-after-offset-move", &[moved]);
+        let result = sync(&db, &report_dir).unwrap();
+        assert_eq!(result["reopened"], 0);
+        assert_eq!(result["remaining"], 0);
+        assert_eq!(stats(&db).unwrap()["done"], 1);
+
+        let changed_edge = make_item(durable_identity.clone(), 100, "stable-review-v1:changed-edge");
+        write_receipted_report(&report_dir, &local, &upstream, "local-after-edge-change", &[changed_edge]);
+        assert_eq!(sync(&db, &report_dir).unwrap()["reopened"], 1);
+        assert_eq!(next(&db, 10).unwrap()["count"], 1);
+
+        mark_pending_sync(&db, "work-owner-pair", "reviewed changed edge").unwrap();
+        let changed_identity = serde_json::json!({
+            "action":"port-missing-upstream-branch",
+            "identities":["stable-review-v1:left-owner","stable-review-v1:changed-right-owner"],
+        });
+        let changed_owner = make_item(changed_identity, 100, "stable-review-v1:changed-edge");
+        write_receipted_report(&report_dir, &local, &upstream, "local-after-owner-change", &[changed_owner]);
+        assert_eq!(sync(&db, &report_dir).unwrap()["reopened"], 1);
+        assert_eq!(next(&db, 10).unwrap()["count"], 1);
+    }
+
+    #[test]
     fn stable_locator_evidence_ignores_only_offsets_and_ids() {
         let previous = serde_json::json!({
             "id":"work-stable","action":"inspect","priority":"P1",
@@ -3986,6 +4059,24 @@ mod tests {
             "local":[{"id":"left:a:50:60:2","stableFingerprint":"changed","file":"a.ts","kind":"Function","line":4,"start":50,"end":60}],
         });
         assert!(!review_evidence_matches(&previous.to_string(), &changed.to_string()));
+
+        let anchored = serde_json::json!({
+            "id":"work-anchored","action":"inspect",
+            "reviewIdentity":{"action":"inspect","identities":["owner-a","owner-b"]},
+            "local":[{"id":"left:a:10:20:0","stableFingerprint":"owner-a","reviewFingerprint":"owner-a","file":"a.ts","kind":"Function","start":10,"end":20}],
+            "upstream":[{"id":"right:b:30:40:0","reviewFingerprint":"edge-a","file":"b.ts","kind":"CallExpression","start":30,"end":40}],
+        });
+        let mut changed_identity = anchored.clone();
+        changed_identity["reviewIdentity"]["identities"][1] = json!("owner-b-changed");
+        assert!(!review_evidence_matches(&anchored.to_string(), &changed_identity.to_string()));
+
+        let mut legacy = anchored.clone();
+        legacy.as_object_mut().unwrap().remove("reviewIdentity");
+        let mut moved_legacy = legacy.clone();
+        moved_legacy["upstream"][0]["id"] = json!("right:b:50:60:1");
+        moved_legacy["upstream"][0]["start"] = json!(50);
+        moved_legacy["upstream"][0]["end"] = json!(60);
+        assert!(!review_evidence_matches(&legacy.to_string(), &moved_legacy.to_string()));
     }
 
     #[test]
