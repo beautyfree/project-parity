@@ -13,7 +13,8 @@ use aho_corasick::AhoCorasick;
 use anyhow::{bail, Context, Result};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    ArrowFunctionExpression, BinaryOperator, Class, Expression, Function, ParenthesizedExpression,
+    ArrowFunctionExpression, BinaryOperator, Class, Expression, Function, MethodDefinition,
+    ParenthesizedExpression,
     TSAsExpression, TSInstantiationExpression, TSNonNullExpression, TSSatisfiesExpression,
     TSTypeAnnotation, TSTypeAssertion, TSTypeParameterDeclaration, TSTypeParameterInstantiation,
 };
@@ -703,6 +704,7 @@ struct RawUnit {
 #[derive(Default)]
 struct UnitCollector {
     units: Vec<RawUnit>,
+    active_method: Option<(Span, String)>,
 }
 
 impl<'a> Visit<'a> for UnitCollector {
@@ -713,9 +715,27 @@ impl<'a> Visit<'a> for UnitCollector {
         self.units.push(RawUnit {
             span: function.span(),
             kind: "Function",
-            name: function.id.as_ref().map(|id| id.name.to_string()),
+            name: function
+                .id
+                .as_ref()
+                .map(|id| id.name.to_string())
+                .or_else(|| {
+                    self.active_method.as_ref().and_then(|(span, name)| {
+                        (*span == function.span()).then(|| name.clone())
+                    })
+                }),
         });
         walk::walk_function(self, function, flags);
+    }
+
+    fn visit_method_definition(&mut self, method: &MethodDefinition<'a>) {
+        let previous = self.active_method.take();
+        self.active_method = method
+            .key
+            .static_name()
+            .map(|name| (method.value.span(), name.to_string()));
+        walk::walk_method_definition(self, method);
+        self.active_method = previous;
     }
 
     fn visit_arrow_function_expression(&mut self, function: &ArrowFunctionExpression<'a>) {
@@ -5452,6 +5472,22 @@ fn coarse_token_count(unit: &Unit) -> usize {
         + unit.features.externals.len()
 }
 
+fn owner_name_hint(unit: &Unit) -> Option<String> {
+    if unit.kind != "Function" {
+        return None;
+    }
+    let name = unit.name.as_deref()?;
+    let normalized = name.strip_prefix('_').unwrap_or(name);
+    // Minified/generated identifiers carry little owner information and
+    // would create large, low-value candidate groups.
+    (normalized.len() >= 4
+        && !normalized.starts_with("0x")
+        && normalized
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '$'))
+    .then(|| normalized.to_string())
+}
+
 fn rank_candidates(targets: &[&Unit], candidates: &[&Unit]) -> Vec<Unmatched> {
     rank_candidates_with_affinity(targets, candidates, None)
 }
@@ -5465,6 +5501,7 @@ fn rank_candidates_with_affinity(
     let mut postings = HashMap::<String, Vec<&Unit>>::new();
     let mut candidates_by_kind = HashMap::<String, Vec<&Unit>>::new();
     let mut candidates_by_file_kind = HashMap::<(String, String), Vec<&Unit>>::new();
+    let mut candidates_by_owner_name = HashMap::<(String, String), Vec<&Unit>>::new();
     for unit in candidates {
         candidates_by_kind
             .entry(unit.kind.clone())
@@ -5474,6 +5511,12 @@ fn rank_candidates_with_affinity(
             .entry((unit.file.clone(), unit.kind.clone()))
             .or_default()
             .push(unit);
+        if let Some(name) = owner_name_hint(unit) {
+            candidates_by_owner_name
+                .entry((unit.kind.clone(), name))
+                .or_default()
+                .push(unit);
+        }
         // Keep the inverted index bounded for minified/vendor-sized units.
         // Similarity still uses the complete feature channels below; the
         // posting list is only a shortlist accelerator and must not retain
@@ -5540,7 +5583,9 @@ fn rank_candidates_with_affinity(
             strongest_votes.truncate(128);
             let mut candidate_pool = strongest_votes
                 .into_iter()
-                .map(|(candidate, votes)| (candidate.id.clone(), (candidate, votes, false)))
+                .map(|(candidate, votes)| {
+                    (candidate.id.clone(), (candidate, votes, false, false))
+                })
                 .collect::<HashMap<_, _>>();
             if let Some(same_kind) = candidates_by_kind.get(&target.kind) {
                 let center = same_kind
@@ -5550,7 +5595,7 @@ fn rank_candidates_with_affinity(
                 for candidate in &same_kind[start..end] {
                     candidate_pool
                         .entry(candidate.id.clone())
-                        .or_insert((*candidate, 0, false));
+                        .or_insert((*candidate, 0, false, false));
                 }
             }
             if let Some(preferred_files) = affinities.and_then(|files| files.get(&target.file)) {
@@ -5567,13 +5612,25 @@ fn rank_candidates_with_affinity(
                         candidate_pool
                             .entry(candidate.id.clone())
                             .and_modify(|entry| entry.2 = true)
-                            .or_insert((*candidate, 0, true));
+                            .or_insert((*candidate, 0, true, false));
                     }
+                }
+            }
+            let owner_name = owner_name_hint(target);
+            if let Some(name) = owner_name.as_ref() {
+                if let Some([candidate]) = candidates_by_owner_name
+                    .get(&(target.kind.clone(), name.clone()))
+                    .map(Vec::as_slice)
+                {
+                    candidate_pool
+                        .entry(candidate.id.clone())
+                        .and_modify(|entry| entry.3 = true)
+                        .or_insert((*candidate, 0, false, true));
                 }
             }
             let mut shortlist = candidate_pool
                 .into_values()
-                .filter_map(|(candidate, intersection, graph_supported)| {
+                .filter_map(|(candidate, intersection, graph_supported, owner_name_supported)| {
                     let candidate_token_count = coarse_token_count(candidate);
                     let union = target_coarse_tokens.len() + candidate_token_count - intersection;
                     let jaccard = if union == 0 {
@@ -5584,35 +5641,51 @@ fn rank_candidates_with_affinity(
                     let size = target.nodes_approx.min(candidate.nodes_approx) as f64
                         / target.nodes_approx.max(candidate.nodes_approx).max(1) as f64;
                     let coarse_score = jaccard * 0.65 + size * 0.35;
-                    (coarse_score >= if graph_supported { 0.05 } else { 0.10 }).then_some((
-                        candidate,
-                        coarse_score,
-                        graph_supported,
-                    ))
+                    (coarse_score
+                        >= if graph_supported || owner_name_supported {
+                            0.05
+                        } else {
+                            0.10
+                        })
+                    .then_some((candidate, coarse_score, graph_supported, owner_name_supported))
                 })
                 .collect::<Vec<_>>();
             shortlist.sort_by(
-                |(left_unit, left_score, left_graph), (right_unit, right_score, right_graph)| {
+                |(left_unit, left_score, left_graph, left_name),
+                 (right_unit, right_score, right_graph, right_name)| {
                     let left_rank = left_score + if *left_graph { 0.05 } else { 0.0 };
                     let right_rank = right_score + if *right_graph { 0.05 } else { 0.0 };
-                    right_rank
-                        .total_cmp(&left_rank)
-                        .then_with(|| left_unit.id.cmp(&right_unit.id))
+                    right_name
+                        .cmp(left_name)
+                        .then_with(|| {
+                            right_rank
+                                .total_cmp(&left_rank)
+                                .then_with(|| left_unit.id.cmp(&right_unit.id))
+                        })
                 },
             );
             shortlist.truncate(48);
             let mut ranked = shortlist
                 .into_iter()
-                .map(|(candidate, _, graph_supported)| {
+                .map(|(candidate, _, graph_supported, owner_name_supported)| {
                     let (score, channels) = similarity(candidate, target);
-                    (score, graph_supported, channels, candidate)
+                    (score, graph_supported, owner_name_supported, channels, candidate)
                 })
-                .filter(|(score, graph_supported, _, _)| {
-                    *score >= if *graph_supported { 0.20 } else { 0.30 }
+                .filter(|(score, graph_supported, owner_name_supported, _, _)| {
+                    *score
+                        >= if *graph_supported {
+                            0.20
+                        } else if *owner_name_supported {
+                            0.10
+                        } else {
+                            0.30
+                        }
                 })
-                .map(|(score, graph_supported, channels, candidate)| Candidate {
+                .map(|(score, graph_supported, owner_name_supported, channels, candidate)| Candidate {
                     score,
-                    basis: if graph_supported {
+                    basis: if owner_name_supported {
+                        "owner-name"
+                    } else if graph_supported {
                         "containment-graph"
                     } else {
                         "feature"
@@ -17358,6 +17431,52 @@ mod tests {
         let targets = [(target.id.clone(), target)].into_iter().collect();
         let members = members.iter().map(|unit| (unit.id.clone(), unit)).collect();
         group_candidates(&ranked, &targets, &members, relation)
+    }
+
+    #[test]
+    fn renamed_class_methods_are_candidate_hints_not_owner_proof() {
+        let local_source = include_str!("../fixtures/owner-name-method-candidate/local.js");
+        let upstream_source = include_str!("../fixtures/owner-name-method-candidate/upstream.js");
+        let local = contribution_fixture_units(local_source, "left");
+        let upstream = contribution_fixture_units(upstream_source, "right");
+        let local_method = local
+            .iter()
+            .find(|unit| unit.name.as_deref() == Some("_setContentIdentity"))
+            .unwrap();
+        let upstream_method = upstream
+            .iter()
+            .find(|unit| unit.name.as_deref() == Some("setContentIdentity"))
+            .unwrap();
+
+        let ranked = rank_candidates(&[upstream_method], &[local_method]);
+        assert_eq!(
+            ranked[0].candidates.len(),
+            1,
+            "the renamed method should be visible even when feature retrieval is weak"
+        );
+        assert_eq!(ranked[0].candidates[0].basis, "owner-name");
+        assert!(
+            !best_is_distinct(&ranked[0], &HashSet::new()),
+            "a name hint alone must not prove an owner match"
+        );
+
+        let changed_source = include_str!("../fixtures/owner-name-method-candidate/changed-upstream.js");
+        let changed = contribution_fixture_units(changed_source, "right");
+        let changed_method = changed
+            .iter()
+            .find(|unit| unit.name.as_deref() == Some("setContentIdentity"))
+            .unwrap();
+        let changed_ranked = rank_candidates(&[changed_method], &[local_method]);
+        assert_eq!(
+            changed_ranked[0].candidates.len(),
+            1,
+            "a same-name behavioral divergence must stay reviewable"
+        );
+        assert_eq!(changed_ranked[0].candidates[0].basis, "owner-name");
+        assert!(
+            !best_is_distinct(&changed_ranked[0], &HashSet::new()),
+            "a same-name behavioral divergence must not auto-promote"
+        );
     }
 
     #[test]
