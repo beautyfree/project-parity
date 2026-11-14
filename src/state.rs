@@ -1286,7 +1286,12 @@ fn ensure_batch_schema(conn: &Connection) -> Result<()> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SummaryOwner {
+    id: Option<String>,
     file: Option<String>,
+    line: Option<usize>,
+    name: Option<String>,
+    candidate_score: Option<f64>,
+    candidate_basis: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1342,17 +1347,52 @@ struct LocalReportSnapshot {
 }
 
 fn summarize_owners(owners: Option<Vec<SummaryOwner>>) -> (usize, usize, Vec<String>) {
-    let owners = owners.unwrap_or_default();
+    let (owners, _) = split_candidate_owners(owners.unwrap_or_default());
+    summarize_owner_list(&owners)
+}
+
+fn split_candidate_owners(
+    owners: Vec<SummaryOwner>,
+) -> (Vec<SummaryOwner>, Vec<SummaryOwner>) {
+    let mut confirmed = Vec::new();
+    let mut candidates = Vec::new();
+    for owner in owners {
+        if owner.candidate_score.is_some() {
+            candidates.push(owner);
+        } else {
+            confirmed.push(owner);
+        }
+    }
+    (confirmed, candidates)
+}
+
+fn summarize_owner_list(owners: &[SummaryOwner]) -> (usize, usize, Vec<String>) {
     let owner_count = owners.len();
     let mut files = owners
         .into_iter()
-        .filter_map(|owner| owner.file)
+        .filter_map(|owner| owner.file.clone())
         .collect::<Vec<_>>();
     files.sort();
     files.dedup();
     let file_count = files.len();
     files.truncate(1);
     (owner_count, file_count, files)
+}
+
+fn candidate_owner_values(owners: Vec<SummaryOwner>) -> Vec<Value> {
+    owners
+        .into_iter()
+        .filter_map(|owner| {
+            Some(serde_json::json!({
+                "id": owner.id?,
+                "file": owner.file?,
+                "line": owner.line,
+                "name": owner.name,
+                "score": owner.candidate_score?,
+                "basis": owner.candidate_basis,
+            }))
+        })
+        .collect()
 }
 
 fn next_queue_page(conn: &Connection, limit: usize, offset: usize) -> Result<Vec<String>> {
@@ -1485,16 +1525,21 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
                 .flatten()
                 .filter_map(|owner| owner.file.clone())
                 .collect::<std::collections::BTreeSet<_>>();
-            let upstream_files = item
-                .upstream
-                .as_ref()
-                .into_iter()
-                .flatten()
+            let (upstream_owners, upstream_candidates) =
+                split_candidate_owners(item.upstream.unwrap_or_default());
+            let upstream_files = upstream_owners
+                .iter()
                 .filter_map(|owner| owner.file.clone())
                 .collect::<std::collections::BTreeSet<_>>();
+            let (
+                upstream_candidate_owner_count,
+                upstream_candidate_file_count,
+                upstream_candidate_file_samples,
+            ) = summarize_owner_list(&upstream_candidates);
+            let upstream_candidate_values = candidate_owner_values(upstream_candidates);
             let (local_owners, local_file_count, local_file_samples) = summarize_owners(item.local);
-            let (upstream_owners, upstream_file_count, upstream_file_samples) =
-                summarize_owners(item.upstream);
+            let (upstream_owner_count, upstream_file_count, upstream_file_samples) =
+                summarize_owner_list(&upstream_owners);
             let local_context_files =
                 local_context_files(item.evidence_path, item.evidence_variants);
             Ok(serde_json::json!({
@@ -1508,9 +1553,13 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
                 "localFiles": local_files,
                 "localContextFiles": local_context_files,
                 "upstreamFiles": upstream_files,
-                "upstreamOwnerCount": upstream_owners,
+                "upstreamOwnerCount": upstream_owner_count,
                 "upstreamFileCount": upstream_file_count,
                 "upstreamFileSamples": upstream_file_samples,
+                "upstreamCandidateOwnerCount": upstream_candidate_owner_count,
+                "upstreamCandidateFileCount": upstream_candidate_file_count,
+                "upstreamCandidateFileSamples": upstream_candidate_file_samples,
+                "upstreamCandidates": upstream_candidate_values,
             }))
         })
         .collect::<Result<Vec<_>>>()?
@@ -1526,14 +1575,15 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
                 .collect::<Vec<_>>();
             local_files.sort();
             local_files.dedup();
-            let mut upstream_files = item
-                .upstream
-                .unwrap_or_default()
+            let (upstream_owners, upstream_candidates) =
+                split_candidate_owners(item.upstream.unwrap_or_default());
+            let mut upstream_files = upstream_owners
                 .into_iter()
                 .filter_map(|owner| owner.file)
                 .collect::<Vec<_>>();
             upstream_files.sort();
             upstream_files.dedup();
+            let upstream_candidates = candidate_owner_values(upstream_candidates);
             let mut local_context_files =
                 local_context_files(item.evidence_path, item.evidence_variants);
             local_context_files.sort();
@@ -1547,6 +1597,7 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
                 "localFiles": local_files,
                 "localContextFiles": local_context_files,
                 "upstreamFiles": upstream_files,
+                "upstreamCandidates": upstream_candidates,
             }))
         })
         .collect::<Result<Vec<_>>>()?
@@ -1557,8 +1608,15 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
             // large evidence subtree without allocating a full `Value` tree.
             let item: SummaryWorkItem = serde_json::from_str(&payload)?;
             let (local_owners, local_file_count, local_file_samples) = summarize_owners(item.local);
-            let (upstream_owners, upstream_file_count, upstream_file_samples) =
-                summarize_owners(item.upstream);
+            let (upstream_owners, upstream_candidates) =
+                split_candidate_owners(item.upstream.unwrap_or_default());
+            let (upstream_owner_count, upstream_file_count, upstream_file_samples) =
+                summarize_owner_list(&upstream_owners);
+            let (
+                upstream_candidate_owner_count,
+                upstream_candidate_file_count,
+                upstream_candidate_file_samples,
+            ) = summarize_owner_list(&upstream_candidates);
             Ok(serde_json::json!({
                 "id": item.id, "action": item.action,
                 "priority": item.priority, "confidence": item.confidence,
@@ -1567,9 +1625,12 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
                 "localOwnerCount": local_owners,
                 "localFileCount": local_file_count,
                 "localFileSamples": local_file_samples,
-                "upstreamOwnerCount": upstream_owners,
+                "upstreamOwnerCount": upstream_owner_count,
                 "upstreamFileCount": upstream_file_count,
                 "upstreamFileSamples": upstream_file_samples,
+                "upstreamCandidateOwnerCount": upstream_candidate_owner_count,
+                "upstreamCandidateFileCount": upstream_candidate_file_count,
+                "upstreamCandidateFileSamples": upstream_candidate_file_samples,
             }))
         })
         .collect::<Result<Vec<_>>>()?
@@ -1729,7 +1790,7 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
             })
             .collect::<Vec<_>>();
         serde_json::json!({
-            "schema": "project-parity/state-next-v2",
+            "schema": "project-parity/state-next-v3",
             "routing": true,
             "summary": summary,
             "staleLocalItemsExcluded": stale_local_items_excluded,
@@ -3642,6 +3703,64 @@ mod tests {
             result["reviewGroups"][0]["itemIndexes"],
             serde_json::json!([0])
         );
+    }
+
+    #[test]
+    fn next_routing_separates_candidate_hints_from_confirmed_upstream_owners() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("state.sqlite");
+        fs::write(
+            root.path().join("llm-manifest.json"),
+            test_manifest(root.path()),
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("llm-work-items.jsonl"),
+            concat!(
+                r#"{"id":"extra","priority":"P2","action":"remove-or-justify-extra-local","local":[{"file":"src/local.ts"}],"upstream":[{"id":"weak","file":"dist/weak.js","line":10,"candidateScore":0.37,"candidateBasis":"feature"},{"id":"strong-but-unpromoted","file":"dist/strong.js","line":20,"candidateScore":0.95,"candidateBasis":"feature"},{"id":"confirmed","file":"dist/confirmed.js","line":30}]}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        sync(&db, root.path()).unwrap();
+
+        let result = next_routing(&db, 10).unwrap();
+        let item = &result["items"][0];
+        assert_eq!(result["schema"], "project-parity/state-next-v3");
+        assert_eq!(
+            item["upstreamFiles"],
+            serde_json::json!(["dist/confirmed.js"])
+        );
+        assert_eq!(
+            item["upstreamCandidates"],
+            serde_json::json!([
+                {
+                    "id": "weak",
+                    "file": "dist/weak.js",
+                    "line": 10,
+                    "name": null,
+                    "score": 0.37,
+                    "basis": "feature"
+                },
+                {
+                    "id": "strong-but-unpromoted",
+                    "file": "dist/strong.js",
+                    "line": 20,
+                    "name": null,
+                    "score": 0.95,
+                    "basis": "feature"
+                }
+            ])
+        );
+        assert_eq!(
+            result["upstreamGroups"][0]["upstreamFiles"],
+            serde_json::json!(["dist/confirmed.js"])
+        );
+
+        let summary = next_summary(&db, 10).unwrap();
+        assert_eq!(summary["items"][0]["upstreamOwnerCount"], 1);
+        assert_eq!(summary["items"][0]["upstreamCandidateOwnerCount"], 2);
+        assert_eq!(summary["items"][0]["upstreamCandidateFileCount"], 2);
     }
 
     #[test]

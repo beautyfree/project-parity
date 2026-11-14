@@ -10410,7 +10410,7 @@ fn main() -> Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.len() == 1 && (args[0] == "--version" || args[0] == "-V") {
         print_stdout(&format!(
-            "project-parity {} (state-next-v2, state-next-owner-groups-v1, state-next-upstream-groups-v1, state-next-local-context-v1, state-done-batch-v1, state-done-sync-progress-v1, state-skip-batch-v1, show-works-v1, show-batch-compact-v1, state-optimize-queue-v1, frontier-triage-v2, frontier-behavior-edges-v1, shared-work-evidence-v1, js-family-jsx-v1)",
+            "project-parity {} (state-next-v3, state-next-candidate-hints-v1, state-next-owner-groups-v1, state-next-upstream-groups-v1, state-next-local-context-v1, state-done-batch-v1, state-done-sync-progress-v1, state-skip-batch-v1, show-works-v1, show-batch-compact-v1, state-optimize-queue-v1, frontier-triage-v2, frontier-behavior-edges-v1, shared-work-evidence-v1, js-family-jsx-v1)",
             env!("CARGO_PKG_VERSION")
         ))?;
         return Ok(());
