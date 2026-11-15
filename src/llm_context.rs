@@ -1,5 +1,6 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
     fs,
     io::{BufRead, BufReader, BufWriter, Seek, Write},
     path::Path,
@@ -13,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     global_behavior_seeding_is_safe, graph_behavior_hashes, graph_similarity, location,
-    normalized_graph_token, sha256, AmbiguousGroup, DivergenceFrontier, GraphNode, GraphNodeRef,
+    normalized_graph_token, sha256, AmbiguousGroup, DivergenceFrontier, GraphEdge, GraphNode, GraphNodeRef,
     GraphRelation, GroupCandidate, Location, MatchRecord, ProjectIndex, Unit, Unmatched,
 };
 
@@ -595,10 +596,289 @@ fn stable_review_identity_maps(
 fn stable_review_fingerprint(material: &str) -> String {
     format!("stable-review-v1:{}", sha256(material))
 }
+fn unit_review_fingerprint(
+    side: &str,
+    file: &str,
+    kind: &str,
+    _strict_sha256: &str,
+    linked_sha256: &str,
+    binding_evidence: &str,
+) -> String {
+    stable_review_fingerprint(&format!(
+        "unit\0{side}\0{file}\0{kind}\0{linked_sha256}\0{binding_evidence}"
+    ))
+}
+fn reference_owners_by_site(
+    units: &[&Unit],
+    reference_sites: &[(String, u32)],
+) -> HashMap<String, Vec<String>> {
+    let mut units = units.iter().enumerate().collect::<Vec<_>>();
+    units.sort_by_key(|(_, unit)| (unit.start, unit.end, unit.id.as_str()));
+    let mut references = reference_sites.iter().collect::<Vec<_>>();
+    references.sort_by_key(|(id, start)| (*start, id.as_str()));
+
+    let mut next_unit = 0;
+    let mut active = BTreeSet::new();
+    let mut by_end = BinaryHeap::new();
+    let mut owners = HashMap::with_capacity(references.len());
+    for (id, start) in references {
+        while next_unit < units.len() && units[next_unit].1.start <= *start {
+            let (_, unit) = units[next_unit];
+            if unit.end > *start {
+                active.insert(next_unit);
+                by_end.push(Reverse((unit.end, next_unit)));
+            }
+            next_unit += 1;
+        }
+        while let Some(Reverse((end, index))) = by_end.peek().copied() {
+            if end > *start {
+                break;
+            }
+            by_end.pop();
+            active.remove(&index);
+        }
+        let matches = active
+            .iter()
+            .map(|index| units[*index].1.id.clone())
+            .collect::<Vec<_>>();
+        if !matches.is_empty() {
+            owners.insert(id.clone(), matches);
+        }
+    }
+    owners
+}
+
+fn graph_unit_binding_evidence(
+    units: &[Unit],
+    nodes: &HashMap<&str, &GraphNode>,
+    edges: &[GraphEdge],
+    symbol_contracts: &HashMap<String, Vec<String>>,
+) -> HashMap<String, String> {
+    let units_by_file = units.iter().fold(HashMap::<&str, Vec<&Unit>>::new(), |mut map, unit| {
+        map.entry(unit.file.as_str()).or_default().push(unit);
+        map
+    });
+    let mut references_by_file = HashMap::<&str, Vec<(String, u32)>>::new();
+    for node in nodes.values().filter(|node| node.kind == "ReferenceSite") {
+        references_by_file
+            .entry(node.file.as_str())
+            .or_default()
+            .push((node.id.clone(), node.start));
+    }
+    let mut reference_owners = HashMap::<String, Vec<String>>::new();
+    for (file, references) in references_by_file {
+        if let Some(file_units) = units_by_file.get(file) {
+            reference_owners.extend(reference_owners_by_site(file_units, &references));
+        }
+    }
+    let mut reference_targets = HashMap::<String, HashSet<String>>::new();
+    for edge in edges.iter().filter(|edge| edge.kind == "References") {
+        if let Some(owners) = reference_owners.get(edge.source.as_str()) {
+            for owner in owners {
+                reference_targets
+                    .entry(owner.clone())
+                    .or_default()
+                    .insert(edge.target.as_ref().clone());
+            }
+        }
+    }
+    units
+        .iter()
+        .map(|unit| {
+            let mut contracts = reference_targets
+                .get(&unit.id)
+                .into_iter()
+                .flatten()
+                .filter_map(|target| symbol_contracts.get(target))
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>();
+            contracts.sort();
+            contracts.dedup();
+            (
+                unit.id.clone(),
+                sha256(format!("{}\0{}", unit.features.signature(true), contracts.join("\n"))),
+            )
+        })
+        .collect()
+}
+
+fn import_symbol_contracts(
+    nodes: &HashMap<&str, &GraphNode>,
+    edges: &[GraphEdge],
+) -> HashMap<String, Vec<String>> {
+    let mut contracts = HashMap::<String, Vec<String>>::new();
+    for edge in edges.iter().filter(|edge| matches!(
+        edge.kind.as_str(),
+        "ImportsBinding" | "TypeImportsBinding" | "DynamicImportsBinding" | "RequiresBinding"
+            | "ReExportsBinding" | "TypeReExportsBinding" | "BindsTo" | "TypeBindsTo"
+    )) {
+        let Some(source) = nodes.get(edge.source.as_str()).filter(|node| node.kind == "Symbol") else {
+            continue;
+        };
+        let target = nodes.get(edge.target.as_str());
+        let target_contract = target.map_or_else(
+            || format!("{}\0{}", edge.target, "missing-target"),
+            |node| format!("{}\0{}", node.kind, node.linked_sha256),
+        );
+        contracts.entry(source.id.clone()).or_default().push(format!(
+            "{}\0{}\0{}\0{}",
+            edge.kind,
+            edge.label.as_deref().unwrap_or_default(),
+            edge.dynamic,
+            target_contract,
+        ));
+    }
+    for values in contracts.values_mut() {
+        values.sort();
+        values.dedup();
+    }
+    contracts
+}
+
+fn streamed_unit_binding_evidence(
+    project: &ProjectIndex,
+) -> Result<(HashMap<String, String>, HashMap<String, Vec<String>>)> {
+    let Some(path) = &project.graph_artifact else {
+        let nodes = project.graph_nodes.iter().map(|node| (node.id.as_str(), node)).collect::<HashMap<_, _>>();
+        let contracts = import_symbol_contracts(&nodes, &project.graph_edges);
+        return Ok((graph_unit_binding_evidence(&project.units, &nodes, &project.graph_edges, &contracts), contracts));
+    };
+
+    // Artifacts are written one file at a time: all nodes for a file, then
+    // its edges. Retain only owner-local ReferenceSite ids, import contracts,
+    // and external binding targets for the current file; never load the full
+    // million-node/two-million-edge graph or decode the artifact a second time.
+    let units_by_file = project.units.iter().fold(HashMap::<&str, Vec<&Unit>>::new(), |mut map, unit| {
+        map.entry(unit.file.as_str()).or_default().push(unit);
+        map
+    });
+    let file = fs::File::open(path).with_context(|| format!("read {}", path.display()))?;
+    let decoded = zstd::stream::read::Decoder::new(file)?;
+    let mut results = HashMap::new();
+    let mut owner_symbols = HashMap::<String, HashSet<String>>::new();
+    let mut lossless_symbol_contracts = HashMap::<String, Vec<String>>::new();
+    let mut current_file: Option<String> = None;
+    let mut reference_owners = HashMap::<String, Vec<String>>::new();
+    let mut reference_sites = Vec::<(String, u32)>::new();
+    let mut references_ready = false;
+    let mut reference_targets = HashMap::<String, HashSet<String>>::new();
+    let mut import_contracts = HashMap::<String, Vec<String>>::new();
+    let mut external_targets = HashMap::<String, (String, String)>::new();
+
+    let flush_file = |reference_targets: &HashMap<String, HashSet<String>>,
+                      import_contracts: &HashMap<String, Vec<String>>,
+                      results: &mut HashMap<String, Vec<String>>,
+                      owner_symbols: &mut HashMap<String, HashSet<String>>| {
+        for (unit_id, targets) in reference_targets {
+            let values = results.entry(unit_id.clone()).or_default();
+            owner_symbols.entry(unit_id.clone()).or_default().extend(targets.iter().cloned());
+            for target in targets {
+                if let Some(contracts) = import_contracts.get(target) {
+                    values.extend(contracts.iter().cloned());
+                }
+            }
+        }
+    };
+    for line in BufReader::new(decoded).lines() {
+        let line = line?;
+        if line.trim().is_empty() { continue; }
+        let record: Value = serde_json::from_str(&line)?;
+        match record["recordType"].as_str() {
+            Some("node") => {
+                let node = serde_json::from_value::<GraphNode>(record["node"].clone())?;
+                if current_file.as_deref().is_some_and(|file| file != node.file) {
+                    flush_file(&reference_targets, &import_contracts, &mut results, &mut owner_symbols);
+                    reference_owners.clear();
+                    reference_sites.clear();
+                    references_ready = false;
+                    reference_targets.clear();
+                    import_contracts.clear();
+                    external_targets.clear();
+                    current_file = Some(node.file.clone());
+                } else if current_file.is_none() {
+                    current_file = Some(node.file.clone());
+                }
+                if node.kind == "ReferenceSite" {
+                    reference_sites.push((node.id, node.start));
+                } else if node.kind == "External" {
+                    external_targets.insert(node.id, (node.kind, node.linked_sha256));
+                }
+            }
+            Some("edge") => {
+                if !references_ready {
+                    if let Some(file) = current_file.as_deref() {
+                        if let Some(units) = units_by_file.get(file) {
+                            reference_owners = reference_owners_by_site(units, &reference_sites);
+                        }
+                    }
+                    references_ready = true;
+                }
+                let edge = serde_json::from_value::<GraphEdge>(record["edge"].clone())?;
+                if edge.kind == "References" {
+                    if let Some(owners) = reference_owners.get(edge.source.as_str()) {
+                        for owner in owners {
+                            reference_targets.entry(owner.clone()).or_default().insert(edge.target.as_ref().clone());
+                        }
+                    }
+                } else if matches!(edge.kind.as_str(),
+                    "ImportsBinding" | "TypeImportsBinding" | "DynamicImportsBinding" | "RequiresBinding"
+                        | "ReExportsBinding" | "TypeReExportsBinding") {
+                    if let Some((target_kind, target_hash)) = external_targets.get(edge.target.as_str()) {
+                        let contract = format!(
+                            "{}\0{}\0{}\0{}\0{}",
+                            edge.kind, edge.label.as_deref().unwrap_or_default(), edge.dynamic,
+                            target_kind, target_hash,
+                        );
+                        import_contracts.entry(edge.source.as_ref().clone()).or_default().push(contract.clone());
+                        lossless_symbol_contracts.entry(edge.source.as_ref().clone()).or_default().push(contract);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if current_file.is_some() {
+        flush_file(&reference_targets, &import_contracts, &mut results, &mut owner_symbols);
+    }
+    // Resolution edges are appended to the compact graph after per-file graph
+    // streaming. Join only edges whose source Symbol was actually referenced
+    // by an owner-local ReferenceSite, so unrelated imports remain isolated.
+    let compact_nodes = project.graph_nodes.iter().map(|node| (node.id.as_str(), node)).collect::<HashMap<_, _>>();
+    let mut resolved_contracts = HashMap::<String, Vec<String>>::new();
+    for edge in project.graph_edges.iter().filter(|edge| matches!(edge.kind.as_str(), "BindsTo" | "TypeBindsTo")) {
+        let Some(target) = compact_nodes.get(edge.target.as_str()) else { continue };
+        resolved_contracts.entry(edge.source.as_ref().clone()).or_default().push(format!(
+            "{}\0{}\0{}\0{}\0{}",
+            edge.kind, edge.label.as_deref().unwrap_or_default(), edge.dynamic,
+            target.kind, target.linked_sha256,
+        ));
+    }
+    for (symbol, contracts) in &mut resolved_contracts {
+        contracts.sort();
+        contracts.dedup();
+        lossless_symbol_contracts.entry(symbol.clone()).or_default().extend(contracts.iter().cloned());
+    }
+    for (unit_id, symbols) in &owner_symbols {
+        let values = results.entry(unit_id.clone()).or_default();
+        for symbol in symbols {
+            if let Some(contracts) = resolved_contracts.get(symbol) {
+                values.extend(contracts.iter().cloned());
+            }
+        }
+    }
+    for values in results.values_mut() { values.sort(); values.dedup(); }
+    for values in lossless_symbol_contracts.values_mut() { values.sort(); values.dedup(); }
+    let unit_evidence = project.units.iter().map(|unit| {
+        let contracts = results.remove(&unit.id).unwrap_or_default().join("\n");
+        (unit.id.clone(), sha256(format!("{}\0{contracts}", unit.features.signature(true))))
+    }).collect();
+    Ok((unit_evidence, lossless_symbol_contracts))
+}
 fn stable_review_identity_map(
     left: &ProjectIndex,
     right: &ProjectIndex,
-) -> (HashMap<String, String>, HashSet<String>) {
+) -> Result<(HashMap<String, String>, HashSet<String>)> {
     let mut candidates = Vec::<(String, String)>::with_capacity(
         left.units.len() + right.units.len() + left.graph_nodes.len() + right.graph_nodes.len(),
     );
@@ -608,19 +888,22 @@ fn stable_review_identity_map(
             .iter()
             .map(|node| (node.id.as_str(), node))
             .collect::<HashMap<_, _>>();
+        let (unit_bindings, lossless_symbol_contracts) = streamed_unit_binding_evidence(project)?;
         // A Symbol node deliberately has no AST feature stream of its own: its
         // behavior is represented by its declaration and typed binding edges.
         // Key a symbol's durable review identity by those contracts, instead of
         // its source offsets. This distinguishes exported/imported bindings and
         // most shadowed declarations while leaving genuinely indistinguishable
         // symbols ambiguous (and therefore fail-closed below).
-        let mut symbol_contracts = HashMap::<&str, Vec<String>>::new();
+        let mut symbol_contracts = HashMap::<String, Vec<String>>::new();
         for edge in &project.graph_edges {
             if !matches!(
                 edge.kind.as_str(),
                 "Defines"
                     | "ImportsBinding"
                     | "TypeImportsBinding"
+                    | "DynamicImportsBinding"
+                    | "RequiresBinding"
                     | "ExportsBinding"
                     | "TypeExportsBinding"
             ) {
@@ -636,7 +919,7 @@ fn stable_review_identity_map(
                 continue;
             };
             symbol_contracts
-                .entry(source.id.as_str())
+                .entry(source.id.clone())
                 .or_default()
                 .push(format!(
                     "{}\0{}\0{}\0{}\0{}",
@@ -651,12 +934,25 @@ fn stable_review_identity_map(
             contracts.sort();
             contracts.dedup();
         }
+        for (symbol, contracts) in lossless_symbol_contracts {
+            symbol_contracts.entry(symbol).or_default().extend(contracts);
+        }
+        for contracts in symbol_contracts.values_mut() {
+            contracts.sort();
+            contracts.dedup();
+        }
         for unit in &project.units {
-            let material = format!(
-                "unit\0{side}\0{}\0{}\0{}\0{}",
-                unit.file, unit.kind, unit.strict_sha256, unit.linked_sha256
-            );
-            candidates.push((unit.id.clone(), stable_review_fingerprint(&material)));
+            candidates.push((
+                unit.id.clone(),
+                unit_review_fingerprint(
+                    side,
+                    &unit.file,
+                    &unit.kind,
+                    &unit.strict_sha256,
+                    &unit.linked_sha256,
+                    unit_bindings.get(&unit.id).map(String::as_str).unwrap_or(""),
+                ),
+            ));
         }
 
         for node in &project.graph_nodes {
@@ -675,7 +971,7 @@ fn stable_review_identity_map(
             candidates.push((node.id.clone(), stable_review_fingerprint(&material)));
         }
     }
-    stable_review_identity_maps(candidates)
+    Ok(stable_review_identity_maps(candidates))
 }
 #[cfg(test)]
 fn stable_identity(
@@ -1334,7 +1630,7 @@ pub(crate) fn write_llm_context(
         })
         .as_ref()
         .map_err(|error| anyhow::anyhow!(error.clone()))?;
-    let (review_fingerprints, ambiguous_review_fingerprints) = stable_review_identity_map(left, right);
+    let (review_fingerprints, ambiguous_review_fingerprints) = stable_review_identity_map(left, right)?;
     let push_work_item = |items: &mut Vec<Value>, draft: WorkItemDraft| {
         push_work_item_with_review_fingerprints(
             items,
@@ -3003,12 +3299,16 @@ mod tests {
         compact_work_evidence, expand_work_evidence, frontier_identity_override, frontier_triage, frontier_work_action,
         push_work_item, push_work_item_with_identity_action, push_work_item_with_review_identities,
         read_shared_work_evidence,
+        import_symbol_contracts,
         same_file_identity, should_defer_structural_frontier, unlinked_upstream_triage,
         stable_identity, stable_review_fingerprint, unique_stable_review_identities,
-        work_item_id, owner_context_needs_work, push_work_item_with_review_fingerprints, WorkItemDraft,
+        graph_unit_binding_evidence, reference_owners_by_site, unit_review_fingerprint, work_item_id,
+        streamed_unit_binding_evidence,
+        owner_context_needs_work,
+        push_work_item_with_review_fingerprints, WorkItemDraft,
         write_json_lines,
     };
-    use crate::{run, FileRecord, Location, MatchRecord};
+    use crate::{run, CorpusSelection, FeatureChannels, FileRecord, GraphEdge, GraphNode, Location, MatchRecord, ProjectIndex, Unit};
     use serde_json::json;
     use std::{collections::{HashMap, HashSet}, fs};
     use tempfile::tempdir;
@@ -3746,6 +4046,236 @@ mod tests {
             identity,
             stable_review_fingerprint("unit\0left\0src/editor.ts\0Function\0source-b\0linked-b")
         );
+    }
+
+    #[test]
+    fn reference_owners_respect_nested_ranges_and_half_open_boundaries() {
+        let unit = |start, end| Unit {
+            id: format!("left:src/editor.ts:{start}:{end}:0"),
+            file: "src/editor.ts".into(),
+            kind: "Function".into(),
+            name: None,
+            start,
+            end,
+            line: 1,
+            origin: None,
+            nodes_approx: 0,
+            strict_sha256: "strict".into(),
+            linked_sha256: "linked".into(),
+            semantic_proof: None,
+            tokens: Default::default(),
+            features: FeatureChannels::default(),
+        };
+        let outer = unit(0, 100);
+        let nested = unit(20, 80);
+        let adjacent = unit(100, 120);
+        let units = [&outer, &nested, &adjacent];
+        let sites = [
+            ("at-start".into(), 0),
+            ("nested-start".into(), 20),
+            ("nested-end".into(), 80),
+            ("outer-end".into(), 100),
+            ("adjacent-end".into(), 120),
+        ];
+
+        let owners = reference_owners_by_site(&units, &sites);
+
+        assert_eq!(owners["at-start"], vec![outer.id.clone()]);
+        assert_eq!(owners["nested-start"], vec![outer.id.clone(), nested.id.clone()]);
+        assert_eq!(owners["nested-end"], vec![outer.id.clone()]);
+        assert_eq!(owners["outer-end"], vec![adjacent.id.clone()]);
+        assert!(!owners.contains_key("adjacent-end"));
+    }
+
+    #[test]
+    fn unit_review_identity_ignores_formatting_but_tracks_call_binding_changes() {
+        let before = unit_review_fingerprint(
+            "left", "src/editor.ts", "Function", "strict-a", "linked-a", "binding-import-a",
+        );
+        let reformatted = unit_review_fingerprint(
+            "left", "src/editor.ts", "Function", "strict-b", "linked-a", "binding-import-a",
+        );
+        let changed = unit_review_fingerprint(
+            "left", "src/editor.ts", "Function", "strict-b", "linked-b", "binding-import-a",
+        );
+        let changed_binding = unit_review_fingerprint(
+            "left", "src/editor.ts", "Function", "strict-b", "linked-a", "binding-import-b",
+        );
+
+        assert_eq!(before, reformatted);
+        assert_ne!(before, changed);
+        assert_ne!(before, changed_binding);
+    }
+
+    #[test]
+    fn unit_binding_evidence_tracks_changed_call_binding() {
+        let unit = Unit {
+            id: "left:src/editor.ts:0:100:0".into(),
+            file: "src/editor.ts".into(),
+            kind: "Function".into(),
+            name: None,
+            start: 0,
+            end: 100,
+            line: 1,
+            origin: None,
+            nodes_approx: 0,
+            strict_sha256: "strict".into(),
+            linked_sha256: "linked".into(),
+            semantic_proof: None,
+            tokens: Default::default(),
+            features: FeatureChannels::default(),
+        };
+        let reference = GraphNode {
+            id: "reference:call".into(),
+            file: "src/editor.ts".into(),
+            kind: "ReferenceSite".into(),
+            label: "call".into(),
+            start: 40,
+            end: 45,
+            line: 1,
+            scope: None,
+            linked_sha256: "reference-linked".into(),
+            tokens: Default::default(),
+        };
+        let imported = GraphNode {
+            id: "symbol:alias-x".into(), file: "src/editor.ts".into(), kind: "Symbol".into(),
+            label: "X".into(), start: 0, end: 0, line: 1, scope: None,
+            linked_sha256: "symbol-linked".into(), tokens: Default::default(),
+        };
+        let external = |linked: &str| GraphNode {
+            id: "external:module".into(), file: "src/editor.ts".into(), kind: "External".into(),
+            label: "module:pkg".into(), start: 0, end: 0, line: 1, scope: None,
+            linked_sha256: linked.into(), tokens: Default::default(),
+        };
+        let left_external = external("module-export-left");
+        let right_external = external("module-export-right");
+        let nodes_before = HashMap::from([
+            (reference.id.as_str(), &reference),
+            (imported.id.as_str(), &imported),
+            (left_external.id.as_str(), &left_external),
+        ]);
+        let nodes_after = HashMap::from([
+            (reference.id.as_str(), &reference),
+            (imported.id.as_str(), &imported),
+            (right_external.id.as_str(), &right_external),
+        ]);
+        let reference_edge = GraphEdge {
+            source: std::sync::Arc::new(reference.id.clone()),
+            target: std::sync::Arc::new(imported.id.clone()),
+            kind: "References".into(),
+            dynamic: false,
+            label: Some("X".into()),
+        };
+        let import_edge = |target: &GraphNode| GraphEdge {
+            source: std::sync::Arc::new(imported.id.clone()), target: std::sync::Arc::new(target.id.clone()),
+            kind: "ImportsBinding".into(), dynamic: false, label: Some("exported".into()),
+        };
+        let before_edges = [reference_edge.clone(), import_edge(&left_external)];
+        let after_edges = [reference_edge, import_edge(&right_external)];
+        let before_contracts = import_symbol_contracts(&nodes_before, &before_edges);
+        let after_contracts = import_symbol_contracts(&nodes_after, &after_edges);
+        let before = graph_unit_binding_evidence(&[unit.clone()], &nodes_before, &before_edges, &before_contracts);
+        let changed = graph_unit_binding_evidence(&[unit.clone()], &nodes_after, &after_edges, &after_contracts);
+        assert_ne!(before[&unit.id], changed[&unit.id]);
+    }
+
+    #[test]
+    fn unrelated_unit_in_same_file_keeps_its_binding_identity() {
+        let unit = |start, end| Unit {
+            id: format!("left:src/editor.ts:{start}:{end}:0"), file: "src/editor.ts".into(),
+            kind: "Function".into(), name: None, start, end, line: 1, origin: None,
+            nodes_approx: 0, strict_sha256: "strict".into(), linked_sha256: "linked".into(),
+            semantic_proof: None, tokens: Default::default(), features: FeatureChannels::default(),
+        };
+        let first = unit(0, 100);
+        let second = unit(100, 200);
+        let reference = GraphNode { id: "reference:a".into(), file: "src/editor.ts".into(),
+            kind: "ReferenceSite".into(), label: "X".into(), start: 40, end: 41, line: 2,
+            scope: None, linked_sha256: "ref".into(), tokens: Default::default() };
+        let imported = GraphNode { id: "symbol:X".into(), file: "src/editor.ts".into(),
+            kind: "Symbol".into(), label: "X".into(), start: 0, end: 0, line: 1,
+            scope: None, linked_sha256: "symbol".into(), tokens: Default::default() };
+        let before_target = GraphNode { id: "external:pkg".into(), file: "src/editor.ts".into(),
+            kind: "External".into(), label: "module:pkg".into(), start: 0, end: 0, line: 1,
+            scope: None, linked_sha256: "before".into(), tokens: Default::default() };
+        let after_target = GraphNode { linked_sha256: "after".into(), ..before_target.clone() };
+        let nodes_before = HashMap::from([
+            (reference.id.as_str(), &reference),
+            (imported.id.as_str(), &imported),
+            (before_target.id.as_str(), &before_target),
+        ]);
+        let nodes_after = HashMap::from([
+            (reference.id.as_str(), &reference),
+            (imported.id.as_str(), &imported),
+            (after_target.id.as_str(), &after_target),
+        ]);
+        let reference_edge = GraphEdge { source: std::sync::Arc::new(reference.id.clone()),
+            target: std::sync::Arc::new(imported.id.clone()), kind: "References".into(), dynamic: false, label: Some("X".into()) };
+        let import_edge = |target: &GraphNode| GraphEdge { source: std::sync::Arc::new(imported.id.clone()),
+            target: std::sync::Arc::new(target.id.clone()), kind: "ImportsBinding".into(), dynamic: false, label: Some("exported".into()) };
+        let before_edges = [reference_edge.clone(), import_edge(&before_target)];
+        let after_edges = [reference_edge, import_edge(&after_target)];
+        let before_contracts = import_symbol_contracts(&nodes_before, &before_edges);
+        let after_contracts = import_symbol_contracts(&nodes_after, &after_edges);
+        let units = [first.clone(), second.clone()];
+        let baseline = graph_unit_binding_evidence(&units, &nodes_before, &before_edges, &before_contracts);
+        let changed = graph_unit_binding_evidence(&units, &nodes_after, &after_edges, &after_contracts);
+        assert_ne!(baseline[&first.id], changed[&first.id]);
+        assert_eq!(baseline[&second.id], changed[&second.id]);
+    }
+
+    #[test]
+    fn lossless_import_and_resolved_target_change_only_the_referencing_owner() {
+        let root = tempdir().unwrap();
+        let make_unit = |name: &str, start, end| Unit {
+            id: format!("left:src/editor.ts:{start}:{end}:0"), file: "src/editor.ts".into(),
+            kind: "Function".into(), name: Some(name.into()), start, end, line: 1, origin: None,
+            nodes_approx: 0, strict_sha256: "strict".into(), linked_sha256: "linked".into(),
+            semantic_proof: None, tokens: Default::default(), features: FeatureChannels::default(),
+        };
+        let units = vec![make_unit("A", 0, 100), make_unit("B", 100, 200)];
+        let reference = GraphNode { id: "ref:X".into(), file: "src/editor.ts".into(),
+            kind: "ReferenceSite".into(), label: "X".into(), start: 40, end: 41, line: 2,
+            scope: None, linked_sha256: "ref".into(), tokens: Default::default() };
+        let imported = GraphNode { id: "symbol:X".into(), file: "src/editor.ts".into(),
+            kind: "Symbol".into(), label: "X".into(), start: 0, end: 0, line: 1,
+            scope: None, linked_sha256: "symbol".into(), tokens: Default::default() };
+        let external = |hash: &str| GraphNode { id: "external:module".into(), file: "src/editor.ts".into(),
+            kind: "External".into(), label: "module:pkg".into(), start: 0, end: 0, line: 1,
+            scope: None, linked_sha256: hash.into(), tokens: Default::default() };
+        let reference_edge = GraphEdge { source: std::sync::Arc::new(reference.id.clone()),
+            target: std::sync::Arc::new(imported.id.clone()), kind: "References".into(), dynamic: false,
+            label: Some("X".into()) };
+        let import_edge = GraphEdge { source: std::sync::Arc::new(imported.id.clone()),
+            target: std::sync::Arc::new("external:module".into()), kind: "ImportsBinding".into(),
+            dynamic: false, label: Some("exported".into()) };
+        let resolved_target = |hash: &str| GraphNode { id: "function:resolved".into(), file: "src/dep.ts".into(),
+            kind: "Function".into(), label: "resolved".into(), start: 10, end: 20, line: 1,
+            scope: None, linked_sha256: hash.into(), tokens: Default::default() };
+        let make_project = |artifact_name: &str, external_hash: &str, target_hash: &str| {
+            let nodes = [reference.clone(), imported.clone(), external(external_hash)];
+            let edges = [reference_edge.clone(), import_edge.clone()];
+            let mut records = nodes.iter().map(|node| json!({"recordType":"node","node":node})).collect::<Vec<_>>();
+            records.extend(edges.iter().map(|edge| json!({"recordType":"edge","edge":edge})));
+            let jsonl = records.iter().map(|record| record.to_string()).collect::<Vec<_>>().join("\n") + "\n";
+            let compressed = zstd::stream::encode_all(jsonl.as_bytes(), 1).unwrap();
+            let artifact = root.path().join(artifact_name);
+            fs::write(&artifact, compressed).unwrap();
+            ProjectIndex {
+                root: String::new(),
+                corpus: CorpusSelection { mode: "source", roots: Vec::new(), excluded_derivative_roots: Vec::new(), source_root: None, projection_tool: None },
+                project_sha256: String::new(), input_fingerprint: String::new(), input_roots: Vec::new(),
+                dependency_queries: Vec::new(), input_files: Vec::new(), files: Vec::new(), units: units.clone(),
+                graph_nodes: vec![resolved_target(target_hash)], graph_node_count: 1, graph_edges: vec![GraphEdge {
+                    source: std::sync::Arc::new(imported.id.clone()), target: std::sync::Arc::new("function:resolved".into()),
+                    kind: "BindsTo".into(), dynamic: false, label: Some("exported".into()),
+                }], graph_artifact: Some(artifact), failures: Vec::new(), skipped: Vec::new(),
+            }
+        };
+        let before = streamed_unit_binding_evidence(&make_project("before.zst", "module-v1", "implementation-v1")).unwrap().0;
+        let after = streamed_unit_binding_evidence(&make_project("after.zst", "module-v1", "implementation-v2")).unwrap().0;
+        assert_ne!(before[&units[0].id], after[&units[0].id]);
+        assert_eq!(before[&units[1].id], after[&units[1].id]);
     }
 
     #[test]

@@ -729,6 +729,11 @@ fn legacy_rekey_payload_matches(previous: &str, current: &str, legacy_id: &str) 
     {
         return false;
     }
+    // This matcher is called only by the exact-input legacy-rekey path: the
+    // previous local hash must equal the current hash, while upstream and
+    // dependency hashes are pinned by the migration query. Within that gate,
+    // a changed review identity can be explained by the engine's identity
+    // algorithm alone if the complete normalized payload still matches.
     fn remove_locator_fields(value: &mut Value) {
         match value {
             Value::Object(object) => {
@@ -2518,6 +2523,82 @@ pub fn import_codegraph(db_path: &Path, source_db: &Path, side: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v79_reviewed_decision_rekey_matches_identity_only_changes() {
+        let previous = serde_json::json!({
+            "id":"v79-old-id", "reviewIdentity":{"identities":["stable-review-v1:old"]},
+            "local":[{"id":"left:a:1:5:0","file":"a.ts","kind":"Function",
+                "reviewFingerprint":"stable-review-v1:old"}],
+            "upstream":[],"evidencePath":[]
+        });
+        let mut current = serde_json::json!({
+            "id":"new-id", "legacyIds":["v79-old-id"],
+            "reviewIdentity":{"identities":["stable-review-v2:new"]},
+            "local":[{"id":"left:a:20:24:0","file":"a.ts","kind":"Function",
+                "reviewFingerprint":"stable-review-v2:new"}],
+            "upstream":[],"evidencePath":[]
+        });
+        assert!(legacy_rekey_payload_matches(&previous.to_string(), &current.to_string(), "v79-old-id"));
+
+        current["local"][0]["behavior"] = serde_json::json!("different call target");
+        assert!(!legacy_rekey_payload_matches(&previous.to_string(), &current.to_string(), "v79-old-id"));
+    }
+
+    #[test]
+    fn sync_migrates_v79_decision_only_for_exact_inputs_and_unique_payload() {
+        fn run_case(local_hash_after: &str, duplicate: bool) -> (Value, Value, Value) {
+            let root = tempdir().unwrap();
+            let report_dir = root.path().join("report");
+            let db = root.path().join("state.sqlite");
+            let local = root.path().join("local");
+            let upstream = root.path().join("upstream");
+            let old_id = "work-v79-reviewed";
+            let old = serde_json::json!({
+                "id":old_id,"action":"inspect","priority":"P1",
+                "reviewIdentity":{"action":"inspect","identities":["stable-review-v1:old-binding"]},
+                "local":[{"id":"left:src/editor.ts:10:20:0","file":"src/editor.ts","kind":"Function",
+                    "start":10,"end":20,"reviewFingerprint":"stable-review-v1:old-binding"}],
+                "upstream":[],"evidencePath":[],"inspectNodeIds":["left:src/editor.ts:10:20:0"]
+            });
+            write_receipted_report(&report_dir, &local, &upstream, "same-local", &[old]);
+            sync(&db, &report_dir).unwrap();
+            mark_pending_sync(&db, old_id, "reviewed v79 owner and binding").unwrap();
+            let current = serde_json::json!({
+                "id":"work-new-identity","legacyIds":[old_id],"action":"inspect","priority":"P1",
+                "reviewIdentity":{"action":"inspect","identities":["stable-review-v2:new-binding"]},
+                "local":[{"id":"left:src/editor.ts:30:40:0","file":"src/editor.ts","kind":"Function",
+                    "start":30,"end":40,"reviewFingerprint":"stable-review-v2:new-binding"}],
+                "upstream":[],"evidencePath":[],"inspectNodeIds":["left:src/editor.ts:30:40:0"]
+            });
+            let mut items = vec![current.clone()];
+            if duplicate {
+                let mut second = current.clone();
+                second["id"] = serde_json::json!("work-new-identity-duplicate");
+                items.push(second);
+            }
+            write_receipted_report(&report_dir, &local, &upstream, local_hash_after, &items);
+            let result = sync(&db, &report_dir).unwrap();
+            (result, stats(&db).unwrap(), next(&db, 10).unwrap())
+        }
+
+        let (migrated, stats, next) = run_case("same-local", false);
+        assert_eq!(migrated["migrated"], 1);
+        assert_eq!(stats["done"], 1);
+        assert_eq!(next["count"], 0);
+
+        let (changed_input, changed_stats, changed_next) = run_case("changed-local-binding", false);
+        assert_eq!(changed_input["migrated"], 0);
+        assert_eq!(changed_stats["done"], 0);
+        assert_eq!(changed_stats["active"], 1);
+        assert_eq!(changed_next["count"], 1);
+
+        let (ambiguous, ambiguous_stats, ambiguous_next) = run_case("same-local", true);
+        assert_eq!(ambiguous["migrated"], 0);
+        assert_eq!(ambiguous_stats["done"], 0);
+        assert_eq!(ambiguous_stats["active"], 2);
+        assert_eq!(ambiguous_next["count"], 2);
+    }
     use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
