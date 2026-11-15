@@ -6059,6 +6059,13 @@ fn group_candidates(
         let Some(target) = targets.get(&record.location.id) else {
             continue;
         };
+        // A maximum-score one-to-one candidate is stronger than aggregate
+        // similarity against unrelated alternatives. Keep any ambiguity
+        // diagnostic, but do not turn weaker extra candidates into split/merge
+        // repair work when an exact single-unit correspondence already exists.
+        if record.candidates.iter().any(|candidate| candidate.score >= 0.999_999) {
+            continue;
+        }
         if target.nodes_approx < 12 {
             continue;
         }
@@ -17623,6 +17630,34 @@ mod tests {
             assert_eq!(contribution_fixture_groups(&repeated, &parts, relation).len(), 1, "actual repeated calls form a necessary group");
         }
     }
+    #[test]
+    fn exact_individual_correspondence_suppresses_speculative_group_candidate() {
+        let target = contribution_fixture_units(
+            "function owner(o){o.alpha(1);o.beta(2);return o;}",
+            "right",
+        ).remove(0);
+        let parts = contribution_fixture_units(
+            "function first(o){o.alpha(1);return o;} function second(o){o.beta(2);return o;}",
+            "left",
+        );
+        let groups_without_exact = contribution_fixture_groups(&target, &parts, "left-one-to-right-many");
+        assert_eq!(groups_without_exact.len(), 1, "the genuine split remains detectable");
+
+        let mut exact = target.clone();
+        exact.id = "exact-single-correspondence".to_string();
+        let mut members = parts.clone();
+        members.push(exact);
+        let member_refs = members.iter().collect::<Vec<_>>();
+        let ranked = rank_candidates(&[&target], &member_refs);
+        assert!(ranked[0].candidates.iter().any(|candidate| candidate.score >= 0.999_999));
+        let targets = [(target.id.clone(), &target)].into_iter().collect();
+        let members_by_id = members.iter().map(|unit| (unit.id.clone(), unit)).collect();
+        assert!(
+            group_candidates(&ranked, &targets, &members_by_id, "left-one-to-right-many").is_empty(),
+            "a perfect one-to-one candidate makes a weaker split grouping redundant"
+        );
+    }
+
     #[test]
     fn candidate_generation_survives_feature_count_drift() {
         let mut target = unit("target", &["CallExpression", "ReturnStatement"]);
