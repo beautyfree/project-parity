@@ -1024,6 +1024,63 @@ fn validate_report_roots_with_artifact(manifest: &Value, require_artifact: bool)
     Ok(())
 }
 
+pub fn bind_legacy_identity(db_path: &Path, report: &Path) -> Result<Value> {
+    let db_path = destination_path(db_path)?;
+    let report = destination_path(report)?;
+    let mut conn = open_existing_database(&db_path)?;
+    conn.busy_timeout(Duration::from_millis(1000))?;
+    if table_exists(&conn, "parity_identity")? {
+        let roots = database_identity(&conn, &db_path)?.context("state root identity is incomplete")?;
+        check_report_identity(&report, &roots, false, Some(&db_path))?;
+        return Ok(serde_json::json!({"status":"already-bound","localRoot":roots.local,"upstreamRoot":roots.upstream}));
+    }
+
+    let latest: (i64, String, Option<String>, Option<String>, i64) = conn.query_row(
+        "SELECT id, report, local_hash, upstream_hash, CAST(strftime('%s', synced_at) AS INTEGER) FROM runs ORDER BY id DESC LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    )?;
+    let recorded_report = legacy_report_path(&db_path, &latest.1)?;
+    if recorded_report != report {
+        bail!("legacy identity can only be bound from the exact report recorded by the latest run: {}", recorded_report.display());
+    }
+    let manifest_path = report.join("llm-manifest.json");
+    let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let has_pending_sync = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM work_item_decisions d JOIN work_items w ON w.id=d.work_item_id WHERE d.status='pending_sync' AND w.resolved_at IS NULL AND d.payload IS NOT NULL AND d.payload=w.payload)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !is_legacy_checkpoint_snapshot(&manifest, has_pending_sync) {
+        bail!("report is not an eligible v79 legacy checkpoint snapshot");
+    }
+    validate_report_roots_for_queue_read(&manifest)?;
+    let identity = read_report_identity(&manifest_path, true)?;
+    if latest.2.as_deref() != Some(&identity.local_hash)
+        || latest.3.as_deref() != Some(&identity.upstream_hash)
+    {
+        bail!("legacy report hashes do not match the latest recorded run; refusing to bind state roots");
+    }
+    let modified = fs::metadata(&manifest_path)?.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
+    if modified >= latest.4 as u64 {
+        bail!("legacy report timestamp is not strictly earlier than its recorded run; refusing ambiguous root migration");
+    }
+    check_report_identity(&report, &identity.roots, false, Some(&db_path))?;
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current = database_identity(&tx, &db_path)?.context("legacy state root identity could not be revalidated")?;
+    current.require(&identity.roots, &db_path)?;
+    store_database_identity(&tx, &identity.roots)?;
+    tx.commit()?;
+    Ok(serde_json::json!({
+        "status":"bound-legacy-identity",
+        "runId":latest.0,
+        "localRoot":identity.roots.local,
+        "upstreamRoot":identity.roots.upstream,
+        "decisionsChanged":false
+    }))
+}
+
 pub fn sync(db_path: &Path, report: &Path) -> Result<Value> {
     let manifest: Value = serde_json::from_slice(&fs::read(report.join("llm-manifest.json"))?)?;
     validate_report_roots(&manifest)?;

@@ -9914,6 +9914,7 @@ fn usage() -> &'static str {
         "  project-parity show-works REPORT_DIRECTORY WORK_ITEM_ID...\n",
         "  project-parity show-batch REPORT_DIRECTORY BATCH_ID [LIMIT] [OFFSET] [--compact]\n",
         "  project-parity state-sync STATE_DB REPORT_DIRECTORY\n",
+        "  project-parity state-bind-legacy-identity STATE_DB RECORDED_REPORT_DIRECTORY\n",
         "  project-parity state-next STATE_DB [LIMIT] [--summary] [--routing|--full]\n",
         "  project-parity state-optimize-queue STATE_DB\n",
         "  project-parity state-done STATE_DB WORK_ITEM_ID REASON\n",
@@ -10688,6 +10689,13 @@ fn main() -> Result<()> {
             bail!(usage());
         }
         print_json(&state::sync(Path::new(&args[1]), Path::new(&args[2]))?)?;
+        return Ok(());
+    }
+    if args.first().is_some_and(|arg| arg == "state-bind-legacy-identity") {
+        if args.len() != 3 {
+            bail!(usage());
+        }
+        print_json(&state::bind_legacy_identity(Path::new(&args[1]), Path::new(&args[2]))?)?;
         return Ok(());
     }
     if args.first().is_some_and(|arg| arg == "state-next") {
