@@ -7744,7 +7744,7 @@ fn analyze_semantic_graph(
                 )
             });
         if exact_parent_pair {
-            type SiblingKey = (String, bool, Option<String>, String, String);
+            type SiblingKey = (String, bool, Option<String>, String, String, BTreeSet<Arc<str>>);
             let mut left_siblings = BTreeMap::<SiblingKey, Vec<(usize, &GraphNode)>>::new();
             let mut right_siblings = BTreeMap::<SiblingKey, Vec<(usize, &GraphNode)>>::new();
             for (index, edge) in left_edges.iter().enumerate() {
@@ -7761,6 +7761,7 @@ fn analyze_semantic_graph(
                         edge.label.clone(),
                         target.kind.clone(),
                         target.linked_sha256.clone(),
+                        target.tokens.clone(),
                     ))
                     .or_default()
                     .push((index, *target));
@@ -7779,6 +7780,7 @@ fn analyze_semantic_graph(
                         edge.label.clone(),
                         target.kind.clone(),
                         target.linked_sha256.clone(),
+                        target.tokens.clone(),
                     ))
                     .or_default()
                     .push((index, *target));
@@ -7790,11 +7792,14 @@ fn analyze_semantic_graph(
                 if left_group.len() < 2 || left_group.len() != right_group.len() {
                     continue;
                 }
-                let source_order = |(_, node): &(usize, &GraphNode)| {
-                    (node.start, node.end, node.id.as_str())
-                };
-                left_group.sort_by(|left, right| source_order(left).cmp(&source_order(right)));
-                right_group.sort_by(|left, right| source_order(left).cmp(&source_order(right)));
+                left_group.sort_by(|(_, left), (_, right)| {
+                    (left.start, left.end, left.id.as_str())
+                        .cmp(&(right.start, right.end, right.id.as_str()))
+                });
+                right_group.sort_by(|(_, left), (_, right)| {
+                    (left.start, left.end, left.id.as_str())
+                        .cmp(&(right.start, right.end, right.id.as_str()))
+                });
                 for ((_, left_target), (_, right_target)) in left_group.into_iter().zip(right_group) {
                     if proposed.iter().any(|(left, right, _, _)| {
                         left == &left_target.id || right == &right_target.id
@@ -12960,6 +12965,53 @@ mod tests {
             && item["leftEdge"]["target"]["kind"] == "Statement"
             && item["rightEdge"]["target"]["kind"] == "Statement"));
         assert!(!frontiers.iter().any(|item| item["classification"] == "changed-branch"));
+    }
+
+    #[test]
+    fn semantic_graph_pairs_semantically_identical_repeated_siblings() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let local = "export function cleanup() { clear(); clear(); }";
+        let upstream = "export function cleanup() { clear(); clear(); }";
+        fs::write(left.path().join("owner.js"), local).unwrap();
+        fs::write(right.path().join("chunk.js"), upstream).unwrap();
+
+        run(left.path(), right.path(), output.path()).unwrap();
+
+        let relations = read_json_lines(&output.path().join("graph-relations.jsonl")).unwrap();
+        let mut statement_pairs = relations
+            .iter()
+            .filter(|relation| {
+                relation["basis"] == "neighbor-ordered-exact-siblings"
+                    && relation["left"]["kind"] == "Statement"
+                    && relation["right"]["kind"] == "Statement"
+            })
+            .map(|relation| {
+                (
+                    relation["left"]["start"].as_u64().unwrap() as usize,
+                    relation["right"]["start"].as_u64().unwrap() as usize,
+                )
+            })
+            .collect::<Vec<_>>();
+        statement_pairs.sort_unstable();
+
+        let local_starts = local
+            .match_indices("clear();")
+            .map(|(start, _)| start)
+            .collect::<Vec<_>>();
+        let upstream_starts = upstream
+            .match_indices("clear();")
+            .map(|(start, _)| start)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statement_pairs,
+            local_starts
+                .into_iter()
+                .zip(upstream_starts)
+                .collect::<Vec<_>>(),
+            "identical repeated siblings should pair by source order under a proven parent"
+        );
     }
 
     #[test]
