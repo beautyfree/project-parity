@@ -3246,9 +3246,23 @@ fn units_have_equivalent_dependency_context(
     left_unit: &Unit,
     right_unit: &Unit,
 ) -> bool {
-    fn context_for(index: &DependencyContextIndex, unit: &Unit) -> Option<BTreeSet<String>> {
+    fn context_for(
+        index: &DependencyContextIndex,
+        unit: &Unit,
+        compare_module_context: bool,
+    ) -> Option<BTreeSet<String>> {
         let mut result = BTreeSet::new();
         for entry in index.get(&unit.file).into_iter().flatten() {
+            // Unbound imports describe module initialization, not this owner.
+            // Comparing a source file's full import set with a bundled chunk's
+            // full import set multiplies one module-level difference into a
+            // candidate for every matched owner. Keep that gate when the two
+            // owners share a file path; cross-file owners compare only imports
+            // actually bound to and referenced by that owner. Module/chunk
+            // dependency edges remain represented in the dependency graph.
+            if entry.start == u32::MAX && !compare_module_context {
+                continue;
+            }
             if entry.start != u32::MAX && (entry.start < unit.start || entry.end > unit.end) {
                 continue;
             }
