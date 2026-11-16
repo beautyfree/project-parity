@@ -7730,6 +7730,87 @@ fn analyze_semantic_graph(
                 ));
             }
         }
+        // Repeated, structurally identical siblings under the same proven
+        // parent have a deterministic correspondence when both sides retain
+        // the same multiplicity and source order. Pair that whole group before
+        // the single-candidate fallback below; otherwise every child sees the
+        // same tied alternatives and is incorrectly left as ambiguous.
+        let exact_parent_pair = pair_meta
+            .get(&(left_id.clone(), right_id.clone()))
+            .is_some_and(|meta| {
+                matches!(
+                    meta.basis,
+                    "seed-unit" | "neighbor-exact" | "neighbor-structural-exact"
+                )
+            });
+        if exact_parent_pair {
+            type SiblingKey = (String, bool, Option<String>, String, String);
+            let mut left_siblings = BTreeMap::<SiblingKey, Vec<(usize, &GraphNode)>>::new();
+            let mut right_siblings = BTreeMap::<SiblingKey, Vec<(usize, &GraphNode)>>::new();
+            for (index, edge) in left_edges.iter().enumerate() {
+                let Some(target) = left_nodes.get(edge.target.as_str()) else {
+                    continue;
+                };
+                if left_to_right.contains_key(&target.id) {
+                    continue;
+                }
+                left_siblings
+                    .entry((
+                        edge.kind.clone(),
+                        edge.dynamic,
+                        edge.label.clone(),
+                        target.kind.clone(),
+                        target.linked_sha256.clone(),
+                    ))
+                    .or_default()
+                    .push((index, *target));
+            }
+            for (index, edge) in right_edges.iter().enumerate() {
+                let Some(target) = right_nodes.get(edge.target.as_str()) else {
+                    continue;
+                };
+                if right_to_left.contains_key(&target.id) {
+                    continue;
+                }
+                right_siblings
+                    .entry((
+                        edge.kind.clone(),
+                        edge.dynamic,
+                        edge.label.clone(),
+                        target.kind.clone(),
+                        target.linked_sha256.clone(),
+                    ))
+                    .or_default()
+                    .push((index, *target));
+            }
+            for (key, mut left_group) in left_siblings {
+                let Some(mut right_group) = right_siblings.remove(&key) else {
+                    continue;
+                };
+                if left_group.len() < 2 || left_group.len() != right_group.len() {
+                    continue;
+                }
+                let source_order = |(_, node): &(usize, &GraphNode)| {
+                    (node.start, node.end, node.id.as_str())
+                };
+                left_group.sort_by(|left, right| source_order(left).cmp(&source_order(right)));
+                right_group.sort_by(|left, right| source_order(left).cmp(&source_order(right)));
+                for ((_, left_target), (_, right_target)) in left_group.into_iter().zip(right_group) {
+                    if proposed.iter().any(|(left, right, _, _)| {
+                        left == &left_target.id || right == &right_target.id
+                    }) {
+                        continue;
+                    }
+                    proposed.push((
+                        left_target.id.clone(),
+                        right_target.id.clone(),
+                        "neighbor-ordered-exact-siblings",
+                        key.0.clone(),
+                    ));
+                }
+            }
+        }
+
         let left_parent_edges = left_incoming
             .get(left_id.as_str())
             .cloned()
