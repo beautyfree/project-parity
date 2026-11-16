@@ -2,7 +2,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     env, fs,
-    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
     thread,
@@ -9002,12 +9002,38 @@ fn generate_report(
         semantic_graph_artifact: "semantic-graph.jsonl.zst",
         semantic_graph_summary,
     };
-    let report_value = serde_json::to_value(&report)?;
-    fs::write(
-        output.join("report.json"),
-        format!("{}\n", serde_json::to_string_pretty(&report_value)?),
-    )?;
-    visualize::write_visual_report(output, &report_value)?;
+    let report_path = output.join("report.json");
+    let mut report_writer = BufWriter::new(fs::File::create(&report_path)?);
+    serde_json::to_writer_pretty(&mut report_writer, &report)?;
+    report_writer.write_all(b"\n")?;
+    report_writer.flush()?;
+
+    // The visual report needs file summaries and relations, not every indexed
+    // AST unit. Avoid materializing a second JSON tree for the full report.
+    let visual_report = serde_json::json!({
+        "schema": report.schema,
+        "engine": report.engine,
+        "evidenceBoundary": report.evidence_boundary,
+        "summary": &report.summary,
+        "graphSummary": &report.graph_summary,
+        "graphRelationsArtifact": report.graph_relations_artifact,
+        "divergenceFrontiersArtifact": report.divergence_frontiers_artifact,
+        "left": {
+            "root": &report.left.root,
+            "corpus": &report.left.corpus,
+            "files": &report.left.files,
+        },
+        "right": {
+            "root": &report.right.root,
+            "corpus": &report.right.corpus,
+            "files": &report.right.files,
+        },
+        "matches": &report.matches,
+        "fileGraphCandidates": &report.file_graph_candidates,
+        "ambiguousGroups": &report.ambiguous_groups,
+        "groupCandidates": &report.group_candidates,
+    });
+    visualize::write_visual_report(output, &visual_report)?;
     Ok(summary)
 }
 
