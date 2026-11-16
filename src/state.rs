@@ -601,12 +601,53 @@ fn routing_reclassification_preserves_evidence(previous: &str, current: &str) ->
 }
 
 fn remove_stable_locator_fields(value: &mut Value, allow_review_fingerprint: bool) -> (usize, bool) {
+    // Resolve repeated source locators (such as semanticOwner) from a
+    // fingerprinted owner elsewhere in this payload.
+    fn collect_stable_locators(value: &Value, stable_by_id: &mut HashMap<String, String>, ambiguous_ids: &mut HashSet<String>) {
+        match value {
+            Value::Object(object) => {
+                let id = object.get("id").and_then(Value::as_str);
+                let stable = object.get("stableFingerprint").and_then(Value::as_str).filter(|v| !v.is_empty());
+                let review = object.get("reviewFingerprint").and_then(Value::as_str).filter(|v| !v.is_empty());
+                if let Some(id) = id {
+                    let fingerprint = match (stable, review) {
+                        (Some(a), Some(b)) if a != b => None,
+                        (Some(a), _) => Some(a),
+                        (_, Some(b)) => Some(b),
+                        _ => None,
+                    };
+                    if let Some(fingerprint) = fingerprint {
+                        if !ambiguous_ids.contains(id) {
+                            if let Some(previous) = stable_by_id.get(id) {
+                                if previous != fingerprint {
+                                    stable_by_id.remove(id);
+                                    ambiguous_ids.insert(id.to_owned());
+                                }
+                            } else {
+                                stable_by_id.insert(id.to_owned(), fingerprint.to_owned());
+                            }
+                        }
+                    }
+                }
+                object.values().for_each(|child| collect_stable_locators(child, stable_by_id, ambiguous_ids));
+            }
+            Value::Array(values) => values.iter().for_each(|child| collect_stable_locators(child, stable_by_id, ambiguous_ids)),
+            _ => {}
+        }
+    }
+
+    let mut stable_by_id = HashMap::new();
+    let mut ambiguous_ids = HashSet::new();
+    collect_stable_locators(value, &mut stable_by_id, &mut ambiguous_ids);
+
     fn visit(
         value: &mut Value,
         root: bool,
         allow_review_fingerprint: bool,
         count: &mut usize,
         complete: &mut bool,
+        stable_by_id: &HashMap<String, String>,
+        ambiguous_ids: &HashSet<String>,
     ) {
         match value {
             Value::Object(object) => {
@@ -633,6 +674,19 @@ fn remove_stable_locator_fields(value: &mut Value, allow_review_fingerprint: boo
                 } else {
                     stable_fingerprint
                 };
+                let fingerprint = fingerprint.or_else(|| {
+                    if object.contains_key("stableFingerprint")
+                        || object.contains_key("reviewFingerprint")
+                        || !object.contains_key("file")
+                    {
+                        return None;
+                    }
+                    let id = object.get("id").and_then(Value::as_str)?;
+                    if ambiguous_ids.contains(id) {
+                        return None;
+                    }
+                    stable_by_id.get(id).cloned()
+                });
                 if let Some(fingerprint) = fingerprint {
                     *count += 1;
                     for key in ["id", "line", "start", "end", "origin"] {
@@ -648,19 +702,19 @@ fn remove_stable_locator_fields(value: &mut Value, allow_review_fingerprint: boo
                 }
                 for (key, child) in object.iter_mut() {
                     if key != "legacyIds" {
-                        visit(child, false, allow_review_fingerprint, count, complete);
+                        visit(child, false, allow_review_fingerprint, count, complete, stable_by_id, ambiguous_ids);
                     }
                 }
             }
             Value::Array(values) => values.iter_mut().for_each(|child| {
-                visit(child, false, allow_review_fingerprint, count, complete)
+                visit(child, false, allow_review_fingerprint, count, complete, stable_by_id, ambiguous_ids)
             }),
             _ => {}
         }
     }
     let mut count = 0;
     let mut complete = true;
-    visit(value, true, allow_review_fingerprint, &mut count, &mut complete);
+    visit(value, true, allow_review_fingerprint, &mut count, &mut complete, &stable_by_id, &ambiguous_ids);
     (count, complete)
 }
 fn review_evidence_matches(previous: &str, current: &str) -> bool {
@@ -4483,6 +4537,10 @@ mod tests {
                 "confidence":"candidate",
                 "reason":"review the missing branch",
                 "reviewIdentity":review_identity,
+                "semanticOwner":{
+                    "id":owner_id,"file":"src/editor.ts","kind":"Function",
+                    "line":offset,"start":offset + 20,"end":offset + 30,
+                },
                 "local":[{
                     "id":local_id,"file":"src/editor.ts","kind":"Function",
                     "line":offset,"start":offset,"end":offset + 10,
