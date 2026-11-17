@@ -199,6 +199,27 @@ fn intern_work_evidence(item: &mut Value, shared: &mut HashMap<String, Value>) -
     item["upstreamEvidenceRef"] = json!(id);
     Ok(())
 }
+fn push_work_item_with_interned_evidence(
+    items: &mut Vec<Value>,
+    draft: WorkItemDraft,
+    identity_action: Option<&str>,
+    review_fingerprints: &HashMap<String, String>,
+    ambiguous_fingerprints: &HashSet<String>,
+    shared: &mut HashMap<String, Value>,
+) -> Result<String> {
+    let id = push_work_item_with_review_fingerprints(
+        items,
+        draft,
+        identity_action,
+        review_fingerprints,
+        ambiguous_fingerprints,
+    );
+    intern_work_evidence(
+        items.last_mut().context("new work item was not appended")?,
+        shared,
+    )?;
+    Ok(id)
+}
 
 pub(crate) fn compact_work_evidence(output: &Path, items: &mut [Value], mut shared: HashMap<String, Value>) -> Result<()> {
     for item in items { intern_work_evidence(item, &mut shared)?; }
@@ -1701,27 +1722,19 @@ pub(crate) fn write_llm_context(
         })
         .as_ref()
         .map_err(|error| anyhow::anyhow!(error.clone()))?;
-    let (review_fingerprints, ambiguous_review_fingerprints) = stable_review_identity_map(left, right)?;
-    let push_work_item = |items: &mut Vec<Value>, draft: WorkItemDraft| {
-        push_work_item_with_review_fingerprints(
-            items,
-            draft,
-            None,
-            &review_fingerprints,
-            &ambiguous_review_fingerprints,
-        )
-    };
-    let push_work_item_with_identity_action = |items: &mut Vec<Value>, draft: WorkItemDraft, action: Option<&str>| {
-        push_work_item_with_review_fingerprints(
-            items,
-            draft,
-            action,
-            &review_fingerprints,
-            &ambiguous_review_fingerprints,
-        )
-    };
     let mut work_items = Vec::<Value>::new();
     let mut shared_work_evidence = HashMap::new();
+    let (review_fingerprints, ambiguous_review_fingerprints) = stable_review_identity_map(left, right)?;
+    let mut push_work_item = |items: &mut Vec<Value>, draft: WorkItemDraft, identity_action: Option<&str>| {
+        push_work_item_with_interned_evidence(
+            items,
+            draft,
+            identity_action,
+            &review_fingerprints,
+            &ambiguous_review_fingerprints,
+            &mut shared_work_evidence,
+        )
+    };
     let mut unit_dispositions = HashMap::<String, UnitDisposition>::new();
     let mut upstream_work_by_node = HashMap::<String, String>::new();
     let mut ambiguous_left_ids = HashSet::<String>::new();
@@ -1750,7 +1763,7 @@ pub(crate) fn write_llm_context(
                         reason: "The files have different TypeScript type syntax; inspect the public contract and its dependencies.".to_string(),
                         local: vec![json!({"file": local.file})], upstream: vec![json!({"file": upstream.file})],
                         evidence_path: Vec::new(), identities: vec![format!("type-surface:{}", upstream.file)],
-                    });
+                    }, None)?;
                 }
             }
         }
@@ -1772,7 +1785,8 @@ pub(crate) fn write_llm_context(
                 evidence_path: Vec::new(),
                 identities: vec![failure.file.clone()],
             },
-        );
+            None,
+        )?;
     }
     for failure in &left.failures {
         push_work_item(
@@ -1787,7 +1801,8 @@ pub(crate) fn write_llm_context(
                 evidence_path: Vec::new(),
                 identities: vec![failure.file.clone()],
             },
-        );
+            None,
+        )?;
     }
 
     let left_nodes = left.graph_nodes.iter().map(|node| (node.id.as_str(), node)).collect::<HashMap<_, _>>();
@@ -1868,7 +1883,8 @@ pub(crate) fn write_llm_context(
                 evidence_path: Vec::new(),
                 identities: vec![record.left.id.clone(), record.right.id.clone()],
             },
-        );
+            None,
+        )?;
         unit_dispositions.insert(
             record.right.id.clone(),
             UnitDisposition {
@@ -1921,7 +1937,8 @@ pub(crate) fn write_llm_context(
                 evidence_path: Vec::new(),
                 identities,
             },
-        );
+            None,
+        )?;
         for location in &group.right {
             unit_dispositions
                 .entry(location.id.clone())
@@ -2001,7 +2018,8 @@ pub(crate) fn write_llm_context(
                     )
                     .collect(),
             },
-        );
+            None,
+        )?;
     }
 
     let (proven_module_context_nodes, proven_module_file_pairs) =
@@ -2092,7 +2110,7 @@ pub(crate) fn write_llm_context(
                     reason: "No upstream module at the same path has a comparable export; inspect other possible owners before deciding whether this local export is extra.".to_string(),
                     local: vec![graph_node_value(&location)], upstream: Vec::new(), evidence_path: Vec::new(),
                     identities: vec![node.id.clone()],
-                });
+                }, None)?;
             }
             continue;
         };
@@ -2104,7 +2122,7 @@ pub(crate) fn write_llm_context(
                 reason: "The local export has no matching edge in the same-path upstream graph; inspect graph coverage and possible other owners before deciding whether it is extra.".to_string(),
                 local: vec![graph_node_value(&location)], upstream: Vec::new(), evidence_path: Vec::new(),
                 identities: vec![node.id.clone()],
-            });
+            }, None)?;
         }
     }
 
@@ -2694,7 +2712,7 @@ pub(crate) fn write_llm_context(
                 let reason = if routed_reason.is_empty() { reason } else { routed_reason };
                 (action, priority, confidence, reason)
             };
-        let id = push_work_item_with_identity_action(
+        let id = push_work_item(
             &mut work_items,
             WorkItemDraft {
                 action,
@@ -2707,7 +2725,7 @@ pub(crate) fn write_llm_context(
                 identities,
             },
             frontier_identity_override(identity_action, action),
-        );
+        )?;
         upstream_work_by_node.insert(right_edge.target.id.clone(), id.clone());
         if let Some(status) = node_status.get_mut(&right_edge.target.id) {
             status.2 = Some(id);
@@ -2755,7 +2773,8 @@ pub(crate) fn write_llm_context(
                 evidence_path: Vec::new(),
                 identities: vec![root_id.clone()],
             },
-        );
+            None,
+        )?;
         work_by_unlinked_root.insert(root_id, id);
     }
     for (node_id, root_id) in unlinked_root_by_node {
@@ -2863,7 +2882,8 @@ pub(crate) fn write_llm_context(
                 evidence_path: Vec::new(),
                 identities: vec![format!("semantic-context:{file}")],
             },
-        );
+            None,
+        )?;
         work_by_context_file.insert(file, id);
     }
 
@@ -2888,6 +2908,7 @@ pub(crate) fn write_llm_context(
         let containing = containing_unit(node, &units_by_file);
         let _ = containing;
     }
+    drop(push_work_item);
     // Intern large ambiguous-candidate arrays before coalescing duplicates;
     // otherwise both the raw queue and the coalescer retain full copies.
     for item in &mut work_items {
@@ -3721,6 +3742,37 @@ mod tests {
         assert_eq!(coalesced[0]["legacyIds"], json!(["old-a", "old-b"]));
     }
 
+    #[test]
+    fn large_ambiguous_evidence_is_interned_when_work_item_is_pushed() {
+        use super::{push_work_item_with_interned_evidence, WorkItemDraft};
+        use std::collections::{HashMap, HashSet};
+
+        let mut items = Vec::new();
+        let mut shared = HashMap::new();
+        let id = push_work_item_with_interned_evidence(
+            &mut items,
+            WorkItemDraft {
+                action: "resolve-ambiguous-owners",
+                priority: "P1",
+                confidence: "candidate",
+                reason: "large ambiguous owner group".to_string(),
+                local: vec![json!({"id":"left:1","file":"local.ts"})],
+                upstream: vec![json!({"id":"right:1","file":"chunk.js","payload":"x".repeat(1200)})],
+                evidence_path: Vec::new(),
+                identities: vec!["left:1".to_string(), "right:1".to_string()],
+            },
+            None,
+            &HashMap::new(),
+            &HashSet::new(),
+            &mut shared,
+        )
+        .unwrap();
+
+        assert_eq!(items[0]["id"], id);
+        assert!(items[0].get("upstream").is_none());
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared.values().next().unwrap()[0]["id"], "right:1");
+    }
     #[test]
     fn early_candidate_interning_preserves_owner_routes_and_coalesced_variants() {
         use super::{intern_work_evidence, semantic_owner, work_item_inspection_pair_key};
