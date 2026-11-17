@@ -6692,10 +6692,17 @@ fn is_terminal_control_flow_statement(node: &GraphNode) -> bool {
     .any(|shape| graph_node_has_shape(node, shape))
 }
 
-/// A control-flow consequent with a sole terminal statement has the same
-/// runtime effect with or without a brace-only BlockStatement.  Keep the
-/// block itself when it owns declarations, expressions, or multiple
-/// statements: those can change lexical scope or behavior.
+/// A control-flow consequent with one scope-inert statement has the same
+/// runtime effect with or without a brace-only BlockStatement. Keep the block
+/// itself when it owns declarations or multiple statements, which can change
+/// lexical scope or behavior.
+fn is_scope_inert_block_statement(node: &GraphNode) -> bool {
+    graph_node_has_shape(node, "ExpressionStatement")
+        || graph_node_has_shape(node, "EmptyStatement")
+        || graph_node_has_shape(node, "DebuggerStatement")
+        || is_terminal_control_flow_statement(node)
+}
+
 fn semantic_control_flow_consequent_edges<'a>(
     parent: &GraphNode,
     edges: &[&'a GraphEdge],
@@ -6732,7 +6739,7 @@ fn semantic_control_flow_consequent_edges<'a>(
             if let [child] = children.as_slice() {
                 if nodes
                     .get(child.target.as_str())
-                    .is_some_and(|node| is_terminal_control_flow_statement(node))
+                    .is_some_and(|node| is_scope_inert_block_statement(*node))
                 {
                     return vec![*child];
                 }
@@ -10621,7 +10628,7 @@ fn main() -> Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.len() == 1 && (args[0] == "--version" || args[0] == "-V") {
         print_stdout(&format!(
-            "project-parity {} (state-next-v3, state-next-candidate-hints-v1, state-next-owner-groups-v1, state-next-upstream-groups-v1, state-next-local-context-v1, state-done-batch-v1, state-done-sync-progress-v1, state-skip-batch-v1, show-works-v1, show-batch-compact-v1, state-optimize-queue-v1, frontier-triage-v2, frontier-behavior-edges-v1, shared-work-evidence-v1, js-family-jsx-v1)",
+            "project-parity {} (state-next-v3, state-next-candidate-hints-v1, state-next-owner-groups-v1, state-next-upstream-groups-v1, state-next-local-context-v1, state-done-batch-v1, state-done-sync-progress-v1, state-skip-batch-v1, show-works-v1, show-batch-compact-v1, state-optimize-queue-v1, frontier-triage-v2, frontier-behavior-edges-v1, single-statement-block-normalization-v1, shared-work-evidence-v1, js-family-jsx-v1)",
             env!("CARGO_PKG_VERSION")
         ))?;
         return Ok(());
