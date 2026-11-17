@@ -1354,7 +1354,7 @@ fn coalesce_work_items(items: Vec<Value>, shared: &HashMap<String, Value>) -> Re
         by_id.entry(key).or_default().push(item);
     }
 
-    by_id
+    let mut coalesced = by_id
         .into_iter()
         .map(|(group_key, mut items)| {
             if items.len() == 1 { return Ok(items.pop().expect("one work item")); }
@@ -1489,7 +1489,51 @@ fn coalesce_work_items(items: Vec<Value>, shared: &HashMap<String, Value>) -> Re
             }
             Ok(merged)
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+
+    // Stable review fingerprints can collide for repeated, structurally equal
+    // syntax at distinct source locations. The inspection-pair grouping above
+    // deliberately keeps those as separate decisions, so give each resulting
+    // item a deterministic ID derived from its full inspected evidence.
+    let mut id_counts = HashMap::<String, usize>::new();
+    for item in &coalesced {
+        if let Some(id) = item["id"].as_str() {
+            *id_counts.entry(id.to_string()).or_default() += 1;
+        }
+    }
+    let mut unique_ids = HashSet::new();
+    for item in &mut coalesced {
+        let Some(base_id) = item["id"].as_str().map(str::to_owned) else {
+            anyhow::bail!("coalesced work item has no ID");
+        };
+        if id_counts.get(&base_id).copied().unwrap_or_default() > 1 {
+            let identity = serde_json::to_vec(&json!({
+                "version": "work-item-collision-v1",
+                "baseId": base_id,
+                "action": item["action"],
+                "reviewIdentity": item.get("reviewIdentity"),
+                "local": item["local"],
+                "upstream": item["upstream"],
+                "inspectNodeIds": item["inspectNodeIds"],
+            }))?;
+            let id = format!("work-{}", &sha256(identity)[..20]);
+            let mut legacy_ids = item["legacyIds"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>();
+            legacy_ids.insert(base_id);
+            item["id"] = Value::String(id);
+            item["legacyIds"] = Value::Array(legacy_ids.into_iter().map(Value::String).collect());
+        }
+        let id = item["id"].as_str().expect("assigned work-item ID").to_string();
+        if !unique_ids.insert(id.clone()) {
+            anyhow::bail!("coalesced work items still contain duplicate ID {id}");
+        }
+    }
+    Ok(coalesced)
 }
 
 // Exact source-range owner lookup. Project units are ID-ordered, not start-
@@ -3729,6 +3773,29 @@ mod tests {
             frontier_triage(&["Calls"], "P1", "candidate"),
             ("P1", "candidate")
         );
+    }
+
+    #[test]
+    fn coalescing_disambiguates_stable_ids_for_distinct_inspection_pairs() {
+        let item = |local: &str, upstream: &str| json!({
+            "id":"work-shared",
+            "action":"inspect-unverified-changed-branch",
+            "priority":"P2",
+            "confidence":"weak-candidate",
+            "reason":"same stable fingerprint, distinct syntax locations",
+            "local":[{"id":local,"file":"local.ts"}],
+            "upstream":[{"id":upstream,"file":"upstream.js"}],
+            "evidencePath":[],
+            "inspectNodeIds":[local,upstream],
+        });
+        let first = item("left:one", "right:one");
+        let second = item("left:two", "right:two");
+        let forward = coalesce_work_items(vec![first.clone(), second.clone()], &HashMap::new()).unwrap();
+        let reverse = coalesce_work_items(vec![second, first], &HashMap::new()).unwrap();
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.len(), 2);
+        assert_ne!(forward[0]["id"], forward[1]["id"]);
+        assert!(forward.iter().all(|item| item["legacyIds"] == json!(["work-shared"])));
     }
 
     #[test]

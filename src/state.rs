@@ -1217,6 +1217,7 @@ fn sync_locked(db_path: &Path, report: &Path, roots: &RootIdentity) -> Result<Va
     let mut raw_line = Vec::new();
     let mut work_items_digest = Sha256::new();
     let mut seen = 0usize;
+    let mut seen_ids = HashSet::new();
     loop {
         raw_line.clear();
         if reader.read_until(b'\n', &mut raw_line)? == 0 {
@@ -1245,6 +1246,9 @@ fn sync_locked(db_path: &Path, report: &Path, roots: &RootIdentity) -> Result<Va
             line
         };
         let id = item["id"].as_str().context("work item has no id")?;
+        if !seen_ids.insert(id.to_string()) {
+            bail!("report work-item artifact contains duplicate work-item ID: {id}");
+        }
         tx.execute("INSERT INTO work_items(id,run_id,action,priority,confidence,payload,last_seen,resolved_at,batch_id) VALUES (?1,?2,?3,?4,?5,?6,CURRENT_TIMESTAMP,NULL,?7) ON CONFLICT(id) DO UPDATE SET run_id=excluded.run_id, action=excluded.action, priority=excluded.priority, confidence=excluded.confidence, payload=excluded.payload, last_seen=CURRENT_TIMESTAMP, resolved_at=NULL, batch_id=excluded.batch_id", params![id, run_id, item["action"].as_str(), item["priority"].as_str(), item["confidence"].as_str(), line, item["batchId"].as_str()])?;
         seen += 1;
     }
@@ -3038,6 +3042,30 @@ mod tests {
 
         assert!(error.to_string().contains("state database is an empty file"));
         assert_eq!(fs::metadata(&db).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn sync_rejects_duplicate_work_item_ids_without_changing_state() {
+        let root = tempdir().unwrap();
+        let report_dir = root.path().join("report");
+        let local = root.path().join("local");
+        let upstream = root.path().join("upstream");
+        let db = root.path().join("state.sqlite");
+        let original = [json!({"id":"stable","priority":"P1","action":"inspect","confidence":"candidate"})];
+        write_receipted_report(&report_dir, &local, &upstream, "local-hash", &original);
+        sync(&db, &report_dir).unwrap();
+        mark_pending_sync(&db, "stable", "reviewed once").unwrap();
+        let before = state_snapshot(&db);
+
+        let duplicates = [
+            json!({"id":"collision","priority":"P1","action":"inspect","confidence":"candidate","file":"a.ts"}),
+            json!({"id":"collision","priority":"P1","action":"inspect","confidence":"candidate","file":"b.ts"}),
+        ];
+        write_receipted_report(&report_dir, &local, &upstream, "next-local-hash", &duplicates);
+        let error = sync(&db, &report_dir).unwrap_err();
+
+        assert!(error.to_string().contains("duplicate work-item ID: collision"));
+        assert_eq!(state_snapshot(&db), before);
     }
 
     #[test]
