@@ -3273,8 +3273,12 @@ fn units_have_equivalent_dependency_context(
         }
         Some(result)
     }
+    let compare_module_context = left_unit.file == right_unit.file;
     matches!(
-        (context_for(left_contexts, left_unit), context_for(right_contexts, right_unit)),
+        (
+            context_for(left_contexts, left_unit, compare_module_context),
+            context_for(right_contexts, right_unit, compare_module_context),
+        ),
         (Some(left), Some(right)) if left == right
     )
 }
@@ -12711,6 +12715,57 @@ mod tests {
         source
             .find(unique_fragment)
             .unwrap_or_else(|| panic!("fixture fragment is missing: {unique_fragment}")) as u64
+    }
+
+    #[test]
+    fn semantic_graph_compiled_jsx_event_handlers_keep_sibling_owner_context() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let local = r#"
+            export function Panel({ camera, trackThrottled }) {
+              return <section>
+                <SliderPicker value={() => camera.background.edgeFalloff01} onChange={(edgeFalloff01) => {
+                  camera.updateBackground({ edgeFalloff01 })
+                  trackEventThrottled('Camera background edge falloff changed', { value: edgeFalloff01 })
+                }} />
+                <SliderPicker value={() => camera.background.edgeInsetPx} onChange={(edgeInsetPx) => {
+                  camera.updateBackground({ edgeInsetPx })
+                  trackEventThrottled('Camera background edge inset changed', { value: edgeInsetPx })
+                }} />
+              </section>
+            }
+        "#;
+        let upstream = r#"
+            export function Panel({ camera, trackThrottled }) {
+              return (0, React.jsxs)('section', { children: [
+                (0, React.jsx)(SliderPicker, { value: () => camera.background.edgeFalloff01, onChange: edgeFalloff01 => {
+                  camera.updateBackground({ edgeFalloff01 });
+                  trackEventThrottled('Camera background edge falloff changed', { value: edgeFalloff01 });
+                }}),
+                (0, React.jsx)(SliderPicker, { value: () => camera.background.edgeInsetPx, onChange: edgeInsetPx => {
+                  camera.updateBackground({ edgeInsetPx });
+                  trackEventThrottled('Camera background edge inset changed', { value: edgeInsetPx });
+                }})
+              ]});
+            }
+        "#;
+        fs::write(left.path().join("owner.tsx"), local).unwrap();
+        fs::write(right.path().join("chunk.jsx"), upstream).unwrap();
+
+        run(left.path(), right.path(), output.path()).unwrap();
+
+        let work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
+        let local_falloff = source_offset(local, "onChange={(edgeFalloff01)");
+        let local_inset = source_offset(local, "onChange={(edgeInsetPx)");
+        for start in [local_falloff, local_inset] {
+            assert!(!work.iter().any(|item| {
+                item["action"] == "remove-or-justify-extra-local"
+                    && item["local"].as_array().is_some_and(|owners| {
+                        owners.iter().any(|owner| owner["start"] == start)
+                    })
+            }), "a callback embedded under the corresponding compiled JSX owner must not be called extra local: {work:?}");
+        }
     }
 
     #[test]
