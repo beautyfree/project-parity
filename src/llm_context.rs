@@ -1291,10 +1291,20 @@ fn push_work_item_with_review_fingerprints(
 /// When distinct graph routes produce the same exact inspected node pair,
 /// they are one review decision with several evidence paths. Group by that
 /// pair while retaining each original ID as a migration alias.
-fn work_item_inspection_pair_key(item: &Value) -> Option<String> {
+fn work_item_inspection_pair_key(
+    item: &Value,
+    shared: &HashMap<String, Value>,
+) -> Option<String> {
     let action = item["action"].as_str()?;
     let local = item["local"].as_array()?;
-    let upstream = item["upstream"].as_array()?;
+    let upstream = item["upstream"]
+        .as_array()
+        .or_else(|| {
+            item["upstreamEvidenceRef"]
+                .as_str()
+                .and_then(|id| shared.get(id))
+                .and_then(Value::as_array)
+        })?;
     if local.len() != 1 || upstream.len() != 1 {
         return None;
     }
@@ -1319,7 +1329,7 @@ fn coalesce_work_items(items: Vec<Value>, shared: &HashMap<String, Value>) -> Re
             unkeyed += 1;
             format!("__unkeyed-{unkeyed}")
         });
-        let key = work_item_inspection_pair_key(&item).unwrap_or(id);
+        let key = work_item_inspection_pair_key(&item, shared).unwrap_or(id);
         by_id.entry(key).or_default().push(item);
     }
 
@@ -1711,7 +1721,7 @@ pub(crate) fn write_llm_context(
         )
     };
     let mut work_items = Vec::<Value>::new();
-    let shared_work_evidence = HashMap::new();
+    let mut shared_work_evidence = HashMap::new();
     let mut unit_dispositions = HashMap::<String, UnitDisposition>::new();
     let mut upstream_work_by_node = HashMap::<String, String>::new();
     let mut ambiguous_left_ids = HashSet::<String>::new();
@@ -2878,6 +2888,11 @@ pub(crate) fn write_llm_context(
         let containing = containing_unit(node, &units_by_file);
         let _ = containing;
     }
+    // Intern large ambiguous-candidate arrays before coalescing duplicates;
+    // otherwise both the raw queue and the coalescer retain full copies.
+    for item in &mut work_items {
+        intern_work_evidence(item, &mut shared_work_evidence)?;
+    }
     let mut work_items = coalesce_work_items(work_items, &shared_work_evidence)?;
     let mut routes = work_items
         .iter()
@@ -3708,7 +3723,7 @@ mod tests {
 
     #[test]
     fn early_candidate_interning_preserves_owner_routes_and_coalesced_variants() {
-        use super::{intern_work_evidence, semantic_owner};
+        use super::{intern_work_evidence, semantic_owner, work_item_inspection_pair_key};
         use std::collections::HashMap;
         let upstream = (0..200).map(|i| json!({"id":format!("right:{i}"),"file":"chunk.js","line":i})).collect::<Vec<_>>();
         let mut original = (0..20).map(|i| json!({
@@ -3719,16 +3734,28 @@ mod tests {
         let mut variant = original[0].clone();
         variant["evidencePath"] = json!([{"viaEdge":"Calls"}]);
         original.push(variant);
+        let wide_pair = json!({
+            "id":"work:pair-a","action":"resolve-ambiguous-owners","priority":"P1","confidence":"candidate",
+            "reason":"ambiguous owner","local":[{"id":"left:pair","file":"local.ts"}],
+            "upstream":[{"id":"right:pair","file":"chunk.js","line":1,"largePayload":"x".repeat(1200)}],
+            "evidencePath":[],"inspectNodeIds":["left:pair","right:pair"]
+        });
+        let mut wide_pair_variant = wide_pair.clone();
+        wide_pair_variant["id"] = json!("work:pair-b");
+        wide_pair_variant["evidencePath"] = json!([{"viaEdge":"Calls"}]);
+        original.extend([wide_pair, wide_pair_variant]);
         let expected = coalesce_work_items(original.clone(), &HashMap::new()).unwrap();
         let mut compact = original.clone();
         let mut shared = HashMap::new();
         for (item, source) in compact.iter_mut().zip(&original) {
+            let inspection_pair = work_item_inspection_pair_key(source, &HashMap::new());
             intern_work_evidence(item, &mut shared).unwrap();
+            assert_eq!(work_item_inspection_pair_key(item, &shared), inspection_pair);
             assert!(item.get("upstream").is_none());
             assert_eq!(semantic_owner(item, &shared, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()),
                 semantic_owner(source, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()));
         }
-        assert_eq!(shared.len(), 1);
+        assert_eq!(shared.len(), 2);
         assert!(serde_json::to_vec(&compact).unwrap().len() < serde_json::to_vec(&original).unwrap().len() / 10);
         let mut merged = coalesce_work_items(compact, &shared).unwrap();
         let output = tempfile::tempdir().unwrap();
