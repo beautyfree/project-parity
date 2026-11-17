@@ -1288,12 +1288,28 @@ fn push_work_item_with_review_fingerprints(
     id
 }
 
+/// When distinct graph routes produce the same exact inspected node pair,
+/// they are one review decision with several evidence paths. Group by that
+/// pair while retaining each original ID as a migration alias.
+fn work_item_inspection_pair_key(item: &Value) -> Option<String> {
+    let action = item["action"].as_str()?;
+    let local = item["local"].as_array()?;
+    let upstream = item["upstream"].as_array()?;
+    if local.len() != 1 || upstream.len() != 1 {
+        return None;
+    }
+    let local_id = local[0]["id"].as_str()?;
+    let upstream_id = upstream[0]["id"].as_str()?;
+    Some(format!("inspection-pair\0{action}\0{local_id}\0{upstream_id}"))
+}
+
 /// One stable work-item ID may be emitted by several divergent edges beneath
 /// the same owner pair. Keep the decision unit singular, but preserve every
 /// distinct edge payload so indexed `show-work` and state sync cannot silently
-/// select only the last occurrence.
+/// select only the last occurrence. Exact duplicate inspected node pairs are
+/// also one decision, even when their graph-route identities differ.
 fn coalesce_work_items(items: Vec<Value>, shared: &HashMap<String, Value>) -> Result<Vec<Value>> {
-    // Group by the compact identity first. Full serialized keys are needed
+    // Group by compact review identity first. Full serialized keys are needed
     // only while deduplicating one identity's variants, not for the entire
     // queue at once (those keys alone can exceed a GB on bundled projects).
     let mut by_id = BTreeMap::<String, Vec<Value>>::new();
@@ -1303,13 +1319,39 @@ fn coalesce_work_items(items: Vec<Value>, shared: &HashMap<String, Value>) -> Re
             unkeyed += 1;
             format!("__unkeyed-{unkeyed}")
         });
-        by_id.entry(id).or_default().push(item);
+        let key = work_item_inspection_pair_key(&item).unwrap_or(id);
+        by_id.entry(key).or_default().push(item);
     }
 
     by_id
-        .into_values()
-        .map(|mut items| {
+        .into_iter()
+        .map(|(group_key, mut items)| {
             if items.len() == 1 { return Ok(items.pop().expect("one work item")); }
+            let coalesced_inspection_pair = group_key.starts_with("inspection-pair\0");
+            let canonical_id = items
+                .iter()
+                .filter_map(|item| item["id"].as_str())
+                .min()
+                .map(str::to_string);
+            let mut grouped_ids = BTreeSet::<String>::new();
+            if coalesced_inspection_pair {
+                for item in &items {
+                    if let Some(id) = item["id"].as_str() {
+                        grouped_ids.insert(id.to_string());
+                    }
+                    grouped_ids.extend(
+                        item["legacyIds"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string),
+                    );
+                }
+                if let Some(canonical_id) = canonical_id.as_ref() {
+                    grouped_ids.remove(canonical_id);
+                }
+            }
             let items = items.into_iter().map(|item| expand_work_evidence(item, shared)).collect::<Result<Vec<_>>>()?;
             let unique = items
                 .into_iter()
@@ -1326,12 +1368,16 @@ fn coalesce_work_items(items: Vec<Value>, shared: &HashMap<String, Value>) -> Re
             }
 
             let mut merged = variants[0].clone();
-            let legacy_ids = variants
+            let mut legacy_ids = variants
                 .iter()
                 .flat_map(|variant| variant["legacyIds"].as_array().into_iter().flatten())
                 .filter_map(Value::as_str)
                 .map(str::to_string)
                 .collect::<BTreeSet<_>>();
+            legacy_ids.extend(grouped_ids);
+            if let Some(canonical_id) = canonical_id.as_ref() {
+                legacy_ids.remove(canonical_id);
+            }
             for key in ["local", "upstream", "evidencePath", "inspectNodeIds"] {
                 let mut values = BTreeMap::<String, Value>::new();
                 for variant in &variants {
@@ -1347,7 +1393,7 @@ fn coalesce_work_items(items: Vec<Value>, shared: &HashMap<String, Value>) -> Re
                 variants
                     .into_iter()
                     .map(|variant| {
-                        json!({
+                        let mut evidence = json!({
                             "action": variant["action"],
                             "priority": variant["priority"],
                             "confidence": variant["confidence"],
@@ -1356,7 +1402,17 @@ fn coalesce_work_items(items: Vec<Value>, shared: &HashMap<String, Value>) -> Re
                             "upstream": variant["upstream"],
                             "evidencePath": variant["evidencePath"],
                             "inspectNodeIds": variant["inspectNodeIds"],
-                        })
+                        });
+                        for key in [
+                            "semanticOwner",
+                            "reviewIdentity",
+                            "inspectNodeIdsFromOwners",
+                        ] {
+                            if let Some(value) = variant.get(key) {
+                                evidence[key] = value.clone();
+                            }
+                        }
+                        evidence
                     })
                     .collect(),
             );
@@ -1392,8 +1448,13 @@ fn coalesce_work_items(items: Vec<Value>, shared: &HashMap<String, Value>) -> Re
                     merged[key] = value;
                 }
             }
+            if let Some(canonical_id) = canonical_id {
+                merged["id"] = Value::String(canonical_id);
+            }
             if !legacy_ids.is_empty() {
                 merged["legacyIds"] = Value::Array(legacy_ids.into_iter().map(Value::String).collect());
+            } else {
+                merged.as_object_mut().expect("work item object").remove("legacyIds");
             }
             Ok(merged)
         })

@@ -783,6 +783,26 @@ fn legacy_rekey_payload_matches(previous: &str, current: &str, legacy_id: &str) 
     {
         return false;
     }
+    // Coalesced graph routes retain their original review payloads. Reuse that
+    // exact evidence to migrate a prior decision to the single owner-pair row.
+    let variant_keys = [
+        "action",
+        "priority",
+        "confidence",
+        "reason",
+        "local",
+        "upstream",
+        "evidencePath",
+    ];
+    if current["evidenceVariants"].as_array().is_some_and(|variants| {
+        variants.iter().any(|variant| {
+            variant_keys
+                .iter()
+                .all(|key| previous.get(*key) == variant.get(*key))
+        })
+    }) {
+        return true;
+    }
     // This matcher is called only by the exact-input legacy-rekey path: the
     // previous local hash must equal the current hash, while upstream and
     // dependency hashes are pinned by the migration query. Within that gate,
