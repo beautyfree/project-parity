@@ -4,7 +4,7 @@ use std::{
     env, fs,
     io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use sourcemap::DecodedMap;
-use walkdir::{DirEntry, WalkDir};
+use walkdir::WalkDir;
 
 mod dependency_entry;
 mod llm_context;
@@ -1541,11 +1541,89 @@ fn collect_units(
         .collect())
 }
 
-fn should_skip(entry: &DirEntry, selected_root: &Path, include_root_dist: bool) -> bool {
-    let is_skipped_directory = entry.file_type().is_dir()
-        && entry.path() != selected_root
-        && SKIP_DIRECTORIES.contains(&entry.file_name().to_string_lossy().as_ref());
-    is_skipped_directory && !(include_root_dist && entry.path() == selected_root.join("dist"))
+fn should_skip_path(path: &Path, selected_root: &Path, is_dir: bool, include_root_dist: bool) -> bool {
+    let is_skipped_directory = is_dir
+        && path != selected_root
+        && path.file_name().is_some_and(|name| SKIP_DIRECTORIES.contains(&name.to_string_lossy().as_ref()));
+    is_skipped_directory && !(include_root_dist && path == selected_root.join("dist"))
+}
+
+/// Walk a project using its ignore files while keeping Project Parity's
+/// explicit generated-output exclusions. Global Git excludes are disabled so
+/// analysis does not depend on machine-specific user configuration.
+fn project_walk(
+    root: &Path,
+    include_root_dist: bool,
+    report_root: &Path,
+    skipped: Arc<Mutex<Vec<String>>>,
+) -> ignore::Walk {
+    let root = root.to_path_buf();
+    let report_root = report_root.to_path_buf();
+    let skipped = Arc::clone(&skipped);
+    let mut builder = ignore::WalkBuilder::new(&root);
+    builder
+        .hidden(false)
+        .parents(true)
+        .ignore(true)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(false)
+        .require_git(false)
+        .follow_links(false)
+        .sort_by_file_name(|left, right| left.cmp(right))
+        .filter_entry(move |entry| {
+            let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+            let skip = should_skip_path(entry.path(), &root, is_dir, include_root_dist);
+            if skip {
+                let relative = entry
+                    .path()
+                    .strip_prefix(&report_root)
+                    .unwrap_or(entry.path())
+                    .display()
+                    .to_string();
+                if let Ok(mut skipped) = skipped.lock() {
+                    skipped.push(relative);
+                }
+            }
+            !skip
+        });
+    builder.build()
+}
+
+fn is_ignore_config_file(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == ".gitignore" || name == ".ignore")
+}
+
+fn project_relative_path(root: &Path, path: &Path) -> String {
+    if let Ok(relative) = path.strip_prefix(root) {
+        return relative.to_string_lossy().to_string();
+    }
+    let depth = root
+        .ancestors()
+        .enumerate()
+        .skip(1)
+        .find_map(|(depth, ancestor)| (path.parent() == Some(ancestor)).then_some(depth))
+        .unwrap_or(usize::MAX);
+    format!(
+        "@ancestor/{depth}/{}",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    )
+}
+
+fn ancestor_ignore_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for ancestor in root.ancestors().skip(1) {
+        for name in [".gitignore", ".ignore"] {
+            let path = ancestor.join(name);
+            if path.is_file() {
+                files.push(path);
+            }
+        }
+        if ancestor.join(".git").exists() {
+            break;
+        }
+    }
+    files
 }
 
 fn is_derivative_duplicate(path: &Path) -> bool {
@@ -1705,29 +1783,16 @@ fn discover(input: &Path) -> Result<Discovery> {
     };
     let mut files = Vec::new();
     let mut filtered = Vec::new();
-    let mut skipped = Vec::new();
+    let skipped_paths = Arc::new(Mutex::new(Vec::new()));
     for selected_root in selected {
-        for entry in WalkDir::new(&selected_root)
-            .follow_links(false)
-            .sort_by_file_name()
-            .into_iter()
-            .filter_entry(|entry| {
-                let skip = should_skip(entry, &selected_root, include_root_dist);
-                if skip {
-                    skipped.push(
-                        entry
-                            .path()
-                            .strip_prefix(&root)
-                            .unwrap_or(entry.path())
-                            .display()
-                            .to_string(),
-                    );
-                }
-                !skip
-            })
-        {
+        for entry in project_walk(
+            &selected_root,
+            include_root_dist,
+            &root,
+            Arc::clone(&skipped_paths),
+        ) {
             let entry = entry?;
-            if !entry.file_type().is_file() {
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                 continue;
             }
             let path = entry.path();
@@ -1753,6 +1818,7 @@ fn discover(input: &Path) -> Result<Discovery> {
         }
     }
     rescue_reachable_source_candidates(&root, &mut files, filtered);
+    let mut skipped = skipped_paths.lock().expect("skip recorder mutex poisoned").clone();
     skipped.sort();
     skipped.dedup();
     Ok(Discovery {
@@ -3417,14 +3483,9 @@ fn discover_dependencies(
         .canonicalize()
         .with_context(|| format!("cannot resolve {}", input.display()))?;
     let mut manifest_paths = Vec::new();
-    for entry in WalkDir::new(&root)
-        .follow_links(false)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_entry(|entry| !should_skip(entry, &root, false))
-    {
+    for entry in project_walk(&root, false, &root, Arc::new(Mutex::new(Vec::new()))) {
         let entry = entry?;
-        if entry.file_type().is_file() && entry.file_name() == "package.json" {
+        if entry.file_type().is_some_and(|kind| kind.is_file()) && entry.file_name() == "package.json" {
             manifest_paths.push(entry.path().to_path_buf());
         }
     }
@@ -3704,22 +3765,16 @@ fn project_fingerprint_files(root: &Path) -> Result<(Vec<(PathBuf, String)>, Vec
     let mut files = BTreeMap::<PathBuf, String>::new();
     let mut candidate_paths = BTreeSet::new();
     let mut tsconfigs = Vec::new();
-    for entry in WalkDir::new(&root)
-        .follow_links(false)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_entry(|entry| !should_skip(entry, &root, include_root_dist))
-    {
+    for path in ancestor_ignore_files(&root) {
+        files.insert(path.clone(), project_relative_path(&root, &path));
+    }
+    for entry in project_walk(&root, include_root_dist, &root, Arc::new(Mutex::new(Vec::new()))) {
         let entry = entry?;
-        if !entry.file_type().is_file() {
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
         let path = entry.path();
-        let relative = path
-            .strip_prefix(&root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string();
+        let relative = project_relative_path(&root, path);
         let is_source = path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -3730,6 +3785,7 @@ fn project_fingerprint_files(root: &Path) -> Result<(Vec<(PathBuf, String)>, Vec
         }
         if (is_source && !is_conventionally_filtered_source(&relative))
             || is_resolver_config_file(path)
+            || is_ignore_config_file(path)
         {
             files.insert(path.to_path_buf(), relative.clone());
         }

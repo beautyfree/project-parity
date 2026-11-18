@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 aho-corasick = "1"
 anyhow = "1"
+ignore = "=0.4.34"
 jsonc-parser = { version = "0.33.2", features = ["serde"] }
 oxc_allocator = "=0.126.0"
 oxc_ast = "=0.126.0"
