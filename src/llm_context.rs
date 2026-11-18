@@ -1312,6 +1312,18 @@ fn push_work_item_with_review_fingerprints(
 /// When distinct graph routes produce the same exact inspected node pair,
 /// they are one review decision with several evidence paths. Group by that
 /// pair while retaining each original ID as a migration alias.
+fn work_item_source_span_key(node: &Value) -> Option<String> {
+    let file = node["file"].as_str()?;
+    let kind = node["kind"].as_str()?;
+    let start = node["start"].as_u64()?;
+    let end = node["end"].as_u64()?;
+    Some(format!("{kind}\0{file}\0{start}\0{end}"))
+}
+
+/// Exact node spans are stable across syntax-node IDs and semantic-graph IDs.
+/// Those representations can describe the same source owner while carrying
+/// different IDs and action labels; preserve both as evidence variants but
+/// make the physical inspected pair one review decision.
 fn work_item_inspection_pair_key(
     item: &Value,
     shared: &HashMap<String, Value>,
@@ -1328,6 +1340,12 @@ fn work_item_inspection_pair_key(
         })?;
     if local.len() != 1 || upstream.len() != 1 {
         return None;
+    }
+    if let (Some(local_span), Some(upstream_span)) = (
+        work_item_source_span_key(&local[0]),
+        work_item_source_span_key(&upstream[0]),
+    ) {
+        return Some(format!("inspection-span\0{local_span}\0{upstream_span}"));
     }
     let local_id = local[0]["id"].as_str()?;
     let upstream_id = upstream[0]["id"].as_str()?;
@@ -1358,7 +1376,8 @@ fn coalesce_work_items(items: Vec<Value>, shared: &HashMap<String, Value>) -> Re
         .into_iter()
         .map(|(group_key, mut items)| {
             if items.len() == 1 { return Ok(items.pop().expect("one work item")); }
-            let coalesced_inspection_pair = group_key.starts_with("inspection-pair\0");
+            let coalesced_inspection_pair = group_key.starts_with("inspection-pair\0")
+                || group_key.starts_with("inspection-span\0");
             let canonical_id = items
                 .iter()
                 .filter_map(|item| item["id"].as_str())
@@ -1415,7 +1434,14 @@ fn coalesce_work_items(items: Vec<Value>, shared: &HashMap<String, Value>) -> Re
                     for value in variant[key].as_array().into_iter().flatten() {
                         let serialized =
                             serde_json::to_string(value).expect("evidence value serializes");
-                        values.entry(serialized).or_insert_with(|| value.clone());
+                        let dedupe_key = if matches!(key, "local" | "upstream") {
+                            work_item_source_span_key(value)
+                                .map(|span| format!("source-span\0{span}"))
+                                .unwrap_or(serialized)
+                        } else {
+                            serialized
+                        };
+                        values.entry(dedupe_key).or_insert_with(|| value.clone());
                     }
                 }
                 merged[key] = Value::Array(values.into_values().collect());
@@ -3796,6 +3822,43 @@ mod tests {
         assert_eq!(forward.len(), 2);
         assert_ne!(forward[0]["id"], forward[1]["id"]);
         assert!(forward.iter().all(|item| item["legacyIds"] == json!(["work-shared"])));
+    }
+
+    #[test]
+    fn coalescing_unifies_graph_and_syntax_ids_for_the_same_source_pair() {
+        let items = vec![
+            json!({
+                "id":"work-ambiguous",
+                "action":"resolve-ambiguous-owners",
+                "priority":"P1",
+                "confidence":"candidate",
+                "reason":"multiple graph routes",
+                "local":[{"id":"left:time.ts:graph:Function:6017:6214:198","kind":"Function","file":"packages/shared/src/time/time.ts","start":6017,"end":6214}],
+                "upstream":[{"id":"right:time.js:graph:Function:4091:4293:477","kind":"Function","file":"dist-deobfuscated/BbVP4mzM.js","start":4091,"end":4293}],
+                "evidencePath":[{"basis":"neighbor-exact"}],
+                "inspectNodeIds":["graph-left","graph-right"]
+            }),
+            json!({
+                "id":"work-changed",
+                "action":"reconcile-changed-owner",
+                "priority":"P2",
+                "confidence":"weak-candidate",
+                "reason":"fuzzy owner match",
+                "local":[{"id":"left:time.ts:6017:6214:14","kind":"Function","file":"packages/shared/src/time/time.ts","start":6017,"end":6214}],
+                "upstream":[{"id":"right:time.js:4091:4293:35","kind":"Function","file":"dist-deobfuscated/BbVP4mzM.js","start":4091,"end":4293}],
+                "evidencePath":[],
+                "inspectNodeIds":["syntax-left","syntax-right"]
+            })
+        ];
+
+        let merged = coalesce_work_items(items, &HashMap::new()).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["id"], "work-ambiguous");
+        assert_eq!(merged[0]["action"], "resolve-ambiguous-owners");
+        assert_eq!(merged[0]["local"].as_array().unwrap().len(), 1);
+        assert_eq!(merged[0]["upstream"].as_array().unwrap().len(), 1);
+        assert_eq!(merged[0]["evidenceVariants"].as_array().unwrap().len(), 2);
+        assert_eq!(merged[0]["legacyIds"], json!(["work-changed"]));
     }
 
     #[test]
