@@ -2737,11 +2737,19 @@ pub(crate) fn write_llm_context(
             .into_iter()
             .collect::<Vec<_>>();
         let upstream = vec![graph_node_value(&right_edge.target)];
-        let identities = std::iter::once(frontier.source_left.id.clone())
-            .chain(std::iter::once(frontier.source_right.id.clone()))
-            .chain(frontier.left_edge.iter().map(|edge| edge.target.id.clone()))
-            .chain(std::iter::once(right_edge.target.id.clone()))
-            .collect::<Vec<_>>();
+        let is_current_module_boundary =
+            right_edge.target.kind == "External" && right_edge.target.label == "module:<current>";
+        // A non-executable module boundary is one review unit; coalescing below
+        // retains each distinct owner path as an evidence variant.
+        let identities = if is_current_module_boundary {
+            vec![right_edge.target.id.clone()]
+        } else {
+            std::iter::once(frontier.source_left.id.clone())
+                .chain(std::iter::once(frontier.source_right.id.clone()))
+                .chain(frontier.left_edge.iter().map(|edge| edge.target.id.clone()))
+                .chain(std::iter::once(right_edge.target.id.clone()))
+                .collect::<Vec<_>>()
+        };
         let evidence_path = relation_path(
             &relation_by_pair,
             &frontier.source_left.id,
@@ -2754,9 +2762,7 @@ pub(crate) fn write_llm_context(
             .map(|edge| edge.kind.as_str())
             .collect::<Vec<_>>();
         let (action, priority, confidence, reason) =
-            if right_edge.target.kind == "External"
-                && right_edge.target.label == "module:<current>"
-            {
+            if is_current_module_boundary {
                 (
                     "inspect-unresolved-upstream-graph-context",
                     "P2",
