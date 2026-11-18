@@ -1162,9 +1162,93 @@ pub fn sync(db_path: &Path, report: &Path) -> Result<Value> {
     SyncGuard::acquire(incoming.roots, report, Some(db_path), false)?.sync()
 }
 
+fn validate_report_input_fingerprints(
+    manifest: &Value,
+    allow_local_changes: bool,
+    allow_legacy_dependency_snapshot: bool,
+    operation: &str,
+) -> Result<()> {
+    let engine = manifest["engine"].as_str();
+    for (side, root, expected_hash) in [
+        (
+            "local",
+            manifest["localRoot"].as_str(),
+            manifest["inputFingerprints"]["local"]["sha256"].as_str(),
+        ),
+        (
+            "upstream",
+            manifest["analysisProjection"].as_str(),
+            manifest["inputFingerprints"]["upstream"]["sha256"].as_str(),
+        ),
+    ] {
+        let Some(root) = root else {
+            if engine == Some(ENGINE_VERSION) {
+                bail!("parity report manifest is missing the {side} source root; regenerate the report before {operation}");
+            }
+            continue;
+        };
+        let Some(expected_hash) = expected_hash else {
+            if engine == Some(ENGINE_VERSION) {
+                bail!("parity report manifest is missing the {side} source fingerprint; regenerate the report before {operation}");
+            }
+            continue;
+        };
+        let selected_files: Vec<(PathBuf, String)> = serde_json::from_value(
+            manifest["inputFingerprints"][side]["inputFiles"].clone(),
+        )
+        .context(format!("manifest has no {side} input files"))?;
+        let current_hash = crate::fingerprint_input(Path::new(root), &selected_files)?;
+        if current_hash != expected_hash && !(side == "local" && allow_local_changes) {
+            bail!("parity report {side} source inputs changed since report generation (root: {root}); regenerate the report before {operation}");
+        }
+    }
+
+    if let Some(dependencies) = manifest["inputFingerprints"]["dependencies"].as_object() {
+        let root = dependencies["root"]
+            .as_str()
+            .context("dependency input fingerprint has no root")?;
+        let expected_hash = dependencies["sha256"]
+            .as_str()
+            .context("dependency input fingerprint has no hash")?;
+        let input_roots: Vec<crate::DependencyInputRoot> = serde_json::from_value(
+            dependencies
+                .get("packageRoots")
+                .cloned()
+                .context("dependency input fingerprint has no package roots")?,
+        )?;
+        let resolution_queries: Vec<crate::DependencyResolutionQuery> = serde_json::from_value(
+            dependencies
+                .get("resolutionQueries")
+                .cloned()
+                .context("dependency input fingerprint has no resolution queries")?,
+        )?;
+        let selected_files: Vec<(PathBuf, String)> = serde_json::from_value(
+            dependencies
+                .get("inputFiles")
+                .cloned()
+                .context("dependency input fingerprint has no input files")?,
+        )?;
+        let current_hash = crate::fingerprint_dependency_input(
+            Path::new(root),
+            &input_roots,
+            &selected_files,
+            &resolution_queries,
+        )?;
+        if current_hash != expected_hash && !allow_legacy_dependency_snapshot {
+            bail!("parity report dependency source inputs changed since report generation (root: {root}); regenerate the report before {operation}");
+        }
+    } else if manifest["inputHashes"]["dependencies"].is_string()
+        && engine == Some(ENGINE_VERSION)
+    {
+        bail!("parity report manifest is missing dependency source fingerprints; regenerate the report before {operation}");
+    }
+    Ok(())
+}
+
 fn sync_locked(db_path: &Path, report: &Path, roots: &RootIdentity) -> Result<Value> {
     let manifest: Value = serde_json::from_slice(&fs::read(report.join("llm-manifest.json"))?)?;
     validate_report_roots(&manifest)?;
+    validate_report_input_fingerprints(&manifest, false, false, "syncing decisions")?;
     let incoming = read_report_identity(&report.join("llm-manifest.json"), true)?;
     incoming.roots.require(roots, report)?;
     check_report_identity(report, roots, true, Some(db_path))?;
@@ -2060,45 +2144,12 @@ fn ensure_report_is_synced(db_path: &Path, conn: &Connection) -> Result<Option<L
         false
     };
     let legacy_checkpoint_snapshot = is_legacy_checkpoint_snapshot(&manifest_value, has_pending_sync);
-    for (side, root, expected_hash) in [
-        (
-            "local",
-            manifest_value["localRoot"].as_str(),
-            manifest_value["inputFingerprints"]["local"]["sha256"].as_str(),
-        ),
-        (
-            "upstream",
-            manifest_value["analysisProjection"].as_str(),
-            manifest_value["inputFingerprints"]["upstream"]["sha256"].as_str(),
-        ),
-    ] {
-        let Some(root) = root else {
-            if manifest_value["engine"].as_str() == Some(ENGINE_VERSION) {
-                bail!(
-                    "parity report manifest is missing the {side} source root. Regenerate the report and run `project-parity sync` before requesting the next item"
-                );
-            }
-            continue;
-        };
-        let Some(expected_hash) = expected_hash else {
-            if manifest_value["engine"].as_str() == Some(ENGINE_VERSION) {
-                bail!(
-                    "parity report manifest is missing the {side} source fingerprint. Regenerate the report and run `project-parity sync` before requesting the next item"
-                );
-            }
-            continue;
-        };
-        let selected_files: Vec<(PathBuf, String)> = serde_json::from_value(
-            manifest_value["inputFingerprints"][side]["inputFiles"].clone(),
-        )
-        .context(format!("manifest has no {side} input files"))?;
-        let current_hash = crate::fingerprint_input(Path::new(root), &selected_files)?;
-        if current_hash != expected_hash && !(side == "local" && has_pending_sync) {
-            bail!(
-                "parity report {side} source inputs changed since report generation (root: {root}). Regenerate the report, then run `project-parity sync` before requesting the next item"
-            );
-        }
-    }
+    validate_report_input_fingerprints(
+        &manifest_value,
+        has_pending_sync,
+        legacy_checkpoint_snapshot,
+        "requesting the next item",
+    )?;
     let local_report_snapshot = manifest_value["localRoot"]
         .as_str()
         .and_then(|root| {
@@ -2120,49 +2171,6 @@ fn ensure_report_is_synced(db_path: &Path, conn: &Connection) -> Result<Option<L
                 file_hashes,
             })
         });
-    if let Some(dependencies) = manifest_value["inputFingerprints"]["dependencies"].as_object() {
-        let root = dependencies["root"]
-            .as_str()
-            .context("dependency input fingerprint has no root")?;
-        let expected_hash = dependencies["sha256"]
-            .as_str()
-            .context("dependency input fingerprint has no hash")?;
-        let input_roots: Vec<crate::DependencyInputRoot> = serde_json::from_value(
-            dependencies
-                .get("packageRoots")
-                .cloned()
-                .context("dependency input fingerprint has no package roots")?,
-        )?;
-        let resolution_queries: Vec<crate::DependencyResolutionQuery> = serde_json::from_value(
-            dependencies
-                .get("resolutionQueries")
-                .cloned()
-                .context("dependency input fingerprint has no resolution queries")?,
-        )?;
-        let selected_files: Vec<(PathBuf, String)> = serde_json::from_value(
-            dependencies
-                .get("inputFiles")
-                .cloned()
-                .context("dependency input fingerprint has no input files")?,
-        )?;
-        let current_hash = crate::fingerprint_dependency_input(
-            Path::new(root),
-            &input_roots,
-            &selected_files,
-            &resolution_queries,
-        )?;
-        if current_hash != expected_hash && !legacy_checkpoint_snapshot {
-            bail!(
-                "parity report dependency source inputs changed since report generation (root: {root}). Regenerate the report, then run `project-parity sync` before requesting the next item"
-            );
-        }
-    } else if manifest_value["inputHashes"]["dependencies"].is_string()
-        && manifest_value["engine"].as_str() == Some(ENGINE_VERSION)
-    {
-        bail!(
-            "parity report manifest is missing dependency source fingerprints. Regenerate the report and run `project-parity sync` before requesting the next item"
-        );
-    }
     Ok(local_report_snapshot)
 }
 
