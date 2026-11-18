@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::{BufRead, BufReader, Cursor},
+    io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::{Duration, UNIX_EPOCH},
 };
@@ -1570,6 +1570,45 @@ struct LocalReportSnapshot {
     file_hashes: HashMap<String, String>,
 }
 
+struct CurrentReportWorkItems {
+    jsonl_path: PathBuf,
+    jsonl: fs::File,
+    records: HashMap<String, (u64, u64)>,
+}
+
+struct QueueReportSnapshot {
+    local: Option<LocalReportSnapshot>,
+    current_work_items: Option<CurrentReportWorkItems>,
+}
+
+impl CurrentReportWorkItems {
+    fn matches(&mut self, payload: &str) -> Result<bool> {
+        let item: Value = serde_json::from_str(payload)?;
+        let Some(id) = item["id"].as_str() else {
+            return Ok(false);
+        };
+        let Some((offset, length)) = self.records.get(id).copied() else {
+            return Ok(false);
+        };
+        let length = usize::try_from(length)
+            .context("work-item index length exceeds address space")?;
+        let file_len = self.jsonl.metadata()?.len();
+        let length_u64 = u64::try_from(length).context("work-item index length exceeds u64")?;
+        let end = offset
+            .checked_add(length_u64)
+            .context("work-item index range overflow")?;
+        if end > file_len {
+            bail!("work-item index range exceeds {}", self.jsonl_path.display());
+        }
+        self.jsonl.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0; length];
+        self.jsonl.read_exact(&mut bytes)?;
+        let current: Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse indexed work item {id}"))?;
+        Ok(current == item)
+    }
+}
+
 fn summarize_owners(owners: Option<Vec<SummaryOwner>>) -> (usize, usize, Vec<String>) {
     let (owners, _) = split_candidate_owners(owners.unwrap_or_default());
     summarize_owner_list(&owners)
@@ -1682,30 +1721,40 @@ fn next_queue_payloads(
     conn: &Connection,
     limit: usize,
     local_snapshot: Option<&LocalReportSnapshot>,
-) -> Result<(Vec<String>, usize)> {
+    mut current_work_items: Option<&mut CurrentReportWorkItems>,
+) -> Result<(Vec<String>, usize, usize)> {
     if limit == 0 {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), 0, 0));
     }
-    let Some(snapshot) = local_snapshot else {
-        return Ok((next_queue_page(conn, limit, 0)?, 0));
-    };
+    if local_snapshot.is_none() && current_work_items.is_none() {
+        return Ok((next_queue_page(conn, limit, 0)?, 0, 0));
+    }
 
     let page_size = limit.max(32);
     let mut offset = 0;
     let mut payloads = Vec::with_capacity(limit);
     let mut stale_count = 0;
+    let mut stale_report_count = 0;
     let mut file_staleness = HashMap::new();
     loop {
         let page = next_queue_page(conn, page_size, offset)?;
         let page_len = page.len();
         for payload in page {
-            if item_has_stale_local_source(&payload, snapshot, &mut file_staleness)? {
-                stale_count += 1;
-            } else {
-                payloads.push(payload);
-                if payloads.len() == limit {
-                    return Ok((payloads, stale_count));
+            if let Some(current) = current_work_items.as_deref_mut() {
+                if !current.matches(&payload)? {
+                    stale_report_count += 1;
+                    continue;
                 }
+            }
+            if let Some(snapshot) = local_snapshot {
+                if item_has_stale_local_source(&payload, snapshot, &mut file_staleness)? {
+                    stale_count += 1;
+                    continue;
+                }
+            }
+            payloads.push(payload);
+            if payloads.len() == limit {
+                return Ok((payloads, stale_count, stale_report_count));
             }
         }
         if page_len < page_size {
@@ -1713,7 +1762,7 @@ fn next_queue_payloads(
         }
         offset += page_len;
     }
-    Ok((payloads, stale_count))
+    Ok((payloads, stale_count, stale_report_count))
 }
 
 fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) -> Result<Value> {
@@ -1726,7 +1775,7 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
     // hang.
     let conn = open_existing_database(db_path)?;
     conn.busy_timeout(Duration::from_millis(1000))?;
-    let local_snapshot = ensure_report_is_synced(db_path, &conn)?;
+    let mut report_snapshot = ensure_report_is_synced(db_path, &conn)?;
     // Order only the small queue key first. Sorting the full payload here makes
     // SQLite materialize tens of thousands of large JSON blobs before LIMIT
     // can apply, which is both slow and capable of exhausting disk space.
@@ -1735,8 +1784,13 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
     // starve upstream functionality gaps. Keep both classes in the queue and
     // surface them automatically after earlier phases are exhausted.
     let unverified_decisions = unverified_decision_count(&conn)?;
-    let (payloads, stale_local_items_excluded) =
-        next_queue_payloads(&conn, limit, local_snapshot.as_ref())?;
+    let (payloads, stale_local_items_excluded, stale_report_items_excluded) =
+        next_queue_payloads(
+            &conn,
+            limit,
+            report_snapshot.local.as_ref(),
+            report_snapshot.current_work_items.as_mut(),
+        )?;
     let rows = payloads.into_iter().map(Ok::<_, anyhow::Error>);
     let items = if routing && summary {
         rows.map(|row| -> Result<Value> {
@@ -2018,6 +2072,7 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
             "routing": true,
             "summary": summary,
             "staleLocalItemsExcluded": stale_local_items_excluded,
+            "staleReportItemsExcluded": stale_report_items_excluded,
             "unverifiedDecisions": unverified_decisions,
             "count": items.len(),
             "reviewGroups": review_groups,
@@ -2032,6 +2087,7 @@ fn next_with_mode(db_path: &Path, limit: usize, summary: bool, routing: bool) ->
             "schema": "project-parity/state-next-v1",
             "summary": summary,
             "staleLocalItemsExcluded": stale_local_items_excluded,
+            "staleReportItemsExcluded": stale_report_items_excluded,
             "unverifiedDecisions": unverified_decisions,
             "count": items.len(),
             "items": items,
@@ -2085,7 +2141,7 @@ fn is_parity_campaign_db(db_path: &Path) -> bool {
         .is_some_and(|name| name == ".parity" || name.starts_with(".parity-"))
 }
 
-fn ensure_report_is_synced(db_path: &Path, conn: &Connection) -> Result<Option<LocalReportSnapshot>> {
+fn ensure_report_is_synced(db_path: &Path, conn: &Connection) -> Result<QueueReportSnapshot> {
     let latest: Option<(String, i64)> = conn
         .query_row(
             "SELECT report, CAST(strftime('%s', synced_at) AS INTEGER) FROM runs ORDER BY id DESC LIMIT 1",
@@ -2094,7 +2150,10 @@ fn ensure_report_is_synced(db_path: &Path, conn: &Connection) -> Result<Option<L
         )
         .optional()?;
     let Some((report, synced_at)) = latest else {
-        return Ok(None);
+        return Ok(QueueReportSnapshot {
+            local: None,
+            current_work_items: None,
+        });
     };
     let report = resolve_report_path(db_path, &report);
     let manifest = report.join("llm-manifest.json");
@@ -2107,21 +2166,23 @@ fn ensure_report_is_synced(db_path: &Path, conn: &Connection) -> Result<Option<L
             db_path.display(),
             manifest.display()
         ),
-        Err(_) => return Ok(None),
+        Err(_) => {
+            return Ok(QueueReportSnapshot {
+                local: None,
+                current_work_items: None,
+            });
+        }
     };
     let Ok(age) = modified_at.duration_since(UNIX_EPOCH) else {
-        return Ok(None);
+        return Ok(QueueReportSnapshot {
+            local: None,
+            current_work_items: None,
+        });
     };
     let modified_seconds = age.as_secs() as i64;
     // SQLite's CURRENT_TIMESTAMP has one-second precision. Permit the same
     // second (and one tick of filesystem timestamp skew) for a fresh sync.
-    if modified_seconds > synced_at.saturating_add(1) {
-        bail!(
-            "parity report manifest is newer than the queue state (report: {}, state synced: {}). Run `project-parity sync` before requesting the next item",
-            manifest.display(),
-            synced_at
-        );
-    }
+    let report_is_newer = modified_seconds > synced_at.saturating_add(1);
     let manifest_value: Value = serde_json::from_slice(
         &fs::read(&manifest)
             .with_context(|| format!("read parity report manifest {}", manifest.display()))?,
@@ -2171,7 +2232,44 @@ fn ensure_report_is_synced(db_path: &Path, conn: &Connection) -> Result<Option<L
                 file_hashes,
             })
         });
-    Ok(local_report_snapshot)
+    let current_work_items = if report_is_newer {
+        let index_path = report.join("llm-work-items.index.json");
+        let index: Value = serde_json::from_slice(
+            &fs::read(&index_path)
+                .with_context(|| format!("read current report work-item index {}", index_path.display()))?,
+        )
+        .with_context(|| format!("parse current report work-item index {}", index_path.display()))?;
+        if index["schema"].as_str() != Some("project-parity/jsonl-index-v1") {
+            bail!("current report work-item index has an unsupported schema");
+        }
+        let entries = index["records"]
+            .as_object()
+            .context("current report work-item index has no records object")?;
+        let mut records = HashMap::with_capacity(entries.len());
+        for (id, entry) in entries {
+            let offset = entry["offset"]
+                .as_u64()
+                .with_context(|| format!("work-item index entry {id} has no valid offset"))?;
+            let length = entry["length"]
+                .as_u64()
+                .with_context(|| format!("work-item index entry {id} has no valid length"))?;
+            records.insert(id.clone(), (offset, length));
+        }
+        let jsonl_path = report.join("llm-work-items.jsonl");
+        let jsonl = fs::File::open(&jsonl_path)
+            .with_context(|| format!("open current report work items {}", jsonl_path.display()))?;
+        Some(CurrentReportWorkItems {
+            jsonl_path,
+            jsonl,
+            records,
+        })
+    } else {
+        None
+    };
+    Ok(QueueReportSnapshot {
+        local: local_report_snapshot,
+        current_work_items,
+    })
 }
 
 /// Guard the bounded queue slice against a report/state mismatch. The index is
@@ -2774,6 +2872,17 @@ mod tests {
         fs::write(dir.join("llm-work-items.jsonl"), format!("{body}\n")).unwrap();
     }
 
+    fn index_report_items(dir: &Path, items: &[Value]) {
+        let mut offset = 0usize;
+        let mut records = serde_json::Map::new();
+        for item in items {
+            let line = item.to_string();
+            records.insert(item["id"].as_str().unwrap().to_string(), json!({"offset":offset,"length":line.len()+1}));
+            offset += line.len() + 1;
+        }
+        fs::write(dir.join("llm-work-items.index.json"), json!({"schema":"project-parity/jsonl-index-v1","records":records}).to_string()).unwrap();
+    }
+
     fn root_report(dir: &Path, local: &Path, upstream: &Path) {
         fs::create_dir_all(dir).unwrap();
         report(dir, &["done", "pending", "skipped"]);
@@ -3127,20 +3236,30 @@ mod tests {
     }
 
     #[test]
-    fn next_refuses_to_issue_ids_when_report_manifest_is_newer_than_state() {
+    fn next_issues_only_payloads_that_match_a_newer_report_without_syncing_state() {
         let root = tempdir().unwrap();
         let db = root.path().join("state.sqlite");
-        report(root.path(), &["a"]);
+        let original = json!({"id":"a","priority":"P1","action":"inspect","reason":"same"});
+        report_items(root.path(), &[original.clone()]);
+        index_report_items(root.path(), &[original.clone()]);
         sync(&db, root.path()).unwrap();
         let conn = Connection::open(&db).unwrap();
-        conn.execute("UPDATE runs SET synced_at='2000-01-01 00:00:00'", [])
-            .unwrap();
-
-        let error = next(&db, 10).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("manifest is newer than the queue state"));
-        assert!(error.to_string().contains("project-parity sync"));
+        conn.execute("UPDATE runs SET synced_at='2000-01-01 00:00:00'", []).unwrap();
+        drop(conn);
+        let before = state_snapshot(&db);
+        let unchanged = next(&db, 10).unwrap();
+        assert_eq!(unchanged["count"], 1);
+        assert_eq!(unchanged["items"][0], original);
+        assert_eq!(unchanged["staleReportItemsExcluded"], 0);
+        assert_eq!(state_snapshot(&db), before);
+        let changed = json!({"id":"a","priority":"P1","action":"inspect","reason":"changed"});
+        let added = json!({"id":"new","priority":"P1","action":"inspect","reason":"new item"});
+        report_items(root.path(), &[changed.clone(), added.clone()]);
+        index_report_items(root.path(), &[changed, added]);
+        let filtered = next(&db, 10).unwrap();
+        assert_eq!(filtered["count"], 0);
+        assert_eq!(filtered["staleReportItemsExcluded"], 1);
+        assert_eq!(state_snapshot(&db), before);
     }
 
     #[test]
@@ -3152,6 +3271,7 @@ mod tests {
         let db = campaign.join("state.sqlite");
         report(&report_dir, &["a"]);
         sync(&db, &report_dir).unwrap();
+        index_report_items(&report_dir, &[json!({"id":"a","priority":"P1","action":"inspect"})]);
 
         let conn = Connection::open(&db).unwrap();
         conn.execute(
@@ -3161,11 +3281,10 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let error = next(&db, 10).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("manifest is newer than the queue state"));
-        assert!(error.to_string().contains(".parity-5040/report/llm-manifest.json"));
+        let output = next(&db, 10).unwrap();
+        assert_eq!(output["count"], 1);
+        assert_eq!(output["items"][0]["id"], "a");
+        assert_eq!(output["staleReportItemsExcluded"], 0);
     }
 
     #[test]
