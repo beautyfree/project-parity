@@ -776,6 +776,27 @@ fn review_evidence_matches(previous: &str, current: &str) -> bool {
     let current = serde_json::to_string(&current_stable).unwrap_or_default();
     previous == current || routing_reclassification_preserves_evidence(&previous, &current)
 }
+// Ignore identity metadata only; all review evidence must remain structurally identical.
+fn identity_metadata_only_match(previous: &str, current: &str) -> bool {
+    let (Ok(mut previous), Ok(mut current)) = (
+        serde_json::from_str::<Value>(previous),
+        serde_json::from_str::<Value>(current),
+    ) else {
+        return false;
+    };
+    for value in [&mut previous, &mut current] {
+        let Some(object) = value.as_object_mut() else {
+            return false;
+        };
+        for key in ["id", "legacyIds", "reviewIdentity"] {
+            object.remove(key);
+        }
+    }
+    previous == current
+}
+fn review_decision_payload_matches(previous: &str, current: &str) -> bool {
+    review_evidence_matches(previous, current) || identity_metadata_only_match(previous, current)
+}
 fn legacy_rekey_payload_matches(previous: &str, current: &str, legacy_id: &str) -> bool {
     let (Ok(mut previous), Ok(mut current)) = (
         serde_json::from_str::<Value>(previous),
@@ -919,9 +940,8 @@ fn migrate_legacy_decisions(
     local_hash: &str,
     upstream_hash: &str,
     engine_sha256: Option<&str>,
-    dependency_hash: Option<&str>,
 ) -> Result<usize> {
-    let (Some(_engine_sha256), Some(dependency_hash)) = (engine_sha256, dependency_hash) else {
+    let Some(_engine_sha256) = engine_sha256 else {
         return Ok(0);
     };
     let old_decisions = {
@@ -932,9 +952,9 @@ fn migrate_legacy_decisions(
              JOIN runs r ON r.id=w.run_id
              WHERE w.run_id<>?1 AND d.status IN ('done','skipped','pending_sync')
                AND d.payload IS NOT NULL AND r.upstream_hash=?2
-               AND r.engine_sha256 IS NOT NULL AND r.dependency_hash=?3",
+               AND r.engine_sha256 IS NOT NULL AND r.dependency_hash IS NOT NULL",
         )?;
-        let rows = stmt.query_map(params![run_id, upstream_hash, dependency_hash], |row| {
+        let rows = stmt.query_map(params![run_id, upstream_hash], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?))
         })?;
@@ -973,7 +993,8 @@ fn migrate_legacy_decisions(
             let unchanged_project = old.5 == local_hash;
             let exact_legacy_match = unchanged_project && legacy_rekey_payload_matches(&old.4, current, alias);
             let stable_match = stable_review_payload_matches(&old.4, current);
-            if old.0 == *new_id || !(exact_legacy_match || stable_match) { continue; }
+            let identity_metadata_match = identity_metadata_only_match(&old.4, current);
+            if old.0 == *new_id || !(exact_legacy_match || stable_match || identity_metadata_match) { continue; }
             old_to_new.entry(alias.to_owned()).or_default().insert(new_id.clone(), current.clone());
         }
     }
@@ -1004,7 +1025,10 @@ fn migrate_legacy_decisions(
         let Some(key) = stable_review_payload_key(&old.4) else { continue };
         let Some(candidates) = current_by_stable_evidence.get(&key) else { continue };
         for (new_id, current) in candidates {
-            if old_id == new_id || !stable_review_payload_matches(&old.4, current) {
+            if old_id == new_id
+                || !(stable_review_payload_matches(&old.4, current)
+                    || identity_metadata_only_match(&old.4, current))
+            {
                 continue;
             }
             old_to_new.entry(old_id.clone()).or_default().insert(new_id.clone(), current.clone());
@@ -1530,7 +1554,7 @@ fn sync_locked(
         params![run_id],
     )?;
     let migrated = migrate_legacy_decisions(
-        conn, run_id, &incoming.local_hash, &incoming.upstream_hash, engine_sha256, dependency_hash,
+        conn, run_id, &incoming.local_hash, &incoming.upstream_hash, engine_sha256,
     )?;
     // Preserve reviewed decisions across routing and coalesced-evidence schema
     // changes only when the underlying owner and evidence are unchanged.
@@ -1549,7 +1573,7 @@ fn sync_locked(
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     for (id, previous, current) in reclassified {
-        if review_evidence_matches(&previous, &current) {
+        if review_decision_payload_matches(&previous, &current) {
             tx.execute(
                 "UPDATE work_item_decisions SET payload=?2 WHERE work_item_id=?1",
                 params![id, current],
@@ -1591,7 +1615,7 @@ fn sync_locked(
     for (id, status, reason, decided_at, previous, current) in historical_decisions {
         if active_decisions.contains(&id)
             || !matches!(status.as_str(), "done" | "skipped" | "pending_sync")
-            || !review_evidence_matches(&previous, &current)
+            || !review_decision_payload_matches(&previous, &current)
         {
             continue;
         }
@@ -2967,6 +2991,69 @@ mod tests {
 
         current["local"][0]["behavior"] = serde_json::json!("different call target");
         assert!(!legacy_rekey_payload_matches(&previous.to_string(), &current.to_string(), "v79-old-id"));
+    }
+
+    #[test]
+    fn sync_preserves_exact_review_across_dependency_and_identity_changes() {
+        fn set_dependency_hash(report: &Path, dependency_hash: &str) {
+            let path = report.join("llm-manifest.json");
+            let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            manifest["inputHashes"]["dependencies"] = json!(dependency_hash);
+            fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        }
+
+        fn run_case(same_id: bool, changed_evidence: bool) -> (Value, Value, Value) {
+            let root = tempdir().unwrap();
+            let report_dir = root.path().join("report");
+            let db = root.path().join("state.sqlite");
+            let local = root.path().join("local");
+            let upstream = root.path().join("upstream");
+            let old_id = "work-context-old";
+            let old = json!({
+                "id":old_id,
+                "action":"inspect-unresolved-upstream-graph-context",
+                "priority":"P2",
+                "confidence":"unknown",
+                "reason":"Reviewed module export context",
+                "batchId":"batch-context",
+                "reviewIdentity":{"action":"inspect-unresolved-upstream-graph-context","identities":["stable-review-v1:old"]},
+                "local":[],
+                "upstream":[{"id":"right:dist/chunk.js:graph:External:0:0:module","file":"dist/chunk.js","kind":"External","label":"module:<current>","start":0,"end":0,"reviewFingerprint":"stable-module"}],
+                "evidencePath":[],
+                "inspectNodeIds":["right:dist/chunk.js:graph:External:0:0:module"]
+            });
+            write_receipted_report(&report_dir, &local, &upstream, "local-before", &[old.clone()]);
+            set_dependency_hash(&report_dir, "dependency-before");
+            sync(&db, &report_dir).unwrap();
+            mark_pending_sync(&db, old_id, "Reviewed module export context").unwrap();
+
+            let mut current = old;
+            current["id"] = json!(if same_id { old_id } else { "work-context-new" });
+            current["reviewIdentity"]["identities"][0] = json!("stable-review-v1:current");
+            if changed_evidence {
+                current["upstream"][0]["reviewFingerprint"] = json!("stable-module-changed");
+            }
+            write_receipted_report(&report_dir, &local, &upstream, "local-after", &[current]);
+            set_dependency_hash(&report_dir, "dependency-after");
+            let result = sync(&db, &report_dir).unwrap();
+            (result, stats(&db).unwrap(), next(&db, 10).unwrap())
+        }
+
+        let (rekeyed, rekeyed_stats, rekeyed_next) = run_case(false, false);
+        assert_eq!(rekeyed["migrated"], 1);
+        assert_eq!(rekeyed["reopened"], 0);
+        assert_eq!(rekeyed_stats["done"], 1);
+        assert_eq!(rekeyed_next["count"], 0);
+
+        let (same_id, same_id_stats, same_id_next) = run_case(true, false);
+        assert_eq!(same_id["reopened"], 0);
+        assert_eq!(same_id_stats["done"], 1);
+        assert_eq!(same_id_next["count"], 0);
+
+        let (changed, changed_stats, changed_next) = run_case(false, true);
+        assert_eq!(changed["migrated"], 0);
+        assert_eq!(changed_stats["active"], 1);
+        assert_eq!(changed_next["count"], 1);
     }
 
     #[test]
