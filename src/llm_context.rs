@@ -2893,6 +2893,7 @@ pub(crate) fn write_llm_context(
         .collect::<HashSet<_>>();
     let context_needs_work = |node: &GraphNode| {
         if proven_module_context_nodes.contains(&node.id)
+            || upstream_work_by_node.contains_key(&node.id)
             || node.kind == "File"
             || identical_files.contains(node.file.as_str()) {
             return false;

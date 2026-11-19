@@ -17250,6 +17250,29 @@ mod tests {
         }), "the lossless graph should retain the export-to-module frontier");
 
         let work = read_json_lines(&output.path().join("llm-work-items.jsonl")).unwrap();
+        let module_boundary_node_id = frontiers
+            .iter()
+            .find(|frontier| {
+                frontier["rightEdge"]["target"]["kind"] == "External"
+                    && frontier["rightEdge"]["target"]["label"] == "module:<current>"
+            })
+            .unwrap()["rightEdge"]["target"]["id"]
+            .as_str()
+            .unwrap();
+        let module_boundary_route_count = work
+            .iter()
+            .filter(|item| {
+                item["inspectNodeIds"].as_array().is_some_and(|ids| {
+                    ids.iter()
+                        .any(|id| id.as_str() == Some(module_boundary_node_id))
+                })
+            })
+            .count();
+        assert_eq!(
+            module_boundary_route_count,
+            1,
+            "a module-export graph node should be routed once, not duplicated in Program context"
+        );
         assert!(work.iter().any(|item| {
             item["action"] == "inspect-unresolved-upstream-graph-context"
                 && item["priority"] == "P2"
