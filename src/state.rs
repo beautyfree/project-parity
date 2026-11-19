@@ -1469,7 +1469,7 @@ fn sync_locked(
     conn.execute_batch("CREATE TEMP TABLE previous_seen (id TEXT PRIMARY KEY); INSERT INTO previous_seen SELECT id FROM work_items WHERE resolved_at IS NULL; CREATE TEMP TABLE previous_unresolved (id TEXT PRIMARY KEY); INSERT INTO previous_unresolved SELECT w.id FROM work_items w LEFT JOIN work_item_decisions d ON d.work_item_id=w.id WHERE w.resolved_at IS NULL AND d.work_item_id IS NULL;")?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS work_item_decision_history (id INTEGER PRIMARY KEY, work_item_id TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL, decided_at TEXT NOT NULL, payload TEXT, reopened_run_id INTEGER NOT NULL, reopened_payload TEXT NOT NULL, FOREIGN KEY(work_item_id) REFERENCES work_items(id), FOREIGN KEY(reopened_run_id) REFERENCES runs(id));")?;
     // Older ledgers contain decision snapshots and require an event column.
-    for column in ["reopened_run_id INTEGER", "reopened_payload TEXT"] {
+    for column in ["reopened_run_id INTEGER", "reopened_payload TEXT", "event TEXT"] {
         let name = column.split_once(' ').unwrap().0;
         let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('work_item_decision_history') WHERE name=?1)", params![name], |row| row.get(0))?;
         if !exists {
@@ -1597,7 +1597,7 @@ fn sync_locked(
     };
     let historical_decisions = {
         let mut stmt = tx.prepare(
-            "SELECT h.work_item_id,h.status,h.reason,h.decided_at,h.payload,w.payload FROM work_item_decision_history h JOIN work_items w ON w.id=h.work_item_id WHERE w.run_id=?1 AND w.resolved_at IS NULL AND h.payload IS NOT NULL ORDER BY h.id DESC",
+            "SELECT h.work_item_id,h.status,h.reason,h.decided_at,h.payload,w.payload FROM work_item_decision_history h JOIN work_items w ON w.id=h.work_item_id WHERE w.run_id=?1 AND w.resolved_at IS NULL AND h.payload IS NOT NULL AND COALESCE(h.event,'decision')<>'superseded' ORDER BY h.id DESC",
         )?;
         let rows = stmt.query_map(params![run_id], |row| {
             Ok((
@@ -2573,6 +2573,54 @@ pub fn mark_pending_sync(db_path: &Path, work_item_id: &str, reason: &str) -> Re
     )
 }
 
+
+/// Correct an active conclusion while retaining the prior conclusion as an
+/// auditable history event. Normal done/skip commands stay append-only.
+pub fn supersede_decision(
+    db_path: &Path,
+    work_item_id: &str,
+    status: &str,
+    reason: &str,
+) -> Result<Value> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        bail!("REASON must not be empty");
+    }
+    if !matches!(status, "pending_sync" | "skipped" | "done") {
+        bail!("STATUS must be one of pending_sync, skipped, done");
+    }
+    let mut conn = open_existing_database(db_path)?;
+    conn.busy_timeout(Duration::from_millis(1000))?;
+    ensure_decision_schema(&conn)?;
+    ensure_decision_history_schema(&conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let previous: Option<(String, String, String, Option<String>, i64, String)> = tx
+        .query_row(
+            "SELECT d.status,d.reason,d.decided_at,d.payload,w.run_id,w.payload FROM work_items w JOIN work_item_decisions d ON d.work_item_id=w.id WHERE w.id=?1 AND w.resolved_at IS NULL",
+            params![work_item_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )
+        .optional()?;
+    let (previous_status, previous_reason, previous_decided_at, previous_payload, run_id, current_payload) = previous
+        .with_context(|| format!("unresolved work item {work_item_id} has no active decision to supersede"))?;
+    tx.execute(
+        "INSERT INTO work_item_decision_history(work_item_id,status,reason,decided_at,payload,reopened_run_id,reopened_payload,event) VALUES (?1,?2,?3,?4,?5,?6,?7,'superseded')",
+        params![work_item_id, previous_status, previous_reason, previous_decided_at, previous_payload, run_id, current_payload],
+    )?;
+    tx.execute(
+        "UPDATE work_item_decisions SET status=?2,reason=?3,decided_at=CURRENT_TIMESTAMP,payload=(SELECT payload FROM work_items WHERE id=?1) WHERE work_item_id=?1",
+        params![work_item_id, status, reason],
+    )?;
+    tx.commit()?;
+    Ok(serde_json::json!({
+        "schema": "project-parity/state-supersede-v1",
+        "id": work_item_id,
+        "previous": {"status": previous_status, "reason": previous_reason, "decidedAt": previous_decided_at},
+        "status": status,
+        "reason": reason,
+        "db": db_path,
+    }))
+}
 /// Mark a reviewed batch as waiting for the next authoritative sync in one
 /// transaction. The payload snapshot is retained for every item so sync can
 /// reopen only items whose evidence changed in the meantime.
@@ -2711,6 +2759,23 @@ fn ensure_decision_schema(conn: &Connection) -> Result<()> {
     )?;
     if !schema.contains("pending_sync") || !schema.contains("'done'") {
         conn.execute_batch("ALTER TABLE work_item_decisions RENAME TO work_item_decisions_legacy; CREATE TABLE work_item_decisions (work_item_id TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN ('skipped','pending_sync','done')), reason TEXT NOT NULL, decided_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, payload TEXT, FOREIGN KEY(work_item_id) REFERENCES work_items(id)); INSERT INTO work_item_decisions(work_item_id,status,reason,decided_at,payload) SELECT work_item_id,status,reason,decided_at,payload FROM work_item_decisions_legacy; DROP TABLE work_item_decisions_legacy; CREATE INDEX IF NOT EXISTS work_item_decisions_status ON work_item_decisions(status);")?;
+    }
+    Ok(())
+}
+
+
+fn ensure_decision_history_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS work_item_decision_history (id INTEGER PRIMARY KEY, work_item_id TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL, decided_at TEXT NOT NULL, payload TEXT, reopened_run_id INTEGER, reopened_payload TEXT, event TEXT NOT NULL DEFAULT 'decision', FOREIGN KEY(work_item_id) REFERENCES work_items(id), FOREIGN KEY(reopened_run_id) REFERENCES runs(id));")?;
+    for column in ["reopened_run_id INTEGER", "reopened_payload TEXT", "event TEXT"] {
+        let name = column.split_once(' ').unwrap().0;
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('work_item_decision_history') WHERE name=?1)",
+            params![name],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            conn.execute_batch(&format!("ALTER TABLE work_item_decision_history ADD COLUMN {column}"))?;
+        }
     }
     Ok(())
 }
@@ -5000,6 +5065,84 @@ mod tests {
         assert_eq!(stats(&db).unwrap()["pendingSync"], 1);
         assert_eq!(stats(&db).unwrap()["skipped"], 1);
         assert_eq!(next(&db, 10).unwrap()["count"], 1);
+    }
+
+    #[test]
+    fn supersede_archives_then_replaces_atomically() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("state.sqlite");
+        report(root.path(), &["a", "b"]);
+        sync(&db, root.path()).unwrap();
+        mark_pending_sync(&db, "a", "incorrect initial review").unwrap();
+
+        let result = supersede_decision(&db, "a", "skipped", "corrected false positive").unwrap();
+        assert_eq!(result["previous"]["status"], "pending_sync");
+        assert_eq!(result["status"], "skipped");
+        let conn = Connection::open(&db).unwrap();
+        let active: (String, String) = conn.query_row(
+            "SELECT status,reason FROM work_item_decisions WHERE work_item_id='a'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(active, ("skipped".into(), "corrected false positive".into()));
+        let history: (String, String, String) = conn.query_row(
+            "SELECT status,reason,event FROM work_item_decision_history WHERE work_item_id='a'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(history, ("pending_sync".into(), "incorrect initial review".into(), "superseded".into()));
+
+        conn.execute_batch("CREATE TRIGGER reject_supersede BEFORE UPDATE ON work_item_decisions BEGIN SELECT RAISE(ABORT, 'reject'); END;").unwrap();
+        assert!(supersede_decision(&db, "a", "done", "second correction").is_err());
+        let active_after: String = conn.query_row(
+            "SELECT status FROM work_item_decisions WHERE work_item_id='a'", [], |row| row.get(0),
+        ).unwrap();
+        let history_after: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM work_item_decision_history WHERE work_item_id='a'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(active_after, "skipped");
+        assert_eq!(history_after, 1);
+    }
+
+    #[test]
+    fn supersede_rejects_invalid_or_missing_active_decisions() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("state.sqlite");
+        report(root.path(), &["a"]);
+        sync(&db, root.path()).unwrap();
+        assert!(supersede_decision(&db, "a", "skipped", "no active decision").is_err());
+        assert!(supersede_decision(&db, "missing", "skipped", "unknown item").is_err());
+        mark_pending_sync(&db, "a", "reviewed").unwrap();
+        assert!(supersede_decision(&db, "a", "invalid", "invalid status").is_err());
+        assert!(supersede_decision(&db, "a", "skipped", " ").is_err());
+        let conn = Connection::open(&db).unwrap();
+        let decision: (String, String) = conn.query_row(
+            "SELECT status,reason FROM work_item_decisions WHERE work_item_id='a'", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        let history: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM work_item_decision_history WHERE work_item_id='a'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(decision, ("pending_sync".into(), "reviewed".into()));
+        assert_eq!(history, 0);
+    }
+
+    #[test]
+    fn sync_never_restores_a_superseded_history_event() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("state.sqlite");
+        report(root.path(), &["a"]);
+        sync(&db, root.path()).unwrap();
+        mark_pending_sync(&db, "a", "incorrect review").unwrap();
+        supersede_decision(&db, "a", "skipped", "corrected review").unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("DELETE FROM work_item_decisions WHERE work_item_id='a'", []).unwrap();
+        sync(&db, root.path()).unwrap();
+        assert_eq!(next(&db, 10).unwrap()["count"], 1);
+        let decisions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM work_item_decisions WHERE work_item_id='a'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(decisions, 0);
     }
 
     #[test]

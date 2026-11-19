@@ -10001,6 +10001,7 @@ fn usage() -> &'static str {
         "  project-parity state-optimize-queue STATE_DB\n",
         "  project-parity state-done STATE_DB WORK_ITEM_ID REASON\n",
         "  project-parity state-done-batch STATE_DB REASON WORK_ITEM_ID...\n",
+        "  project-parity state-supersede STATE_DB WORK_ITEM_ID STATUS REASON\n",
         "  project-parity state-skip STATE_DB WORK_ITEM_ID REASON\n",
         "  project-parity state-skip-batch STATE_DB REASON WORK_ITEM_ID...\n",
         "  project-parity state-stats STATE_DB\n",
@@ -10874,6 +10875,18 @@ fn main() -> Result<()> {
             Path::new(&args[1]),
             &args[2],
             &args[3],
+        )?)?;
+        return Ok(());
+    }
+    if args.first().is_some_and(|arg| arg == "state-supersede") {
+        if args.len() != 5 {
+            bail!(usage());
+        }
+        print_json(&state::supersede_decision(
+            Path::new(&args[1]),
+            &args[2],
+            &args[3],
+            &args[4],
         )?)?;
         return Ok(());
     }

@@ -75,6 +75,14 @@ argument, followed by one or more individually reviewed IDs):
 project-parity state-done-batch STATE_DB "reviewed and patched; batch sync pending" WORK_ITEM_ID...
 ```
 
+To correct an already-recorded active decision, retain its original status,
+reason, timestamp, and evidence snapshot in decision history with the explicit
+`superseded` event, then replace the active decision atomically:
+
+```bash
+project-parity state-supersede STATE_DB WORK_ITEM_ID pending_sync|skipped|done "corrected evidence-backed decision"
+```
+
 `state-next` defaults to compact routing output so a bare invocation cannot
 dump 100 large evidence payloads into an agent context. Use `--full` only when
 you explicitly need the legacy full-payload response; `--summary` adds compact
