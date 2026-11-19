@@ -2932,20 +2932,52 @@ pub(crate) fn write_llm_context(
         }
         true
     };
-    let context_files = right
+    let mut context_nodes_by_file = BTreeMap::<String, Vec<&GraphNode>>::new();
+    for node in right
         .graph_nodes
         .iter()
         .filter(|node| context_needs_work(node))
-        .map(|node| node.file.clone())
-        .collect::<BTreeSet<_>>();
+    {
+        context_nodes_by_file
+            .entry(node.file.clone())
+            .or_default()
+            .push(node);
+    }
     let mut work_by_context_file = HashMap::<String, String>::new();
-    for file in context_files {
+    for (file, context_nodes) in context_nodes_by_file {
         let representative = right
             .graph_nodes
             .iter()
             .find(|node| node.file == file && node.kind == "File")
             .or_else(|| right.graph_nodes.iter().find(|node| node.file == file))
             .expect("context file has a graph node");
+        let context_ids = context_nodes
+            .iter()
+            .filter(|node| node.kind != "Scope")
+            .map(|node| node.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut upstream = vec![graph_node_value(&graph_node_ref(representative))];
+        let context_roots = context_nodes
+            .iter()
+            .filter(|node| node.kind != "Scope")
+            .filter(|node| {
+                !parent_by_child
+                    .get(node.id.as_str())
+                    .copied()
+                    .is_some_and(|parent| context_ids.contains(parent))
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let context_roots = if context_roots.is_empty() {
+            context_nodes
+        } else {
+            context_roots
+        };
+        upstream.extend(
+            context_roots
+                .iter()
+                .map(|node| graph_node_value(&graph_node_ref(node))),
+        );
         let id = push_work_item(
             &mut work_items,
             WorkItemDraft {
@@ -2954,7 +2986,7 @@ pub(crate) fn write_llm_context(
                 confidence: "unknown",
                 reason: "This upstream file has semantic context nodes outside every executable owner and graph correspondence. Inspect this file's compact semantic-ledger rows and graph adjacency before treating it as covered.".to_string(),
                local: Vec::new(),
-                upstream: vec![graph_node_value(&graph_node_ref(representative))],
+                upstream,
                 evidence_path: Vec::new(),
                 identities: vec![format!("semantic-context:{file}")],
             },
@@ -3525,6 +3557,33 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn unresolved_program_context_lists_unmatched_top_level_nodes() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        fs::create_dir_all(left.path()).unwrap();
+        fs::create_dir_all(right.path()).unwrap();
+        fs::write(
+            right.path().join("context.js"),
+            "const marker = \"upstream-only\";\n",
+        )
+        .unwrap();
+        run(left.path(), right.path(), output.path()).unwrap();
+        let work = fs::read_to_string(output.path().join("llm-work-items.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|item| item["action"] == "inspect-unresolved-upstream-graph-context")
+            .expect("unresolved top-level context remains actionable");
+        assert_eq!(work["upstream"][0]["kind"], "File");
+        assert!(work["upstream"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["kind"] == "Symbol"));
+        assert!(work["inspectNodeIds"].as_array().unwrap().len() >= 2);
+    }
     #[test]
     fn named_export_marker_is_not_counted_twice_but_wildcard_export_stays_visible() {
         let left = tempdir().unwrap();
