@@ -76,8 +76,8 @@ project-parity state-done-batch STATE_DB "reviewed and patched; batch sync pendi
 ```
 
 To correct an already-recorded active decision, retain its original status,
-reason, timestamp, and evidence snapshot in decision history with the explicit
-`superseded` event, then replace the active decision atomically:
+reason, timestamp, and evidence snapshot in decision history with a superseded
+marker, then replace the active decision atomically:
 
 ```bash
 project-parity state-supersede STATE_DB WORK_ITEM_ID pending_sync|skipped|done "corrected evidence-backed decision"

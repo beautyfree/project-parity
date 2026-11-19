@@ -1467,9 +1467,9 @@ fn sync_locked(
     ensure_run_receipt_schema(&conn)?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS work_item_id_migrations (old_work_item_id TEXT NOT NULL,new_work_item_id TEXT NOT NULL,run_id INTEGER NOT NULL,status TEXT NOT NULL,reason TEXT NOT NULL,decided_at TEXT NOT NULL,previous_payload TEXT NOT NULL,current_payload TEXT NOT NULL,PRIMARY KEY(old_work_item_id,new_work_item_id,run_id),FOREIGN KEY(old_work_item_id) REFERENCES work_items(id),FOREIGN KEY(new_work_item_id) REFERENCES work_items(id),FOREIGN KEY(run_id) REFERENCES runs(id))")?;
     conn.execute_batch("CREATE TEMP TABLE previous_seen (id TEXT PRIMARY KEY); INSERT INTO previous_seen SELECT id FROM work_items WHERE resolved_at IS NULL; CREATE TEMP TABLE previous_unresolved (id TEXT PRIMARY KEY); INSERT INTO previous_unresolved SELECT w.id FROM work_items w LEFT JOIN work_item_decisions d ON d.work_item_id=w.id WHERE w.resolved_at IS NULL AND d.work_item_id IS NULL;")?;
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS work_item_decision_history (id INTEGER PRIMARY KEY, work_item_id TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL, decided_at TEXT NOT NULL, payload TEXT, reopened_run_id INTEGER NOT NULL, reopened_payload TEXT NOT NULL, FOREIGN KEY(work_item_id) REFERENCES work_items(id), FOREIGN KEY(reopened_run_id) REFERENCES runs(id));")?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS work_item_decision_history (id INTEGER PRIMARY KEY, work_item_id TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL, decided_at TEXT NOT NULL, payload TEXT, reopened_run_id INTEGER NOT NULL, reopened_payload TEXT NOT NULL, event TEXT, superseded INTEGER NOT NULL DEFAULT 0 CHECK(superseded IN (0,1)), FOREIGN KEY(work_item_id) REFERENCES work_items(id), FOREIGN KEY(reopened_run_id) REFERENCES runs(id));")?;
     // Older ledgers contain decision snapshots and require an event column.
-    for column in ["reopened_run_id INTEGER", "reopened_payload TEXT", "event TEXT"] {
+    for column in ["reopened_run_id INTEGER", "reopened_payload TEXT", "event TEXT", "superseded INTEGER NOT NULL DEFAULT 0 CHECK(superseded IN (0,1))"] {
         let name = column.split_once(' ').unwrap().0;
         let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('work_item_decision_history') WHERE name=?1)", params![name], |row| row.get(0))?;
         if !exists {
@@ -1597,7 +1597,7 @@ fn sync_locked(
     };
     let historical_decisions = {
         let mut stmt = tx.prepare(
-            "SELECT h.work_item_id,h.status,h.reason,h.decided_at,h.payload,w.payload FROM work_item_decision_history h JOIN work_items w ON w.id=h.work_item_id WHERE w.run_id=?1 AND w.resolved_at IS NULL AND h.payload IS NOT NULL AND COALESCE(h.event,'decision')<>'superseded' ORDER BY h.id DESC",
+            "SELECT h.work_item_id,h.status,h.reason,h.decided_at,h.payload,w.payload FROM work_item_decision_history h JOIN work_items w ON w.id=h.work_item_id WHERE w.run_id=?1 AND w.resolved_at IS NULL AND h.payload IS NOT NULL AND COALESCE(h.superseded,0)=0 ORDER BY h.id DESC",
         )?;
         let rows = stmt.query_map(params![run_id], |row| {
             Ok((
@@ -2604,7 +2604,7 @@ pub fn supersede_decision(
     let (previous_status, previous_reason, previous_decided_at, previous_payload, run_id, current_payload) = previous
         .with_context(|| format!("unresolved work item {work_item_id} has no active decision to supersede"))?;
     tx.execute(
-        "INSERT INTO work_item_decision_history(work_item_id,status,reason,decided_at,payload,reopened_run_id,reopened_payload,event) VALUES (?1,?2,?3,?4,?5,?6,?7,'superseded')",
+        "INSERT INTO work_item_decision_history(work_item_id,status,reason,decided_at,payload,reopened_run_id,reopened_payload,event,superseded) VALUES (?1,?2,?3,?4,?5,?6,?7,'decision',1)",
         params![work_item_id, previous_status, previous_reason, previous_decided_at, previous_payload, run_id, current_payload],
     )?;
     tx.execute(
@@ -2765,8 +2765,8 @@ fn ensure_decision_schema(conn: &Connection) -> Result<()> {
 
 
 fn ensure_decision_history_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS work_item_decision_history (id INTEGER PRIMARY KEY, work_item_id TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL, decided_at TEXT NOT NULL, payload TEXT, reopened_run_id INTEGER, reopened_payload TEXT, event TEXT NOT NULL DEFAULT 'decision', FOREIGN KEY(work_item_id) REFERENCES work_items(id), FOREIGN KEY(reopened_run_id) REFERENCES runs(id));")?;
-    for column in ["reopened_run_id INTEGER", "reopened_payload TEXT", "event TEXT"] {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS work_item_decision_history (id INTEGER PRIMARY KEY, work_item_id TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL, decided_at TEXT NOT NULL, payload TEXT, reopened_run_id INTEGER, reopened_payload TEXT, event TEXT NOT NULL DEFAULT 'decision', superseded INTEGER NOT NULL DEFAULT 0 CHECK(superseded IN (0,1)), FOREIGN KEY(work_item_id) REFERENCES work_items(id), FOREIGN KEY(reopened_run_id) REFERENCES runs(id));")?;
+    for column in ["reopened_run_id INTEGER", "reopened_payload TEXT", "event TEXT", "superseded INTEGER NOT NULL DEFAULT 0 CHECK(superseded IN (0,1))"] {
         let name = column.split_once(' ').unwrap().0;
         let exists: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('work_item_decision_history') WHERE name=?1)",
@@ -5073,6 +5073,7 @@ mod tests {
         let db = root.path().join("state.sqlite");
         report(root.path(), &["a", "b"]);
         sync(&db, root.path()).unwrap();
+        Connection::open(&db).unwrap().execute_batch("DROP TABLE work_item_decision_history; CREATE TABLE work_item_decision_history (id INTEGER PRIMARY KEY, work_item_id TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL, decided_at TEXT NOT NULL, payload TEXT, event TEXT NOT NULL CHECK(event IN ('snapshot','decision')), recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, reopened_run_id INTEGER, reopened_payload TEXT, FOREIGN KEY(work_item_id) REFERENCES work_items(id));").unwrap();
         mark_pending_sync(&db, "a", "incorrect initial review").unwrap();
 
         let result = supersede_decision(&db, "a", "skipped", "corrected false positive").unwrap();
@@ -5085,12 +5086,12 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).unwrap();
         assert_eq!(active, ("skipped".into(), "corrected false positive".into()));
-        let history: (String, String, String) = conn.query_row(
-            "SELECT status,reason,event FROM work_item_decision_history WHERE work_item_id='a'",
+        let history: (String, String, String, i64) = conn.query_row(
+            "SELECT status,reason,event,superseded FROM work_item_decision_history WHERE work_item_id='a'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).unwrap();
-        assert_eq!(history, ("pending_sync".into(), "incorrect initial review".into(), "superseded".into()));
+        assert_eq!(history, ("pending_sync".into(), "incorrect initial review".into(), "decision".into(), 1));
 
         conn.execute_batch("CREATE TRIGGER reject_supersede BEFORE UPDATE ON work_item_decisions BEGIN SELECT RAISE(ABORT, 'reject'); END;").unwrap();
         assert!(supersede_decision(&db, "a", "done", "second correction").is_err());
@@ -5128,7 +5129,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_never_restores_a_superseded_history_event() {
+    fn sync_never_restores_a_superseded_history_row() {
         let root = tempdir().unwrap();
         let db = root.path().join("state.sqlite");
         report(root.path(), &["a"]);
