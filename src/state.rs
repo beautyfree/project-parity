@@ -70,6 +70,12 @@ struct ReportIdentity {
     local_hash: String,
     upstream_hash: String,
 }
+struct RootMigrationEvidence {
+    previous_roots: RootIdentity,
+    previous_report: PathBuf,
+    previous_local_hash: String,
+    previous_upstream_hash: String,
+}
 
 fn read_report_identity(path: &Path, manifest: bool) -> Result<ReportIdentity> {
     let value: Value = serde_json::from_slice(&fs::read(path).with_context(|| format!("read provenance {}", path.display()))?)
@@ -255,7 +261,7 @@ fn check_database_identity(db: &Path, expected: &RootIdentity) -> Result<()> {
 
 fn store_database_identity(conn: &Connection, roots: &RootIdentity) -> Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS parity_identity (id INTEGER PRIMARY KEY CHECK(id=1), local_root TEXT NOT NULL, upstream_root TEXT NOT NULL)")?;
-    conn.execute("INSERT OR IGNORE INTO parity_identity(id,local_root,upstream_root) VALUES (1,?1,?2)", params![roots.local.to_string_lossy(), roots.upstream.to_string_lossy()])?;
+    conn.execute("INSERT INTO parity_identity(id,local_root,upstream_root) VALUES (1,?1,?2) ON CONFLICT(id) DO UPDATE SET local_root=excluded.local_root,upstream_root=excluded.upstream_root", params![roots.local.to_string_lossy(), roots.upstream.to_string_lossy()])?;
     Ok(())
 }
 
@@ -353,7 +359,7 @@ impl SyncGuard {
 
     pub fn sync(&self) -> Result<Value> {
         let db = self.db.as_deref().context("no state database selected")?;
-        sync_locked(db, &self.report, &self.roots)
+        sync_locked(db, &self.report, &self.roots, None)
     }
 }
 
@@ -1230,6 +1236,74 @@ pub fn sync(db_path: &Path, report: &Path) -> Result<Value> {
     let incoming = read_report_identity(&report.join("llm-manifest.json"), true)?;
     SyncGuard::acquire(incoming.roots, report, Some(db_path), false)?.sync()
 }
+pub fn sync_rebind_roots(db_path: &Path, previous_report: &Path, report: &Path) -> Result<Value> {
+    let db_path = destination_path(db_path)?;
+    let previous_report = destination_path(previous_report)?;
+    let report = destination_path(report)?;
+    if previous_report == report {
+        bail!("root migration requires distinct previous and incoming reports");
+    }
+    let read_identities = || -> Result<(ReportIdentity, ReportIdentity)> {
+        let previous_manifest = previous_report.join("llm-manifest.json");
+        let manifest_path = report.join("llm-manifest.json");
+        let previous_value: Value = serde_json::from_slice(&fs::read(&previous_manifest)?)?;
+        let value: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        validate_report_roots(&previous_value)?;
+        validate_report_roots(&value)?;
+        let previous = read_report_identity(&previous_manifest, true)?;
+        let incoming = read_report_identity(&manifest_path, true)?;
+        check_report_identity(&previous_report, &previous.roots, false, None)?;
+        check_report_identity(&report, &incoming.roots, false, None)?;
+        validate_report_input_fingerprints(&value, false, false, "migrating state roots")?;
+        if previous.roots == incoming.roots {
+            bail!("reports already use the same roots; use state-sync");
+        }
+        if previous.upstream_hash != incoming.upstream_hash {
+            bail!("root migration requires the same upstream input hash in both reports");
+        }
+        Ok((previous, incoming))
+    };
+    let (previous, incoming) = read_identities()?;
+    let verify_database = || -> Result<()> {
+        let conn = open_existing_database(&db_path)?;
+        let roots = database_identity(&conn, &db_path)?
+            .context("state database has no recorded root identity")?;
+        roots.require(&previous.roots, &db_path)?;
+        let latest_upstream: String = conn.query_row(
+            "SELECT upstream_hash FROM runs ORDER BY id DESC LIMIT 1", [], |row| row.get(0),
+        ).context("state database has no recorded upstream checkpoint")?;
+        if latest_upstream != previous.upstream_hash || latest_upstream != incoming.upstream_hash {
+            bail!("root migration reports do not match the latest synced upstream checkpoint");
+        }
+        Ok(())
+    };
+    verify_database()?;
+    let mut resources = vec![db_path.clone(), previous_report.clone(), report.clone()];
+    resources.sort();
+    resources.dedup();
+    let mut locks = Vec::new();
+    for path in resources {
+        locks.push(lock_resource(&path, false)?);
+    }
+    let (locked_previous, locked_incoming) = read_identities()?;
+    if locked_previous.roots != previous.roots
+        || locked_previous.local_hash != previous.local_hash
+        || locked_previous.upstream_hash != previous.upstream_hash
+        || locked_incoming.roots != incoming.roots
+        || locked_incoming.local_hash != incoming.local_hash
+        || locked_incoming.upstream_hash != incoming.upstream_hash
+    {
+        bail!("report provenance changed while acquiring the state migration lock");
+    }
+    verify_database()?;
+    let migration = RootMigrationEvidence {
+        previous_roots: previous.roots,
+        previous_report,
+        previous_local_hash: previous.local_hash,
+        previous_upstream_hash: previous.upstream_hash,
+    };
+    sync_locked(&db_path, &report, &incoming.roots, Some(&migration))
+}
 
 fn validate_report_input_fingerprints(
     manifest: &Value,
@@ -1314,21 +1388,52 @@ fn validate_report_input_fingerprints(
     Ok(())
 }
 
-fn sync_locked(db_path: &Path, report: &Path, roots: &RootIdentity) -> Result<Value> {
+fn sync_locked(
+    db_path: &Path,
+    report: &Path,
+    roots: &RootIdentity,
+    migration: Option<&RootMigrationEvidence>,
+) -> Result<Value> {
     let manifest: Value = serde_json::from_slice(&fs::read(report.join("llm-manifest.json"))?)?;
     validate_report_roots(&manifest)?;
     validate_report_input_fingerprints(&manifest, false, false, "syncing decisions")?;
     let incoming = read_report_identity(&report.join("llm-manifest.json"), true)?;
     incoming.roots.require(roots, report)?;
-    check_report_identity(report, roots, true, Some(db_path))?;
+    check_report_identity(report, roots, true, migration.is_none().then_some(db_path))?;
     let shared = super::llm_context::read_shared_work_evidence(report)?;
     let mut conn = open_or_create_state_database(db_path)?;
     conn.busy_timeout(Duration::from_millis(1000))?;
-    if let Some(previous) = database_identity(&conn, db_path)? { previous.require(roots, db_path)?; }
+    if let Some(previous) = database_identity(&conn, db_path)? {
+        previous.require(migration.map_or(roots, |migration| &migration.previous_roots), db_path)?;
+    } else if migration.is_some() {
+        bail!("root migration requires a database with an existing root identity");
+    }
     conn.execute_batch("PRAGMA journal_mode=WAL")?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let conn = &tx;
-    if let Some(previous) = database_identity(conn, db_path)? { previous.require(roots, db_path)?; }
+    if let Some(previous) = database_identity(conn, db_path)? {
+        previous.require(migration.map_or(roots, |migration| &migration.previous_roots), db_path)?;
+    } else if migration.is_some() {
+        bail!("root migration requires a database with an existing root identity");
+    }
+    if let Some(migration) = migration {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS parity_root_migrations (id INTEGER PRIMARY KEY, migrated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, previous_report TEXT NOT NULL, previous_local_root TEXT NOT NULL, previous_upstream_root TEXT NOT NULL, previous_local_hash TEXT NOT NULL, previous_upstream_hash TEXT NOT NULL, incoming_report TEXT NOT NULL, incoming_local_root TEXT NOT NULL, incoming_upstream_root TEXT NOT NULL, incoming_local_hash TEXT NOT NULL, incoming_upstream_hash TEXT NOT NULL)")?;
+        conn.execute(
+            "INSERT INTO parity_root_migrations(previous_report,previous_local_root,previous_upstream_root,previous_local_hash,previous_upstream_hash,incoming_report,incoming_local_root,incoming_upstream_root,incoming_local_hash,incoming_upstream_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                migration.previous_report.to_string_lossy(),
+                migration.previous_roots.local.to_string_lossy(),
+                migration.previous_roots.upstream.to_string_lossy(),
+                migration.previous_local_hash,
+                migration.previous_upstream_hash,
+                report.to_string_lossy(),
+                roots.local.to_string_lossy(),
+                roots.upstream.to_string_lossy(),
+                incoming.local_hash,
+                incoming.upstream_hash,
+            ],
+        )?;
+    }
     store_database_identity(conn, roots)?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, report TEXT NOT NULL, upstream_hash TEXT, local_hash TEXT, synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS work_items (id TEXT PRIMARY KEY, run_id INTEGER NOT NULL, action TEXT, priority TEXT, confidence TEXT, payload TEXT NOT NULL, first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, resolved_at TEXT, batch_id TEXT, FOREIGN KEY(run_id) REFERENCES runs(id)); CREATE TABLE IF NOT EXISTS work_item_decisions (work_item_id TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN ('skipped','pending_sync','done')), reason TEXT NOT NULL, decided_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, payload TEXT, FOREIGN KEY(work_item_id) REFERENCES work_items(id)); CREATE INDEX IF NOT EXISTS work_items_queue ON work_items(resolved_at, priority, id); CREATE INDEX IF NOT EXISTS work_item_decisions_status ON work_item_decisions(status);")?;
     ensure_queue_index(&conn, "work_items_queue_phase", false, false)?;
@@ -1518,9 +1623,18 @@ fn sync_locked(db_path: &Path, report: &Path, roots: &RootIdentity) -> Result<Va
         [], |row| row.get(0),
     )?;
     tx.commit()?;
-    Ok(
-        serde_json::json!({"schema":"project-parity/state-sync-v1","runId":run_id,"workItems":seen,"new":new_items,"resolved":resolved,"reopened":reopened,"restored":restored,"pendingReleased":pending_released,"migrated":migrated,"remaining":remaining,"db":db_path}),
-    )
+    let mut result = serde_json::json!({"schema":"project-parity/state-sync-v1","runId":run_id,"workItems":seen,"new":new_items,"resolved":resolved,"reopened":reopened,"restored":restored,"pendingReleased":pending_released,"migrated":migrated,"remaining":remaining,"db":db_path});
+    if let Some(migration) = migration {
+        result["rootMigration"] = serde_json::json!({
+            "previousLocalRoot": migration.previous_roots.local,
+            "previousUpstreamRoot": migration.previous_roots.upstream,
+            "incomingLocalRoot": roots.local,
+            "incomingUpstreamRoot": roots.upstream,
+            "sameUpstreamHash": true,
+            "decisionsReconciledAtomically": true,
+        });
+    }
+    Ok(result)
 }
 
 pub fn next(db_path: &Path, limit: usize) -> Result<Value> {
@@ -3104,6 +3218,70 @@ mod tests {
         assert_eq!(after["runs"][0]["dependencyHash"], "dependencies");
         assert_eq!(after["runs"][0]["workItemsSha256"], "items");
         assert_eq!(after["runs"][0]["workItemsCount"], 12);
+    }
+
+    #[test]
+    fn explicit_root_sync_rebind_requires_same_upstream_and_preserves_decisions() {
+        fn decision_reasons(db: &Path) -> Vec<(String, String)> {
+            let conn = Connection::open(db).unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT work_item_id, reason FROM work_item_decisions ORDER BY work_item_id"
+            ).unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        }
+        fn set_hashes(report: &Path, local: &str, upstream: &str) {
+            let manifest_path = report.join("llm-manifest.json");
+            let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+            manifest["inputHashes"]["local"] = serde_json::json!(local);
+            manifest["inputHashes"]["upstream"] = serde_json::json!(upstream);
+            fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            let report_path = report.join("report.json");
+            let mut summary: Value = serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+            summary["left"]["projectSha256"] = serde_json::json!(local);
+            summary["right"]["projectSha256"] = serde_json::json!(upstream);
+            fs::write(&report_path, serde_json::to_vec(&summary).unwrap()).unwrap();
+        }
+        let root = tempdir().unwrap();
+        let old_local = root.path().join("old-local");
+        let old_upstream = root.path().join("old-upstream");
+        let new_local = root.path().join("new-local");
+        let new_upstream = root.path().join("new-upstream");
+        for path in [&old_local, &old_upstream, &new_local, &new_upstream] {
+            fs::create_dir(path).unwrap();
+        }
+        let previous_report = root.path().join("previous-report");
+        let new_report = root.path().join("new-report");
+        let db = root.path().join("state.sqlite");
+        root_report(&previous_report, &old_local, &old_upstream);
+        reviewed_state(&db, &previous_report);
+        let before = decision_reasons(&db);
+        root_report(&new_report, &new_local, &new_upstream);
+        set_hashes(&new_report, "new-local-hash", "u");
+        let result = sync_rebind_roots(&db, &previous_report, &new_report).unwrap();
+        assert_eq!(result["rootMigration"]["sameUpstreamHash"], true);
+        assert_eq!(result["rootMigration"]["decisionsReconciledAtomically"], true);
+        assert_eq!(decision_reasons(&db), before);
+        let conn = Connection::open(&db).unwrap();
+        let roots = database_identity(&conn, &db).unwrap().unwrap();
+        roots.require(&RootIdentity::new(&new_local, &new_upstream).unwrap(), &db).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM parity_root_migrations", [], |row| row.get::<_, i64>(0)).unwrap(),
+            1
+        );
+        let rejected_root = tempdir().unwrap();
+        let rejected_local = rejected_root.path().join("new-local");
+        let rejected_upstream = rejected_root.path().join("new-upstream");
+        fs::create_dir(&rejected_local).unwrap();
+        fs::create_dir(&rejected_upstream).unwrap();
+        let rejected_report = rejected_root.path().join("report");
+        root_report(&rejected_report, &rejected_local, &rejected_upstream);
+        set_hashes(&rejected_report, "other-local-hash", "different-upstream-hash");
+        let before_rejected_sync = state_snapshot(&db);
+        assert!(sync_rebind_roots(&db, &new_report, &rejected_report).is_err());
+        assert_eq!(state_snapshot(&db), before_rejected_sync);
     }
 
     #[test]

@@ -232,7 +232,13 @@ The sync result counts queue entries that appeared (`new`), disappeared
 (`resolved`), or were restored from matching decision history independently,
 so all can be nonzero in the same run. `new`
 includes reviewed items reopened after their evidence changed; `reopened`
-reports that subset. Before reopening, sync preserves the prior decision and
+reports that subset. If a state database must move to a different checkout path,
+run:
+
+    project-parity state-sync-rebind-roots STATE_DB PREVIOUS_REPORT NEW_REPORT
+
+This performs an explicit atomic root migration and sync. It requires the previous report to match the database's recorded roots and latest upstream hash, and both reports to carry the same upstream input hash. The migration is recorded in parity_root_migrations; use it only when the new checkout is the same project.
+Before reopening, sync preserves the prior decision and
 both evidence snapshots in SQLite's `work_item_decision_history` table.
 
 `watch` takes content-hash snapshots, debounces save bursts, skips no-op
