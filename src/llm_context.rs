@@ -1328,7 +1328,6 @@ fn work_item_inspection_pair_key(
     item: &Value,
     shared: &HashMap<String, Value>,
 ) -> Option<String> {
-    let action = item["action"].as_str()?;
     let local = item["local"].as_array()?;
     let upstream = item["upstream"]
         .as_array()
@@ -1349,7 +1348,7 @@ fn work_item_inspection_pair_key(
     }
     let local_id = local[0]["id"].as_str()?;
     let upstream_id = upstream[0]["id"].as_str()?;
-    Some(format!("inspection-pair\0{action}\0{local_id}\0{upstream_id}"))
+    Some(format!("inspection-pair\0{local_id}\0{upstream_id}"))
 }
 
 /// One stable work-item ID may be emitted by several divergent edges beneath
@@ -2978,6 +2977,28 @@ pub(crate) fn write_llm_context(
                 .iter()
                 .map(|node| graph_node_value(&graph_node_ref(node))),
         );
+        let mut root_identities = context_roots
+            .iter()
+            .map(|node| {
+                stable_identity_with_ambiguity(
+                    &node.id,
+                    &review_fingerprints,
+                    &ambiguous_review_fingerprints,
+                )
+                .unwrap_or_else(|| {
+                    format!(
+                        "ambiguous:{}:{}:{}:{}",
+                        node.file, node.id, node.kind, node.linked_sha256
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        root_identities.sort();
+        root_identities.dedup();
+        let context_identity = format!(
+            "semantic-context:{file}:{}",
+            sha256(root_identities.join("\0").as_bytes())
+        );
         let id = push_work_item(
             &mut work_items,
             WorkItemDraft {
@@ -2988,7 +3009,7 @@ pub(crate) fn write_llm_context(
                local: Vec::new(),
                 upstream,
                 evidence_path: Vec::new(),
-                identities: vec![format!("semantic-context:{file}")],
+                identities: vec![context_identity],
             },
             None,
         )?;
@@ -3558,6 +3579,37 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_program_context_identity_tracks_the_unresolved_node_set() {
+        let left = tempdir().unwrap();
+        fs::create_dir_all(left.path()).unwrap();
+        let context_work = |source: &str| {
+            let right = tempdir().unwrap();
+            let output = tempdir().unwrap();
+            fs::create_dir_all(right.path()).unwrap();
+            fs::write(right.path().join("context.js"), source).unwrap();
+            run(left.path(), right.path(), output.path()).unwrap();
+            fs::read_to_string(output.path().join("llm-work-items.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .find(|item| {
+                    item["action"] == "inspect-unresolved-upstream-graph-context"
+                        && item["semanticOwner"]["kind"] == "File"
+                })
+                .expect("unresolved top-level context remains actionable")
+        };
+
+        let one_root = context_work("const marker = \"upstream-only\";\n");
+        let same_root = context_work("const marker = \"upstream-only\";\n");
+        let additional_root = context_work(
+            "const marker = \"upstream-only\";\nconst added = 1;\n",
+        );
+
+        assert_eq!(one_root["id"], same_root["id"]);
+        assert_ne!(one_root["id"], additional_root["id"]);
+        assert_ne!(one_root["reviewIdentity"], additional_root["reviewIdentity"]);
+    }
+    #[test]
     fn unresolved_program_context_lists_unmatched_top_level_nodes() {
         let left = tempdir().unwrap();
         let right = tempdir().unwrap();
@@ -4077,9 +4129,14 @@ mod tests {
             output.path().join("llm-manifest.json"),
             serde_json::to_vec(&json!({
                 "engine": crate::ENGINE_VERSION,
+                "engineArtifact":{"executableSha256":crate::sha256_file(&std::env::current_exe().unwrap()).unwrap()},
                 "localRoot": local.path().canonicalize().unwrap(),
                 "analysisProjection": upstream_root.path().canonicalize().unwrap(),
-                "inputHashes": {"local": "fixture-local", "upstream": "fixture-upstream"}
+                "inputHashes": {"local": "fixture-local", "upstream": "fixture-upstream"},
+                "inputFingerprints": {
+                    "local":{"sha256":crate::fingerprint_input(local.path(), &[]).unwrap(),"inputFiles":[]},
+                    "upstream":{"sha256":crate::fingerprint_input(upstream_root.path(), &[]).unwrap(),"inputFiles":[]}
+                }
             })).unwrap(),
         )
         .unwrap();

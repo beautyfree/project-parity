@@ -3180,6 +3180,10 @@ mod tests {
             let mut value: Value = serde_json::from_slice(&fs::read(incoming.join("llm-manifest.json")).unwrap()).unwrap();
             value["engine"] = Value::String(ENGINE_VERSION.into());
             value["inputHashes"]["local"] = Value::String("new source contents".into());
+            value["inputFingerprints"] = serde_json::json!({
+                "local":{"sha256":crate::fingerprint_input(root.path(), &[]).unwrap(),"inputFiles":[]},
+                "upstream":{"sha256":crate::fingerprint_input(root.path(), &[]).unwrap(),"inputFiles":[]}
+            });
             fs::write(incoming.join("llm-manifest.json"), value.to_string()).unwrap();
             let result = sync(&db, &incoming).unwrap();
             assert_eq!(result["pendingReleased"], 1);
@@ -3258,6 +3262,10 @@ mod tests {
             "localRoot":local,
             "analysisProjection":upstream,
             "inputHashes":{"local":"l","upstream":"u"},
+            "inputFingerprints":{
+                "local":{"sha256":crate::fingerprint_input(&root.join("local"), &[]).unwrap(),"inputFiles":[]},
+                "upstream":{"sha256":crate::fingerprint_input(&root.join("upstream"), &[]).unwrap(),"inputFiles":[]}
+            },
             "workItemsIntegrity":{
                 "sha256":crate::sha256(work_items),
                 "records":record_count,
