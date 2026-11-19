@@ -1248,7 +1248,7 @@ pub fn sync_rebind_roots(db_path: &Path, previous_report: &Path, report: &Path) 
         let manifest_path = report.join("llm-manifest.json");
         let previous_value: Value = serde_json::from_slice(&fs::read(&previous_manifest)?)?;
         let value: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
-        validate_report_roots(&previous_value)?;
+        validate_report_roots_for_queue_read(&previous_value)?;
         validate_report_roots(&value)?;
         let previous = read_report_identity(&previous_manifest, true)?;
         let incoming = read_report_identity(&manifest_path, true)?;
@@ -3239,10 +3239,12 @@ mod tests {
             manifest["inputHashes"]["upstream"] = serde_json::json!(upstream);
             fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
             let report_path = report.join("report.json");
-            let mut summary: Value = serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
-            summary["left"]["projectSha256"] = serde_json::json!(local);
-            summary["right"]["projectSha256"] = serde_json::json!(upstream);
-            fs::write(&report_path, serde_json::to_vec(&summary).unwrap()).unwrap();
+            if report_path.exists() {
+                let mut summary: Value = serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+                summary["left"]["projectSha256"] = serde_json::json!(local);
+                summary["right"]["projectSha256"] = serde_json::json!(upstream);
+                fs::write(&report_path, serde_json::to_vec(&summary).unwrap()).unwrap();
+            }
         }
         let root = tempdir().unwrap();
         let old_local = root.path().join("old-local");
@@ -3257,8 +3259,26 @@ mod tests {
         let db = root.path().join("state.sqlite");
         root_report(&previous_report, &old_local, &old_upstream);
         reviewed_state(&db, &previous_report);
+        let mut previous_manifest: Value =
+            serde_json::from_slice(&fs::read(previous_report.join("llm-manifest.json")).unwrap()).unwrap();
+        previous_manifest["schema"] = serde_json::json!("project-parity/llm-manifest-v3");
+        previous_manifest["engine"] = serde_json::json!(ENGINE_VERSION);
+        previous_manifest["engineArtifact"] =
+            serde_json::json!({"executableSha256":"f".repeat(64)});
+        fs::write(
+            previous_report.join("llm-manifest.json"),
+            serde_json::to_vec(&previous_manifest).unwrap(),
+        ).unwrap();
+        assert_ne!(
+            previous_manifest["engineArtifact"]["executableSha256"],
+            crate::sha256_file(&std::env::current_exe().unwrap()).unwrap(),
+        );
         let before = decision_reasons(&db);
-        root_report(&new_report, &new_local, &new_upstream);
+        let items = ["done", "pending", "skipped"]
+            .map(|id| serde_json::json!({"id":id,"priority":"P1","action":"inspect"}));
+        write_receipted_report(
+            &new_report, &new_local, &new_upstream, "new-local-hash", &items,
+        );
         set_hashes(&new_report, "new-local-hash", "u");
         let result = sync_rebind_roots(&db, &previous_report, &new_report).unwrap();
         assert_eq!(result["rootMigration"]["sameUpstreamHash"], true);
