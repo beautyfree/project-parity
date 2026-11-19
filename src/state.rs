@@ -850,6 +850,20 @@ fn legacy_rekey_payload_matches(previous: &str, current: &str, legacy_id: &str) 
         &serde_json::to_string(&current).unwrap_or_default(),
     )
 }
+fn route_evidence_key(value: &Value) -> Option<String> {
+    let mut evidence = serde_json::Map::new();
+    for key in ["action", "priority", "confidence", "reason", "local", "upstream", "evidencePath"] {
+        evidence.insert(key.to_string(), value.get(key)?.clone());
+    }
+    Some(serde_json::to_string(&Value::Object(evidence)).unwrap_or_default())
+}
+fn coalesced_variant_keys(payload: &str) -> Vec<String> {
+    let Ok(item) = serde_json::from_str::<Value>(payload) else { return Vec::new() };
+    let Some(variants) = item["evidenceVariants"].as_array().filter(|variants| variants.len() > 1) else {
+        return Vec::new();
+    };
+    variants.iter().filter_map(route_evidence_key).collect()
+}
 fn stable_review_payload_matches(previous: &str, current: &str) -> bool {
     let (Ok(mut previous), Ok(mut current)) = (
         serde_json::from_str::<Value>(previous),
@@ -934,8 +948,16 @@ fn migrate_legacy_decisions(
             alias_targets.entry(alias.to_owned()).or_default().insert(new_id.clone());
         }
     }
+    let mut current_by_coalesced_variant = HashMap::<String, Vec<(String, String)>>::new();
+    for (new_id, current) in &new_items {
+        for key in coalesced_variant_keys(current) {
+            current_by_coalesced_variant
+                .entry(key)
+                .or_default()
+                .push((new_id.clone(), current.clone()));
+        }
+    }
     let mut old_to_new = HashMap::<String, BTreeMap<String, String>>::new();
-    let mut new_to_old = HashMap::<String, BTreeMap<String, String>>::new();
     for (new_id, current) in &new_items {
         let Ok(item) = serde_json::from_str::<Value>(current) else { continue };
         let Some(aliases) = item["legacyIds"].as_array() else { continue };
@@ -947,7 +969,17 @@ fn migrate_legacy_decisions(
             let stable_match = stable_review_payload_matches(&old.4, current);
             if old.0 == *new_id || !(exact_legacy_match || stable_match) { continue; }
             old_to_new.entry(alias.to_owned()).or_default().insert(new_id.clone(), current.clone());
-            new_to_old.entry(new_id.clone()).or_default().insert(alias.to_owned(), current.clone());
+        }
+    }
+    for (old_id, old) in &old_by_id {
+        let Ok(previous) = serde_json::from_str::<Value>(&old.4) else { continue };
+        let Some(key) = route_evidence_key(&previous) else { continue };
+        let Some(candidates) = current_by_coalesced_variant.get(&key) else { continue };
+        for (new_id, current) in candidates {
+            old_to_new
+                .entry(old_id.clone())
+                .or_default()
+                .insert(new_id.clone(), current.clone());
         }
     }
     // IDs and aliases can both change after unrelated local edits. Carry a
@@ -970,26 +1002,63 @@ fn migrate_legacy_decisions(
                 continue;
             }
             old_to_new.entry(old_id.clone()).or_default().insert(new_id.clone(), current.clone());
-            new_to_old.entry(new_id.clone()).or_default().insert(old_id.clone(), current.clone());
         }
     }
-    let mut migrated = 0;
+    // Coalescing can turn several already-reviewed route items into one current
+    // decision. Carry it only when every current route has exactly one matching
+    // prior decision and those decisions agree; partial or conflicting reviews
+    // remain open.
+    let mut migrations_by_new = BTreeMap::<String, BTreeMap<String, String>>::new();
     for (old_id, candidates) in old_to_new {
         if candidates.len() != 1 { continue; }
         let (new_id, current) = candidates.into_iter().next().expect("one migration candidate");
-        if new_to_old.get(&new_id).is_none_or(|old_ids| old_ids.len() != 1) { continue; }
-        let old = old_by_id.get(&old_id).expect("candidate came from old decision");
+        migrations_by_new.entry(new_id).or_default().insert(old_id, current);
+    }
+    let mut migrated = 0;
+    for (new_id, old_candidates) in migrations_by_new {
+        let current = old_candidates.values().next().expect("migration candidate").clone();
+        let route_keys = coalesced_variant_keys(&current);
+        let old_ids = old_candidates.keys().collect::<Vec<_>>();
+        if !route_keys.is_empty() {
+            let unique_route_keys = route_keys.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+            let reviewed_route_keys = old_ids
+                .iter()
+                .filter_map(|old_id| old_by_id.get(*old_id))
+                .filter_map(|old| serde_json::from_str::<Value>(&old.4).ok())
+                .filter_map(|old| route_evidence_key(&old))
+                .collect::<std::collections::BTreeSet<_>>();
+            if route_keys.len() != old_candidates.len()
+                || unique_route_keys.len() != route_keys.len()
+                || reviewed_route_keys != unique_route_keys
+            {
+                continue;
+            }
+        } else if old_candidates.len() != 1 {
+            continue;
+        }
+        let mut old_decisions = old_ids
+            .iter()
+            .filter_map(|old_id| old_by_id.get(*old_id))
+            .collect::<Vec<_>>();
+        old_decisions.sort_by_key(|old| &old.0);
+        let Some(old) = old_decisions.first() else { continue };
+        if old_decisions.iter().any(|decision| decision.1 != old.1 || decision.2 != old.2) {
+            continue;
+        }
         let inserted = conn.execute(
             "INSERT OR IGNORE INTO work_item_decisions(work_item_id,status,reason,decided_at,payload) VALUES (?1,?2,?3,?4,?5)",
             params![new_id, old.1, old.2, old.3, current],
         )?;
         if inserted != 1 { continue; }
-        conn.execute(
-            "INSERT INTO work_item_id_migrations(old_work_item_id,new_work_item_id,run_id,status,reason,decided_at,previous_payload,current_payload) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![old_id, new_id, run_id, old.1, old.2, old.3, old.4, current],
-        )?;
-        conn.execute("DELETE FROM work_item_decisions WHERE work_item_id=?1", params![old_id])?;
-        migrated += 1;
+        for old_id in old_ids {
+            let previous = old_by_id.get(old_id).expect("candidate came from old decision");
+            conn.execute(
+                "INSERT INTO work_item_id_migrations(old_work_item_id,new_work_item_id,run_id,status,reason,decided_at,previous_payload,current_payload) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![old_id, new_id, run_id, previous.1, previous.2, previous.3, previous.4, current],
+            )?;
+            conn.execute("DELETE FROM work_item_decisions WHERE work_item_id=?1", params![old_id])?;
+            migrated += 1;
+        }
     }
     Ok(migrated)
 }
@@ -2787,6 +2856,96 @@ mod tests {
     }
 
     #[test]
+    fn sync_migrates_route_decisions_only_when_all_coalesced_variants_agree() {
+        fn run_case(reviewed_routes: usize, conflicting_status: bool) -> (Value, Value, Value) {
+            let root = tempdir().unwrap();
+            let report_dir = root.path().join("report");
+            let db = root.path().join("state.sqlite");
+            let local_root = root.path().join("local");
+            let upstream_root = root.path().join("upstream");
+            let module = serde_json::json!({
+                "id":"right:dist/chunk.js:graph:External:0:0:module",
+                "file":"dist/chunk.js","kind":"External","label":"module:<current>",
+                "start":0,"end":0,"reviewFingerprint":"stable-module"
+            });
+            let routes = (0..2)
+                .map(|index| {
+                    let local = serde_json::json!({
+                        "id":format!("left:src/hook{index}.ts:0:20:0"),
+                        "file":format!("src/hook{index}.ts"),"kind":"Function","label":"declaration",
+                        "line":index + 1,"start":index * 20,"end":index * 20 + 20,
+                        "reviewFingerprint":format!("stable-local-{index}")
+                    });
+                    let upstream = serde_json::json!({
+                        "id":format!("right:dist/chunk.js:graph:Function:{}:{}:{index}",index * 30,index * 30 + 20),
+                        "file":"dist/chunk.js","kind":"Function","label":"declaration",
+                        "line":index + 1,"start":index * 30,"end":index * 30 + 20,
+                        "reviewFingerprint":format!("stable-upstream-{index}")
+                    });
+                    serde_json::json!({
+                        "id":format!("work:old-route-{index}"),
+                        "action":"inspect-unresolved-upstream-graph-context",
+                        "priority":"P2","confidence":"unknown",
+                        "reason":"Reviewed current-module export context",
+                        "reviewIdentity":{"action":"inspect-unresolved-upstream-graph-context",
+                            "identities":[format!("stable-route-{index}"),"stable-module"]},
+                        "local":[local],"upstream":[module.clone()],
+                        "evidencePath":[{"basis":"seed-unit","depth":0,"left":local,"right":upstream}],
+                        "inspectNodeIds":[format!("old-route-node-{index}")]
+                    })
+                })
+                .collect::<Vec<_>>();
+            write_receipted_report(&report_dir, &local_root, &upstream_root, "same-local", &routes);
+            sync(&db, &report_dir).unwrap();
+            for (index, route) in routes.iter().enumerate().take(reviewed_routes) {
+                if conflicting_status && index == 1 {
+                    skip(&db, route["id"].as_str().unwrap(), "Reviewed current-module export context").unwrap();
+                } else {
+                    mark_pending_sync(&db, route["id"].as_str().unwrap(), "Reviewed current-module export context").unwrap();
+                }
+            }
+            let variants = routes.iter().map(|route| serde_json::json!({
+                "action":route["action"],"priority":route["priority"],"confidence":route["confidence"],
+                "reason":route["reason"],"local":route["local"],"upstream":route["upstream"],
+                "evidencePath":route["evidencePath"],"inspectNodeIds":route["inspectNodeIds"],
+                "reviewIdentity":route["reviewIdentity"]
+            })).collect::<Vec<_>>();
+            let current = serde_json::json!({
+                "id":"work:current-module-context",
+                "action":"inspect-unresolved-upstream-graph-context",
+                "priority":"P2","confidence":"unknown",
+                "reason":"Reviewed current-module export context",
+                "reviewIdentity":{"action":"inspect-unresolved-upstream-graph-context",
+                    "identities":["stable-module"]},
+                "local":routes.iter().flat_map(|route| route["local"].as_array().unwrap().clone()).collect::<Vec<_>>(),
+                "upstream":[module],
+                "evidencePath":routes.iter().flat_map(|route| route["evidencePath"].as_array().unwrap().clone()).collect::<Vec<_>>(),
+                "evidenceVariants":variants
+            });
+            write_receipted_report(&report_dir, &local_root, &upstream_root, "same-local", &[current]);
+            let result = sync(&db, &report_dir).unwrap();
+            (result, stats(&db).unwrap(), next(&db, 10).unwrap())
+        }
+
+        let (complete, complete_stats, complete_next) = run_case(2, false);
+        assert_eq!(complete["migrated"], 2);
+        assert_eq!(complete_stats["done"], 1);
+        assert_eq!(complete_stats["active"], 0);
+        assert_eq!(complete_next["count"], 0);
+
+        let (partial, partial_stats, partial_next) = run_case(1, false);
+        assert_eq!(partial["migrated"], 0);
+        assert_eq!(partial_stats["done"], 0);
+        assert_eq!(partial_stats["active"], 1);
+        assert_eq!(partial_next["count"], 1);
+
+        let (conflict, conflict_stats, conflict_next) = run_case(2, true);
+        assert_eq!(conflict["migrated"], 0);
+        assert_eq!(conflict_stats["done"], 0);
+        assert_eq!(conflict_stats["active"], 1);
+        assert_eq!(conflict_next["count"], 1);
+    }
+    #[test]
     fn sync_migrates_v79_decision_only_for_exact_inputs_and_unique_payload() {
         fn run_case(local_hash_after: &str, duplicate: bool) -> (Value, Value, Value) {
             let root = tempdir().unwrap();
@@ -3112,6 +3271,10 @@ mod tests {
     }
 
     fn write_receipted_report(dir: &Path, local: &Path, upstream: &Path, local_hash: &str, items: &[Value]) {
+        static EXECUTABLE_SHA256: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let executable_sha256 = EXECUTABLE_SHA256
+            .get_or_init(|| crate::sha256_file(&std::env::current_exe().unwrap()).unwrap())
+            .clone();
         fs::create_dir_all(dir).unwrap();
         fs::create_dir_all(local).unwrap();
         fs::create_dir_all(upstream).unwrap();
@@ -3124,7 +3287,7 @@ mod tests {
         let manifest = serde_json::json!({
             "schema":"project-parity/llm-manifest-v3",
             "engine":ENGINE_VERSION,
-            "engineArtifact":{"executableSha256":crate::sha256_file(&std::env::current_exe().unwrap()).unwrap()},
+            "engineArtifact":{"executableSha256":executable_sha256},
             "localRoot":local,
             "analysisProjection":upstream,
             "inputHashes":{"local":local_hash,"upstream":"upstream-hash","dependencies":"dependency-hash"},
